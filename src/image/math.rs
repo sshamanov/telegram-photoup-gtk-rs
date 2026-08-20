@@ -48,7 +48,7 @@ pub fn auto_exposure_ev(luminances: &[u8], opts: &AutoExpOpts) -> f32 {
     let mut sorted: Vec<u8> = luminances.to_vec();
     sorted.sort_unstable();
     let idx = (sorted.len() - 1).min((sorted.len() as f32 * opts.percentile) as usize);
-    let measured = *sorted.get(idx).unwrap_or(&128) as f32;
+    let measured = sorted[idx] as f32;
     let ev = (opts.target / measured.max(1.0)).log2();
     clamp(ev, opts.min_ev, opts.max_ev)
 }
@@ -100,8 +100,17 @@ mod tests {
 
     #[test]
     fn auto_exposure_clamps_max() {
-        let lums = vec![255u8; 100];
+        // Zero luminance → target/measured = 180/1 → log2 ≈ 7.49 EV, above max_ev.
+        let lums = vec![0u8; 100];
         let ev = auto_exposure_ev(&lums, &AutoExpOpts { target: 180.0, max_ev: 0.5, ..Default::default() });
-        assert!(ev <= 0.5);
+        assert_eq!(ev, 0.5, "expected clamp to max_ev, got {ev}");
+    }
+
+    #[test]
+    fn auto_exposure_clamps_min() {
+        // Max-brightness, target 128 → log2(128/255) ≈ −0.99, below min_ev.
+        let lums = vec![255u8; 100];
+        let ev = auto_exposure_ev(&lums, &AutoExpOpts { target: 128.0, min_ev: 0.0, ..Default::default() });
+        assert_eq!(ev, 0.0, "expected clamp to min_ev, got {ev}");
     }
 }
