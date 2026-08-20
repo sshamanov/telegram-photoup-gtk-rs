@@ -136,6 +136,10 @@ pub fn build_grid(
             image.set_paintable(row.texture().as_ref());
             if row.error() {
                 image.add_css_class("cell-error");
+            } else {
+                // GridView recycles cells: a cell that previously showed a failed
+                // photo must drop the red border when rebound to a healthy row.
+                image.remove_css_class("cell-error");
             }
             // GridView only re-binds on items-changed / scroll recycle — NOT when a
             // row's properties change. So subscribe to the row's texture-notify so
