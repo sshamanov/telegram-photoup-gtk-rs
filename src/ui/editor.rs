@@ -1,9 +1,10 @@
-//! Per-photo editor: exposure/WB/crop controls, live preview, histogram.
-//! Thread: UI (GTK main loop) only.
+//! Per-photo editor (photoup `EditorPanel`): preview on the left, a 332px panel
+//! on the right with filename, histogram, Exposure / White balance / Crop / Image
+//! sections, nav (‹ Prev / Next ›) and Reject / Close.
 //!
 //! The controls emit `AppEvent::PhotoEdit { id, adjustments }` through the
-//! `on_event` callback; the wiring (Task 21) re-renders the preview and pushes
-//! the result back via `set_preview`/`set_histogram`/`set_photo`.
+//! `on_event` callback; the wiring re-renders the preview and pushes the result
+//! back via `set_preview`/`set_histogram`/`set_photo`.
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
@@ -11,31 +12,96 @@ use std::sync::{Arc, RwLock};
 use gtk4::prelude::*;
 use gtk4::{Box as GBox, Button, DrawingArea, Label, Orientation, Picture, Scale};
 
-use crate::image::types::{Adjustments, ExposureMode};
+use crate::image::process::export_dimensions;
+use crate::image::types::{Adjustments, ExposureMode, NormalizedCrop};
 use crate::state::{AppEvent, AppState};
 
-/// Field handles used by Task 21 (histogram_area, buttons, state) are not read
-/// until the wiring lands; `#[allow(dead_code)]` keeps the build warning-free.
-#[allow(dead_code)]
+/// Longest edge of an export render (must match the controller's EXPORT_EDGE).
+const EXPORT_EDGE: u32 = 2560;
+
+/// Read the photo's current adjustments straight from state (so slider/crop
+/// edits merge onto the latest value instead of clobbering it).
+fn current_adjustments(state: &AppState, id: u64) -> Adjustments {
+    state
+        .photos
+        .iter()
+        .find(|p| p.id == id)
+        .map(|p| p.adjustments)
+        .unwrap_or_default()
+}
+
+/// "output 2560 × 1709 px" from the full dimensions + active crop.
+fn output_line(full: (u32, u32), crop: Option<NormalizedCrop>) -> String {
+    let out = export_dimensions(full.0, full.1, crop.as_ref(), EXPORT_EDGE);
+    format!("output {} × {} px", out.width, out.height)
+}
+
+/// A click handler that applies a crop-preset ratio (photoup `applyPreset`):
+/// computes a centered crop rect matching the ratio against the source aspect.
+fn crop_preset_handler(
+    ratio: f32,
+    active_id: Rc<Cell<Option<u64>>>,
+    state: Arc<RwLock<AppState>>,
+    on_event: Arc<dyn Fn(AppEvent) + Send + Sync + 'static>,
+    full_size: Rc<Cell<Option<(u32, u32)>>>,
+    info2: Label,
+) -> impl Fn(&Button) + 'static {
+    move |_| {
+        let Some(id) = active_id.get() else { return };
+        let Some((fw, fh)) = full_size.get() else { return };
+        if fw == 0 || fh == 0 {
+            return;
+        }
+        let target = ratio * (fh as f32 / fw as f32);
+        let (w, h) = if target >= 1.0 {
+            (1.0, 1.0 / target)
+        } else {
+            (target, 1.0)
+        };
+        let crop = NormalizedCrop {
+            x: (1.0 - w) / 2.0,
+            y: (1.0 - h) / 2.0,
+            width: w,
+            height: h,
+        };
+        let mut adj = current_adjustments(&state.read().unwrap(), id);
+        adj.crop = Some(crop);
+        info2.set_text(&output_line((fw, fh), Some(crop)));
+        on_event(AppEvent::PhotoEdit { id, adjustments: adj });
+    }
+}
+
 pub struct EditorScreen {
     pub root: GBox,
     pub preview: Picture,
-    back_button: Button,
+    pub nav_prev: Button,
+    pub nav_next: Button,
+    file_label: Label,
     histogram_area: DrawingArea,
     exposure_scale: Scale,
-    mode_dropdown: gtk4::DropDown,
     temp_scale: Scale,
     hue_scale: Scale,
-    reset_button: Button,
-    auto_button: Button,
-    auto_wb_button: Button,
-    crop_button: Button,
-    raw_controls: GBox,
+    ev_value: Label,
+    wb_value: Label,
+    info1: Label,
+    info2: Label,
+    auto_exposure_btn: Button,
+    slide_exposure_btn: Button,
+    rest_exposure_btn: Button,
+    reset_wb_btn: Button,
+    crop_11: Button,
+    crop_23: Button,
+    crop_32: Button,
+    crop_orig: Button,
+    reject_button: Button,
+    close_button: Button,
     /// Current photo id (set by `set_photo`), read by the signal closures.
-    /// `Rc<Cell<..>>` so each closure can own a clone instead of borrowing the screen.
-    pub active_id: Rc<Cell<Option<u64>>>,
-    /// Suppresses PhotoEdit emission while `set_photo` programs the controls
-    /// (their `set_selected`/`set_value` calls fire signals synchronously).
+    active_id: Rc<Cell<Option<u64>>>,
+    /// Full source dimensions, needed for the Image section + crop presets.
+    full_size: Rc<Cell<Option<(u32, u32)>>>,
+    is_raw: Rc<Cell<bool>>,
+    /// Suppresses PhotoEdit emission while `set_photo`/buttons program the
+    /// controls (their `set_value` calls fire signals synchronously).
     suppress: Rc<Cell<bool>>,
     state: Arc<RwLock<AppState>>,
     /// Shared with every control closure (a plain `Box` can't be split across
@@ -54,137 +120,209 @@ impl EditorScreen {
         root.set_margin_start(8);
         root.set_margin_end(8);
 
-        // Left: live preview.
+        // Left: live preview (contain, like photoup's object-fit: contain).
         let preview = Picture::new();
         preview.set_vexpand(true);
         preview.set_hexpand(true);
+        preview.set_content_fit(gtk4::ContentFit::Contain);
         root.append(&preview);
 
-        // Right: control panel.
-        let panel = GBox::new(Orientation::Vertical, 8);
-        panel.set_width_request(300);
+        // Right: control panel, scrollable if the window is short.
+        let panel_scroll = gtk4::ScrolledWindow::new();
+        let panel = GBox::new(Orientation::Vertical, 10);
+        panel.set_width_request(332);
+        panel.set_margin_start(4);
 
-        // Back to the grid (dispatches ActivePhoto { index: None }).
-        let back_button = Button::with_label("← Back");
-        back_button.add_css_class("flat");
-        back_button.set_halign(gtk4::Align::Start);
-        panel.append(&back_button);
+        let file_label = Label::new(Some(""));
+        file_label.add_css_class("editor-file");
+        file_label.set_halign(gtk4::Align::Start);
+        file_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        file_label.set_tooltip_text(Some(""));
+        panel.append(&file_label);
 
-        let title = Label::new(Some("Edit photo"));
-        title.add_css_class("title-2");
-        panel.append(&title);
-
-        // Mode dropdown: Auto / Slide (aggressive) / Manual.
-        let mode_model = gtk4::StringList::new(&["Auto", "Slide", "Manual"]);
-        let mode_dropdown = gtk4::DropDown::new(Some(mode_model), None::<gtk4::Expression>);
-        mode_dropdown.set_selected(0);
-        let mode_row = row_labeled("Exposure mode", &mode_dropdown);
-        panel.append(&mode_row);
-
-        // EV scale -4..+4 (only meaningful in Manual; but always shown, disabled in auto).
-        let ev_adj = gtk4::Adjustment::new(0.0, -4.0, 4.0, 0.1, 0.5, 0.0);
-        let exposure_scale = Scale::new(gtk4::Orientation::Horizontal, Some(&ev_adj));
-        exposure_scale.set_value(0.0);
-        exposure_scale.set_draw_value(true);
-        exposure_scale.set_digits(1);
-        // EV only matters in Manual; default mode is Auto, so start disabled
-        // (the mode-notify in wire_controls keeps this in sync afterwards).
-        exposure_scale.set_sensitive(false);
-        let ev_row = row_labeled("Exposure (EV)", &exposure_scale);
-        panel.append(&ev_row);
-
-        // RAW-only controls (hidden for JPEG by default).
-        let raw_controls = GBox::new(Orientation::Vertical, 8);
-        let temp_adj = gtk4::Adjustment::new(0.0, -1.0, 1.0, 0.01, 0.1, 0.0);
-        let temp_scale = Scale::new(gtk4::Orientation::Horizontal, Some(&temp_adj));
-        temp_scale.set_value(0.0);
-        temp_scale.set_draw_value(true);
-        temp_scale.set_digits(2);
-        raw_controls.append(&row_labeled("Temperature", &temp_scale));
-
-        let hue_adj = gtk4::Adjustment::new(0.0, -1.0, 1.0, 0.01, 0.1, 0.0);
-        let hue_scale = Scale::new(gtk4::Orientation::Horizontal, Some(&hue_adj));
-        hue_scale.set_value(0.0);
-        hue_scale.set_draw_value(true);
-        hue_scale.set_digits(2);
-        raw_controls.append(&row_labeled("Hue", &hue_scale));
-
-        let auto_wb_button = Button::with_label("Auto WB");
-        raw_controls.append(&auto_wb_button);
-        raw_controls.set_visible(false);
-        panel.append(&raw_controls);
-
-        // Action row.
-        let actions = GBox::new(Orientation::Horizontal, 8);
-        let auto_button = Button::with_label("Auto");
-        let reset_button = Button::with_label("Reset");
-        let crop_button = Button::with_label("Crop");
-        actions.append(&auto_button);
-        actions.append(&reset_button);
-        actions.append(&crop_button);
-        panel.append(&actions);
-
-        // Histogram.
+        // Histogram (neutral frame until the wiring calls `set_histogram`).
         let histogram_area = DrawingArea::new();
         histogram_area.set_height_request(120);
-        // Neutral frame until the wiring (Task 21) calls `set_histogram`.
         histogram_area.set_draw_func(|_area, cr, _width, _height| {
-            cr.set_source_rgb(0.25, 0.25, 0.25);
+            cr.set_source_rgb(0.15, 0.15, 0.15);
             let _ = cr.paint();
         });
         panel.append(&histogram_area);
 
-        root.append(&panel);
+        // ---- Exposure ----
+        panel.append(&section_label("Exposure"));
+        let ev_adj = gtk4::Adjustment::new(0.0, -3.0, 5.0, 0.1, 0.5, 0.0);
+        let exposure_scale = Scale::new(gtk4::Orientation::Horizontal, Some(&ev_adj));
+        exposure_scale.set_value(0.0);
+        exposure_scale.set_draw_value(false);
+        panel.append(&exposure_scale);
+
+        let ev_row = GBox::new(Orientation::Horizontal, 6);
+        let auto_exposure_btn = Button::with_label("Auto");
+        let slide_exposure_btn = Button::with_label("Slide");
+        let rest_exposure_btn = Button::with_label("Rest");
+        let ev_value = Label::new(Some("+0.00 EV"));
+        ev_value.add_css_class("editor-value");
+        ev_value.set_hexpand(true);
+        ev_value.set_halign(gtk4::Align::End);
+        ev_row.append(&auto_exposure_btn);
+        ev_row.append(&slide_exposure_btn);
+        ev_row.append(&rest_exposure_btn);
+        ev_row.append(&ev_value);
+        panel.append(&ev_row);
+
+        // ---- White balance ----
+        panel.append(&section_label("White balance"));
+        let temp_adj = gtk4::Adjustment::new(0.0, -2.0, 2.0, 0.05, 0.5, 0.0);
+        let temp_scale = Scale::new(gtk4::Orientation::Horizontal, Some(&temp_adj));
+        temp_scale.set_value(0.0);
+        temp_scale.set_draw_value(false);
+        panel.append(&temp_scale);
+
+        let hue_adj = gtk4::Adjustment::new(0.0, -2.0, 2.0, 0.05, 0.5, 0.0);
+        let hue_scale = Scale::new(gtk4::Orientation::Horizontal, Some(&hue_adj));
+        hue_scale.set_value(0.0);
+        hue_scale.set_draw_value(false);
+        panel.append(&hue_scale);
+
+        let wb_row = GBox::new(Orientation::Horizontal, 6);
+        let wb_auto_button = Button::with_label("Auto");
+        let pick_button = Button::with_label("Pick");
+        let reset_wb_btn = Button::with_label("Reset");
+        let wb_value = Label::new(Some("+0.00 · +0.00"));
+        wb_value.add_css_class("editor-value");
+        wb_value.set_hexpand(true);
+        wb_value.set_halign(gtk4::Align::End);
+        wb_row.append(&wb_auto_button);
+        wb_row.append(&pick_button);
+        wb_row.append(&reset_wb_btn);
+        wb_row.append(&wb_value);
+        // Auto-WB + neutral-picker need the camera color matrix, which the port
+        // doesn't carry yet — keep the buttons present but disabled (see report).
+        wb_auto_button.set_sensitive(false);
+        pick_button.set_sensitive(false);
+        panel.append(&wb_row);
+
+        // ---- Crop ----
+        panel.append(&section_label("Crop"));
+        let presets = GBox::new(Orientation::Horizontal, 6);
+        let crop_11 = Button::with_label("1:1");
+        let crop_23 = Button::with_label("2:3");
+        let crop_32 = Button::with_label("3:2");
+        let crop_orig = Button::with_label("Original");
+        for b in [&crop_11, &crop_23, &crop_32, &crop_orig] {
+            b.set_hexpand(true);
+            presets.append(b);
+        }
+        panel.append(&presets);
+
+        // ---- Image ----
+        panel.append(&section_label("Image"));
+        let info = GBox::new(Orientation::Vertical, 2);
+        let info1 = Label::new(Some(""));
+        info1.add_css_class("editor-value");
+        info1.set_halign(gtk4::Align::Start);
+        let info2 = Label::new(Some(""));
+        info2.add_css_class("editor-value");
+        info2.set_halign(gtk4::Align::Start);
+        info.append(&info1);
+        info.append(&info2);
+        panel.append(&info);
+
+        // Hint (crop-interaction hint; crop drag is deferred in the port).
+        let hint = Label::new(Some(
+            "Drag handles to resize · drag inside to move · Shift keeps ratio",
+        ));
+        hint.add_css_class("dim-label");
+        hint.set_halign(gtk4::Align::Start);
+        hint.set_wrap(true);
+        panel.append(&hint);
+
+        // Nav: ‹ Prev | Next ›.
+        let nav_row = GBox::new(Orientation::Horizontal, 6);
+        let nav_prev = Button::with_label("‹ Prev");
+        let nav_next = Button::with_label("Next ›");
+        nav_prev.set_hexpand(true);
+        nav_next.set_hexpand(true);
+        nav_row.append(&nav_prev);
+        nav_row.append(&nav_next);
+        panel.append(&nav_row);
+
+        // Bottom: Reject | Close.
+        let bottom = GBox::new(Orientation::Horizontal, 6);
+        let reject_button = Button::with_label("Reject");
+        reject_button.add_css_class("editor-reject");
+        let close_button = Button::with_label("Close");
+        reject_button.set_hexpand(true);
+        close_button.set_hexpand(true);
+        bottom.append(&reject_button);
+        bottom.append(&close_button);
+        panel.append(&bottom);
+
+        panel_scroll.set_child(Some(&panel));
+        root.append(&panel_scroll);
 
         let screen = Self {
             root,
             preview,
-            back_button,
+            nav_prev,
+            nav_next,
+            file_label,
             histogram_area,
             exposure_scale,
-            mode_dropdown,
             temp_scale,
             hue_scale,
-            reset_button,
-            auto_button,
-            auto_wb_button,
-            crop_button,
-            raw_controls,
+            ev_value,
+            wb_value,
+            info1,
+            info2,
+            auto_exposure_btn,
+            slide_exposure_btn,
+            rest_exposure_btn,
+            reset_wb_btn,
+            crop_11,
+            crop_23,
+            crop_32,
+            crop_orig,
+            reject_button,
+            close_button,
             active_id: Rc::new(Cell::new(None)),
+            full_size: Rc::new(Cell::new(None)),
+            is_raw: Rc::new(Cell::new(false)),
             suppress: Rc::new(Cell::new(false)),
             state,
             on_event,
         };
 
-        // Wire controls → PhotoEdit.
         screen.wire_controls();
-        // Back → clear the active photo (controller switches back to the grid).
-        let on = Arc::clone(&screen.on_event);
-        screen.back_button.connect_clicked(move |_| {
-            on(AppEvent::ActivePhoto { index: None });
-        });
+        screen.wire_buttons();
         screen
     }
 
-    /// Push a photo into the editor: set active id, adjustments, and show/hide RAW controls.
-    ///
-    /// The `set_selected`/`set_value` calls below fire their signals synchronously;
-    /// the `suppress` flag stops them from emitting a PhotoEdit with mixed
-    /// old/new control values. The EV-sensitivity mode-notify is intentionally NOT
-    /// suppressed: it sets the correct enabled/disabled state for the loaded mode.
-    pub fn set_photo(&mut self, id: u64, adjustments: &Adjustments, is_raw: bool) {
+    /// Push a photo into the editor: set active id, name, adjustments and the
+    /// info/nav rows. `shown_ev` is the effective EV (autoEV in auto/aggressive,
+    /// the manual EV otherwise) — what the slider should display.
+    pub fn set_photo(
+        &mut self,
+        id: u64,
+        name: &str,
+        adjustments: &Adjustments,
+        shown_ev: f32,
+        is_raw: bool,
+        full_size: Option<(u32, u32)>,
+    ) {
         self.suppress.set(true);
         self.active_id.set(Some(id));
-        self.raw_controls.set_visible(is_raw);
-        self.mode_dropdown.set_selected(match adjustments.exposure_mode {
-            ExposureMode::Auto => 0,
-            ExposureMode::Aggressive => 1,
-            ExposureMode::Manual => 2,
-        });
-        self.exposure_scale.set_value(adjustments.exposure_ev as f64);
+        self.is_raw.set(is_raw);
+        self.full_size.set(full_size);
+        self.file_label.set_text(name);
+        self.file_label.set_tooltip_text(Some(name));
+        self.exposure_scale.set_value(shown_ev as f64);
         self.temp_scale.set_value(adjustments.wb_offset as f64);
         self.hue_scale.set_value(adjustments.hue as f64);
         self.suppress.set(false);
+        self.refresh_value_labels();
+        self.refresh_image_info();
     }
 
     pub fn set_preview(&self, texture: Option<&gdk4::Texture>) {
@@ -211,85 +349,253 @@ impl EditorScreen {
         });
     }
 
-    /// Each control closure owns clones of the field handles + a clone of the
-    /// `active_id`/`suppress` slots and the `on_event` callback, so no reference
-    /// to `self` leaks into the `'static` signal handlers.
+    pub fn set_nav(&self, has_prev: bool, has_next: bool) {
+        self.nav_prev.set_sensitive(has_prev);
+        self.nav_next.set_sensitive(has_next);
+    }
+
+    fn refresh_value_labels(&self) {
+        self.ev_value
+            .set_text(&format!("{:+.2} EV", self.exposure_scale.value()));
+        self.wb_value.set_text(&format!(
+            "{:+.2} · {:+.2}",
+            self.temp_scale.value(),
+            self.hue_scale.value()
+        ));
+    }
+
+    fn refresh_image_info(&self) {
+        match (self.full_size.get(), self.active_id.get()) {
+            (Some(full), Some(id)) => {
+                let src = if self.is_raw.get() { "RAW" } else { "JPEG" };
+                self.info1
+                    .set_text(&format!("{src} · {} × {}", full.0, full.1));
+                let adj = current_adjustments(&self.state.read().unwrap(), id);
+                self.info2.set_text(&output_line(full, adj.crop));
+            }
+            _ => {
+                self.info1.set_text("");
+                self.info2.set_text("");
+            }
+        }
+    }
+
     fn wire_controls(&self) {
         let on_event = Arc::clone(&self.on_event);
         let active_id = Rc::clone(&self.active_id);
+        let state = Arc::clone(&self.state);
         let suppress = Rc::clone(&self.suppress);
-        let mode = self.mode_dropdown.clone();
         let ev = self.exposure_scale.clone();
         let temp = self.temp_scale.clone();
         let hue = self.hue_scale.clone();
+        let ev_lab = self.ev_value.clone();
+        let wb_lab = self.wb_value.clone();
 
-        // EV slider is only meaningful in Manual — grey it out otherwise.
-        let mode_for_sens = mode.clone();
-        let ev_for_sens = ev.clone();
-        mode_for_sens.connect_selected_notify(move |d| {
-            let manual = d.selected() == 2;
-            ev_for_sens.set_sensitive(manual);
+        // EV slider: dragging sets Manual exposure with the slider value.
+        let (a, o, s, st, lab) = (
+            Rc::clone(&active_id),
+            Arc::clone(&on_event),
+            Rc::clone(&suppress),
+            Arc::clone(&state),
+            ev_lab.clone(),
+        );
+        ev.connect_value_changed(move |sc| {
+            if s.get() {
+                return;
+            }
+            let Some(id) = a.get() else { return };
+            let mut adj = current_adjustments(&st.read().unwrap(), id);
+            adj.exposure_mode = ExposureMode::Manual;
+            adj.exposure_ev = sc.value() as f32;
+            lab.set_text(&format!("{:+.2} EV", adj.exposure_ev));
+            o(AppEvent::PhotoEdit { id, adjustments: adj });
         });
 
-        let (a, o, m, e, t, h) =
-            (Rc::clone(&active_id), Arc::clone(&on_event), mode.clone(), ev.clone(), temp.clone(), hue.clone());
-        let sup = Rc::clone(&suppress);
-        mode.connect_selected_notify(move |_| emit(&a, &sup, &m, &e, &t, &h, &*o));
+        // Temperature slider.
+        let (a, o, s, st, hue2, lab) = (
+            Rc::clone(&active_id),
+            Arc::clone(&on_event),
+            Rc::clone(&suppress),
+            Arc::clone(&state),
+            hue.clone(),
+            wb_lab.clone(),
+        );
+        temp.connect_value_changed(move |sc| {
+            if s.get() {
+                return;
+            }
+            let Some(id) = a.get() else { return };
+            let mut adj = current_adjustments(&st.read().unwrap(), id);
+            adj.wb_offset = sc.value() as f32;
+            lab.set_text(&format!("{:+.2} · {:+.2}", adj.wb_offset, hue2.value()));
+            o(AppEvent::PhotoEdit { id, adjustments: adj });
+        });
 
-        let (a, o, m, e, t, h) =
-            (Rc::clone(&active_id), Arc::clone(&on_event), mode.clone(), ev.clone(), temp.clone(), hue.clone());
-        let sup = Rc::clone(&suppress);
-        ev.connect_value_changed(move |_| emit(&a, &sup, &m, &e, &t, &h, &*o));
+        // Hue slider.
+        let (a, o, s, st, temp2, lab) = (
+            Rc::clone(&active_id),
+            Arc::clone(&on_event),
+            Rc::clone(&suppress),
+            Arc::clone(&state),
+            temp.clone(),
+            wb_lab,
+        );
+        hue.connect_value_changed(move |sc| {
+            if s.get() {
+                return;
+            }
+            let Some(id) = a.get() else { return };
+            let mut adj = current_adjustments(&st.read().unwrap(), id);
+            adj.hue = sc.value() as f32;
+            lab.set_text(&format!("{:+.2} · {:+.2}", temp2.value(), adj.hue));
+            o(AppEvent::PhotoEdit { id, adjustments: adj });
+        });
+    }
 
-        let (a, o, m, e, t, h) =
-            (Rc::clone(&active_id), Arc::clone(&on_event), mode.clone(), ev.clone(), temp.clone(), hue.clone());
-        let sup = Rc::clone(&suppress);
-        temp.connect_value_changed(move |_| emit(&a, &sup, &m, &e, &t, &h, &*o));
+    fn wire_buttons(&self) {
+        let on_event = Arc::clone(&self.on_event);
+        let active_id = Rc::clone(&self.active_id);
+        let state = Arc::clone(&self.state);
+        let suppress = Rc::clone(&self.suppress);
+        let ev = self.exposure_scale.clone();
+        let temp = self.temp_scale.clone();
+        let hue = self.hue_scale.clone();
+        let full_size = Rc::clone(&self.full_size);
+        let ev_lab = self.ev_value.clone();
+        let wb_lab = self.wb_value.clone();
+        let info2 = self.info2.clone();
 
-        let (a, o, m, e, t, h) =
-            (Rc::clone(&active_id), Arc::clone(&on_event), mode.clone(), ev.clone(), temp.clone(), hue.clone());
-        let sup = Rc::clone(&suppress);
-        hue.connect_value_changed(move |_| emit(&a, &sup, &m, &e, &t, &h, &*o));
+        // Exposure: Auto / Slide.
+        let (a, o, st) = (
+            Rc::clone(&active_id),
+            Arc::clone(&on_event),
+            Arc::clone(&state),
+        );
+        self.auto_exposure_btn.connect_clicked(move |_| {
+            let Some(id) = a.get() else { return };
+            let mut adj = current_adjustments(&st.read().unwrap(), id);
+            adj.exposure_mode = ExposureMode::Auto;
+            o(AppEvent::PhotoEdit { id, adjustments: adj });
+        });
+        let (a, o, st) = (
+            Rc::clone(&active_id),
+            Arc::clone(&on_event),
+            Arc::clone(&state),
+        );
+        self.slide_exposure_btn.connect_clicked(move |_| {
+            let Some(id) = a.get() else { return };
+            let mut adj = current_adjustments(&st.read().unwrap(), id);
+            adj.exposure_mode = ExposureMode::Aggressive;
+            o(AppEvent::PhotoEdit { id, adjustments: adj });
+        });
+
+        // Rest: manual EV = 0, snap the slider.
+        let (a, o, st, s, ev, lab) = (
+            Rc::clone(&active_id),
+            Arc::clone(&on_event),
+            Arc::clone(&state),
+            Rc::clone(&suppress),
+            ev.clone(),
+            ev_lab.clone(),
+        );
+        self.rest_exposure_btn.connect_clicked(move |_| {
+            let Some(id) = a.get() else { return };
+            let mut adj = current_adjustments(&st.read().unwrap(), id);
+            adj.exposure_mode = ExposureMode::Manual;
+            adj.exposure_ev = 0.0;
+            s.set(true);
+            ev.set_value(0.0);
+            s.set(false);
+            lab.set_text("+0.00 EV");
+            o(AppEvent::PhotoEdit { id, adjustments: adj });
+        });
+
+        // WB Reset: warmth + hue back to neutral, snap both sliders.
+        let (a, o, st, s, temp, hue, lab) = (
+            Rc::clone(&active_id),
+            Arc::clone(&on_event),
+            Arc::clone(&state),
+            Rc::clone(&suppress),
+            temp.clone(),
+            hue.clone(),
+            wb_lab.clone(),
+        );
+        self.reset_wb_btn.connect_clicked(move |_| {
+            let Some(id) = a.get() else { return };
+            let mut adj = current_adjustments(&st.read().unwrap(), id);
+            adj.wb_offset = 0.0;
+            adj.hue = 0.0;
+            s.set(true);
+            temp.set_value(0.0);
+            hue.set_value(0.0);
+            s.set(false);
+            lab.set_text("+0.00 · +0.00");
+            o(AppEvent::PhotoEdit { id, adjustments: adj });
+        });
+
+        // Crop presets.
+        self.crop_11.connect_clicked(crop_preset_handler(
+            1.0,
+            Rc::clone(&active_id),
+            Arc::clone(&state),
+            Arc::clone(&on_event),
+            Rc::clone(&full_size),
+            info2.clone(),
+        ));
+        self.crop_23.connect_clicked(crop_preset_handler(
+            2.0 / 3.0,
+            Rc::clone(&active_id),
+            Arc::clone(&state),
+            Arc::clone(&on_event),
+            Rc::clone(&full_size),
+            info2.clone(),
+        ));
+        self.crop_32.connect_clicked(crop_preset_handler(
+            3.0 / 2.0,
+            Rc::clone(&active_id),
+            Arc::clone(&state),
+            Arc::clone(&on_event),
+            Rc::clone(&full_size),
+            info2.clone(),
+        ));
+
+        // Original: no crop.
+        let (a, o, st, full, i2) = (
+            Rc::clone(&active_id),
+            Arc::clone(&on_event),
+            Arc::clone(&state),
+            Rc::clone(&full_size),
+            info2,
+        );
+        self.crop_orig.connect_clicked(move |_| {
+            let Some(id) = a.get() else { return };
+            let mut adj = current_adjustments(&st.read().unwrap(), id);
+            adj.crop = None;
+            if let Some(full) = full.get() {
+                i2.set_text(&output_line(full, None));
+            }
+            o(AppEvent::PhotoEdit { id, adjustments: adj });
+        });
+
+        // Nav.
+        let (o1, o2) = (Arc::clone(&on_event), Arc::clone(&on_event));
+        self.nav_prev
+            .connect_clicked(move |_| o1(AppEvent::Nav { delta: -1 }));
+        self.nav_next
+            .connect_clicked(move |_| o2(AppEvent::Nav { delta: 1 }));
+
+        // Reject / Close.
+        let (o3, o4) = (Arc::clone(&on_event), Arc::clone(&on_event));
+        self.reject_button
+            .connect_clicked(move |_| o3(AppEvent::RejectActive));
+        self.close_button
+            .connect_clicked(move |_| o4(AppEvent::ActivePhoto { index: None }));
     }
 }
 
-/// Recompute `Adjustments` from the current control values and emit PhotoEdit
-/// for the active photo (no-op while no photo is loaded, or while `set_photo`
-/// is programming the controls — see the `suppress` flag).
-fn emit(
-    active_id: &Cell<Option<u64>>,
-    suppress: &Cell<bool>,
-    mode: &gtk4::DropDown,
-    ev: &Scale,
-    temp: &Scale,
-    hue: &Scale,
-    on_event: &(dyn Fn(AppEvent) + Send + Sync),
-) {
-    if suppress.get() {
-        return;
-    }
-    if let Some(id) = active_id.get() {
-        let adjustments = Adjustments {
-            exposure_mode: match mode.selected() {
-                1 => ExposureMode::Aggressive,
-                2 => ExposureMode::Manual,
-                _ => ExposureMode::Auto,
-            },
-            exposure_ev: ev.value() as f32,
-            wb_offset: temp.value() as f32,
-            hue: hue.value() as f32,
-            crop: None,
-        };
-        on_event(AppEvent::PhotoEdit { id, adjustments });
-    }
-}
-
-fn row_labeled(text: &str, widget: &impl IsA<gtk4::Widget>) -> GBox {
-    let row = GBox::new(Orientation::Horizontal, 8);
-    let label = Label::new(Some(text));
-    label.set_width_request(120);
-    label.set_halign(gtk4::Align::Start);
-    row.append(&label);
-    row.append(widget);
-    row
+fn section_label(text: &str) -> Label {
+    let l = Label::new(Some(text));
+    l.add_css_class("editor-section");
+    l.set_halign(gtk4::Align::Start);
+    l
 }
