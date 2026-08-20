@@ -89,6 +89,9 @@ pub struct AppController {
     ui_events_sender: Sender<UiEvent>,
     screen_events: Receiver<AppEvent>,
 
+    // Persisted app config (api creds, target group, session path).
+    config: crate::config::AppConfig,
+
     // Group dropdown + export bookkeeping.
     dialogs: Vec<DialogInfo>,
     cam_mul: HashMap<u64, Option<[f32; 4]>>,
@@ -107,14 +110,15 @@ pub struct AppController {
 
 impl AppController {
     pub fn new(state: Arc<RwLock<AppState>>, window: adw::ApplicationWindow) -> Self {
-        // Telegram worker: commands out, events back.
+        // Telegram worker: commands out, events back. Credentials and the session
+        // path come from the persisted TOML config.
         let (events_tx, events_rx) = channel::<TEvent>();
-        let (api_id, api_hash) = crate::config::telegram_credentials();
+        let config = crate::config::AppConfig::load();
         let telegram_cmd = crate::telegram::worker::spawn(
             TelegramWorkerConfig {
-                session_path: crate::config::session_path(),
-                api_id,
-                api_hash,
+                session_path: config.session_path.clone(),
+                api_id: config.api_id,
+                api_hash: config.api_hash.clone(),
             },
             events_tx,
         );
@@ -128,6 +132,14 @@ impl AppController {
 
         let stack = gtk4::Stack::new();
         let toast = Toast::new();
+        if config.api_id == 0 || config.api_hash.is_empty() {
+            // No credentials configured: the worker will fail to connect. Point the
+            // user at the config file rather than a cryptic connect error.
+            toast.show(&format!(
+                "Set TG_API_ID / TG_API_HASH in {}",
+                crate::config::AppConfig::path().display()
+            ));
+        }
 
         let login_on = {
             let tx = screen_tx.clone();
@@ -172,6 +184,7 @@ impl AppController {
             window,
             ui_events_sender: ui_tx,
             screen_events: screen_rx,
+            config,
             dialogs: Vec::new(),
             cam_mul: HashMap::new(),
             send_pending: Vec::new(),
@@ -474,7 +487,12 @@ impl AppController {
         self.main_screen.group_dropdown.set_expression(Some(&expr));
         self.main_screen.group_dropdown.set_model(Some(&model));
         if !self.dialogs.is_empty() {
-            self.main_screen.group_dropdown.set_selected(0);
+            // Pre-select the persisted target group if it's still in the dialog list.
+            let idx = self.dialogs.iter().position(|d| Some(d.id) == self.config.target_peer_id);
+            match idx {
+                Some(i) => self.main_screen.group_dropdown.set_selected(i as u32),
+                None => self.main_screen.group_dropdown.set_selected(0),
+            }
         }
     }
 
@@ -676,6 +694,9 @@ impl AppController {
             self.toast.show("Pick a target group");
             return;
         };
+        // Persist the chosen target group so it's pre-selected next launch.
+        self.config.target_peer_id = Some(peer.id);
+        let _ = self.config.save();
 
         let jobs: Vec<(u64, SourceType, Adjustments, Option<[f32; 4]>, PathBuf)> = {
             let st = self.state.read().unwrap();
