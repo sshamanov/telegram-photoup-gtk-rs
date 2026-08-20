@@ -5,6 +5,7 @@ use gtk4::prelude::*;
 use crate::state::{AppState, AppEvent, reduce};
 
 pub mod editor;
+pub mod grid;
 pub mod login;
 pub mod main_screen;
 pub mod toast;
@@ -62,6 +63,14 @@ fn build_window(app: &adw::Application, state: Arc<RwLock<AppState>>) {
     // The `login` struct handle drops here; the widget tree (stack → root → children)
     // keeps the visible UI alive. Task 21 must hold the screen handles to switch
     // steps from AuthStatus (set_data needs Send + 'static, so Rc<RefCell> won't fit).
+
+    // Main screen: group picker + load/send + thumbnail grid. Mounted but hidden —
+    // the login screen is the visible child until Task 21 switches to it on auth.
+    let main = crate::ui::main_screen::MainScreen::new();
+    stack.add_named(&main.root, Some("main"));
+    // Same lifetime story as `login` above: `main` drops here but the widget tree
+    // (stack → root → header → scroller → grid → store) keeps everything alive.
+    // Task 21 restructures screen holding.
 
     window.present();
 }
