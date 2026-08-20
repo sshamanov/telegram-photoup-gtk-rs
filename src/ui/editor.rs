@@ -772,6 +772,9 @@ impl EditorScreen {
         self.cam_matrix.borrow_mut().take();
         self.picking.set(false);
         self.pick_button.remove_css_class("suggested-action");
+        // Clear the preview so closing the editor never leaves the previous
+        // photo's image visible while the next one renders.
+        self.preview.set_paintable(None::<&gdk4::Texture>);
     }
 
     pub fn set_histogram(&self, bins: &[u32]) {

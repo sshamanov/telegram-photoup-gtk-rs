@@ -1665,6 +1665,14 @@ impl AppController {
             .set_photo(active.0, &active.1, &active.2, active.3, active.4, active.5);
         self.editor
             .set_cam_matrix(self.cam_matrix.get(&active.0).copied().flatten());
+        // Show the already-decoded thumbnail immediately so the editor is never
+        // blank — and never shows the previous photo — while the ≤1024 preview
+        // renders in the background and then upgrades this image.
+        if let Some(row) = self.row_map.get(&active.0) {
+            if let Some(tex) = row.texture() {
+                self.editor.set_preview(Some(&tex));
+            }
+        }
         self.schedule_preview(active.0);
     }
 }
