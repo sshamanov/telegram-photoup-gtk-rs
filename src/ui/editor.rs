@@ -13,6 +13,8 @@ use gtk4::prelude::*;
 use gtk4::{Box as GBox, Button, DrawingArea, Label, Orientation, Picture, Scale};
 
 use crate::image::process::export_dimensions;
+use crate::image::resize::downscale_rgba;
+use crate::image::srgb::{auto_wb, wb_from_pick};
 use crate::image::types::{Adjustments, ExposureMode, NormalizedCrop};
 use crate::state::{AppEvent, AppState};
 
@@ -34,6 +36,129 @@ fn current_adjustments(state: &AppState, id: u64) -> Adjustments {
 fn output_line(full: (u32, u32), crop: Option<NormalizedCrop>) -> String {
     let out = export_dimensions(full.0, full.1, crop.as_ref(), EXPORT_EDGE);
     format!("output {} × {} px", out.width, out.height)
+}
+
+/// The camera→sRGB matrix is carried as libraw's `rgb_cam[3][4]` (4 columns, 3
+/// used); the WB math needs the 3×3 part.
+fn cam_matrix3x3(m: Option<[[f32; 4]; 3]>) -> Option<[[f32; 3]; 3]> {
+    m.map(|m| [
+        [m[0][0], m[0][1], m[0][2]],
+        [m[1][0], m[1][1], m[1][2]],
+        [m[2][0], m[2][1], m[2][2]],
+    ])
+}
+
+/// Grey-world reference for auto-WB (photoup `autoWhiteBalance`): downscale the
+/// preview to ≤64×64, average only near-neutral bright pixels, and fall back to
+/// the whole-image mean when too few qualify. Returns the channel means (0..255).
+fn auto_wb_mean(rgba: &[u8], w: u32, h: u32) -> Option<(f32, f32, f32)> {
+    // Downscale to ≤64×64 (photoup draws the preview to a 64×64 canvas).
+    let (dw, dh) = (w.min(64), h.min(64));
+    let down = downscale_rgba(rgba, w, h, dw, dh);
+    let mut sr = 0.0f64;
+    let mut sg = 0.0f64;
+    let mut sb = 0.0f64;
+    let mut n = 0usize;
+    for px in down.chunks_exact(4) {
+        let (r, g, b) = (px[0] as f32, px[1] as f32, px[2] as f32);
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        // Near-neutral, reasonably bright → neutral reference. Saturated scene
+        // colours (grass, sky, walls) mustn't pull the WB into green/magenta.
+        if max - min < 60.0 && 0.2126 * r + 0.7152 * g + 0.0722 * b > 60.0 {
+            sr += r as f64;
+            sg += g as f64;
+            sb += b as f64;
+            n += 1;
+        }
+    }
+    if n < 16 {
+        // Too few neutral pixels: use the whole-image mean.
+        sr = 0.0;
+        sg = 0.0;
+        sb = 0.0;
+        n = 0;
+        for px in down.chunks_exact(4) {
+            sr += px[0] as f64;
+            sg += px[1] as f64;
+            sb += px[2] as f64;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    Some((
+        (sr / n as f64) as f32,
+        (sg / n as f64) as f32,
+        (sb / n as f64) as f32,
+    ))
+}
+
+/// Average a fixed 7×7 area of the preview around pixel (cx, cy) — the GIMP-style
+/// grey-point picker (photoup `pickNeutral`; larger than one pixel so noise can't
+/// skew the WB). Returns the channel means (0..255), or None if the area is empty.
+fn pick_sample(rgba: &[u8], w: u32, h: u32, cx: f64, cy: f64) -> Option<(f32, f32, f32)> {
+    const WIN: isize = 7;
+    let cxp = cx.floor() as isize;
+    let cyp = cy.floor() as isize;
+    let sx0 = (cxp - WIN / 2).max(0).min((w as isize - WIN).max(0));
+    let sy0 = (cyp - WIN / 2).max(0).min((h as isize - WIN).max(0));
+    let (mut sr, mut sg, mut sb) = (0.0f64, 0.0f64, 0.0f64);
+    let mut n = 0usize;
+    for dy in 0..WIN {
+        let yy = sy0 + dy;
+        if yy >= h as isize {
+            break;
+        }
+        for dx in 0..WIN {
+            let xx = sx0 + dx;
+            if xx >= w as isize {
+                break;
+            }
+            let o = ((yy * w as isize + xx) as usize) * 4;
+            sr += rgba[o] as f64;
+            sg += rgba[o + 1] as f64;
+            sb += rgba[o + 2] as f64;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    Some((
+        (sr / n as f64) as f32,
+        (sg / n as f64) as f32,
+        (sb / n as f64) as f32,
+    ))
+}
+
+/// A WB correction is clamped to the ±2 slider range; reflect it on the warmth +
+/// hue sliders and the value label, then emit a `PhotoEdit` so the preview
+/// re-renders with the new WB (photoup `updateAdjustments`).
+#[allow(clippy::too_many_arguments)]
+fn apply_wb(
+    id: u64,
+    offset: f32,
+    hue: f32,
+    state: &std::sync::Arc<std::sync::RwLock<AppState>>,
+    on_event: &std::sync::Arc<dyn Fn(AppEvent) + Send + Sync + 'static>,
+    suppress: &Rc<Cell<bool>>,
+    temp: &Scale,
+    hue_scale: &Scale,
+    wb_lab: &Label,
+) {
+    let offset = offset.clamp(-2.0, 2.0);
+    let hue = hue.clamp(-2.0, 2.0);
+    suppress.set(true);
+    temp.set_value(offset as f64);
+    hue_scale.set_value(hue as f64);
+    suppress.set(false);
+    wb_lab.set_text(&format!("{:+.2} · {:+.2}", offset, hue));
+    let mut adj = current_adjustments(&state.read().unwrap(), id);
+    adj.wb_offset = offset;
+    adj.hue = hue;
+    on_event(AppEvent::PhotoEdit { id, adjustments: adj });
 }
 
 // ---- Crop overlay (photoup `.stage` + `.crop-box`) ----
@@ -329,6 +454,8 @@ pub struct EditorScreen {
     auto_exposure_btn: Button,
     slide_exposure_btn: Button,
     rest_exposure_btn: Button,
+    wb_auto_button: Button,
+    pick_button: Button,
     reset_wb_btn: Button,
     crop_11: Button,
     crop_23: Button,
@@ -343,6 +470,15 @@ pub struct EditorScreen {
     /// The active crop selection, mirrored from the photo's adjustments and
     /// updated live by presets / drags; the overlay draws from this.
     crop: Rc<RefCell<Option<NormalizedCrop>>>,
+    /// The active photo's preview RGBA (≤1024 edge), pushed on every PreviewReady;
+    /// the WB Auto / neutral-picker sample from it.
+    preview_rgba: Rc<RefCell<Option<(Vec<u8>, u32, u32)>>>,
+    /// The active photo's camera→sRGB color matrix (RAW only; `None` for JPEG /
+    /// no matrix), pushed by the controller for WB Auto/Pick.
+    cam_matrix: Rc<RefCell<Option<[[f32; 4]; 3]>>>,
+    /// Pick mode (photoup `pickingNeutral`): clicking the preview samples a
+    /// neutral point. Toggled by the Pick button.
+    picking: Rc<Cell<bool>>,
     is_raw: Rc<Cell<bool>>,
     /// Suppresses PhotoEdit emission while `set_photo`/buttons program the
     /// controls (their `set_value` calls fire signals synchronously).
@@ -429,6 +565,9 @@ impl EditorScreen {
         ev_value.add_css_class("editor-value");
         ev_value.set_hexpand(true);
         ev_value.set_halign(gtk4::Align::End);
+        // Fixed character width so the label never jitters as the value changes
+        // ("+0.00 EV" ↔ "+?.?? EV" ↔ "-1.25 EV" are all 5 chars + unit).
+        ev_value.set_width_chars(6);
         ev_row.append(&auto_exposure_btn);
         ev_row.append(&slide_exposure_btn);
         ev_row.append(&rest_exposure_btn);
@@ -457,14 +596,13 @@ impl EditorScreen {
         wb_value.add_css_class("editor-value");
         wb_value.set_hexpand(true);
         wb_value.set_halign(gtk4::Align::End);
+        wb_value.set_width_chars(13);
         wb_row.append(&wb_auto_button);
         wb_row.append(&pick_button);
         wb_row.append(&reset_wb_btn);
         wb_row.append(&wb_value);
-        // Auto-WB + neutral-picker need the camera color matrix, which the port
-        // doesn't carry yet — keep the buttons present but disabled (see report).
-        wb_auto_button.set_sensitive(false);
-        pick_button.set_sensitive(false);
+        // Auto-WB + neutral-picker now have the preview pixels + camera matrix
+        // wired (see wire_buttons / wire_pick) — enabled.
         panel.append(&wb_row);
 
         // ---- Crop ----
@@ -544,6 +682,8 @@ impl EditorScreen {
             auto_exposure_btn,
             slide_exposure_btn,
             rest_exposure_btn,
+            wb_auto_button,
+            pick_button,
             reset_wb_btn,
             crop_11,
             crop_23,
@@ -554,6 +694,9 @@ impl EditorScreen {
             active_id: Rc::new(Cell::new(None)),
             full_size: Rc::new(Cell::new(None)),
             crop,
+            preview_rgba: Rc::new(RefCell::new(None)),
+            cam_matrix: Rc::new(RefCell::new(None)),
+            picking: Rc::new(Cell::new(false)),
             is_raw: Rc::new(Cell::new(false)),
             suppress: Rc::new(Cell::new(false)),
             state,
@@ -583,6 +726,12 @@ impl EditorScreen {
         self.is_raw.set(is_raw);
         self.full_size.set(full_size);
         self.crop.replace(adjustments.crop);
+        // New photo: drop the previous photo's per-photo data (preview pixels for
+        // WB sampling, camera matrix, pick mode).
+        self.preview_rgba.borrow_mut().take();
+        self.cam_matrix.borrow_mut().take();
+        self.picking.set(false);
+        self.pick_button.remove_css_class("suggested-action");
         self.crop_area.queue_draw();
         self.file_label.set_text(name);
         self.file_label.set_tooltip_text(Some(name));
@@ -596,6 +745,33 @@ impl EditorScreen {
 
     pub fn set_preview(&self, texture: Option<&gdk4::Texture>) {
         self.preview.set_paintable(texture);
+    }
+
+    /// Set the EV indicator ("+0.35 EV"); `{:+.2}` keeps the width fixed so the
+    /// label doesn't jitter as auto/manual EVs change.
+    pub fn set_ev(&self, ev: f32) {
+        self.ev_value.set_text(&format!("{ev:+.2} EV"));
+    }
+
+    /// Cache the active photo's rendered preview pixels (≤1024 edge) so WB Auto
+    /// and the neutral-picker can sample them.
+    pub fn set_preview_rgba(&self, rgba: Vec<u8>, w: u32, h: u32) {
+        *self.preview_rgba.borrow_mut() = Some((rgba, w, h));
+    }
+
+    /// Push the active photo's camera→sRGB color matrix (RAW) for WB Auto/Pick.
+    pub fn set_cam_matrix(&self, cam_matrix: Option<[[f32; 4]; 3]>) {
+        self.cam_matrix.replace(cam_matrix);
+    }
+
+    /// Drop the per-photo data the editor holds (preview pixels, camera matrix,
+    /// pick mode) — called when the editor closes so a later photo can't read a
+    /// stale previous photo's pixels/matrix.
+    pub fn release_photo_data(&self) {
+        self.preview_rgba.borrow_mut().take();
+        self.cam_matrix.borrow_mut().take();
+        self.picking.set(false);
+        self.pick_button.remove_css_class("suggested-action");
     }
 
     pub fn set_histogram(&self, bins: &[u32]) {
@@ -729,8 +905,14 @@ impl EditorScreen {
     fn wire_crop_overlay(&self) {
         let crop_draw = Rc::clone(&self.crop);
         let full_draw = Rc::clone(&self.full_size);
+        let picking_draw = Rc::clone(&self.picking);
         let area = self.crop_area.clone();
         area.set_draw_func(move |_a, cr, width, height| {
+            // While picking a neutral point the crop box is hidden (photoup's
+            // `.left.picking` state) so the preview is uncluttered.
+            if picking_draw.get() {
+                return;
+            }
             let Some(c) = *crop_draw.borrow() else { return };
             let Some(full) = full_draw.get() else { return };
             draw_crop_overlay(cr, width as f64, height as f64, full, c);
@@ -739,12 +921,17 @@ impl EditorScreen {
         let gesture = gtk4::GestureDrag::new();
         let drag: Rc<RefCell<Option<DragState>>> = Rc::new(RefCell::new(None));
 
-        // Press: pick a handle (resize) or the rect interior (move).
+        // Press: pick a handle (resize) or the rect interior (move). In pick mode
+        // the crop is inert — the GestureClick handles the press instead.
         let crop_begin = Rc::clone(&self.crop);
         let full_begin = Rc::clone(&self.full_size);
         let area_begin = self.crop_area.clone();
         let drag_begin = Rc::clone(&drag);
+        let picking_begin = Rc::clone(&self.picking);
         gesture.connect_drag_begin(move |_g, x, y| {
+            if picking_begin.get() {
+                return;
+            }
             let Some(c) = *crop_begin.borrow() else { return };
             let Some(full) = full_begin.get() else { return };
             let (aw, ah) = (area_begin.width() as f64, area_begin.height() as f64);
@@ -822,6 +1009,55 @@ impl EditorScreen {
         });
 
         self.crop_area.add_controller(gesture);
+
+        // Neutral-pick: while Pick mode is on, clicking the preview samples a 7×7
+        // area under the cursor and maps it to warmth + hue (photoup `pickNeutral`).
+        // The click lands on the crop overlay (it fills the preview area), whose
+        // coordinates map to the letterboxed image via `project` — the same rect
+        // the crop overlay draws with.
+        let click = gtk4::GestureClick::new();
+        let picking_click = Rc::clone(&self.picking);
+        let rgba_click = Rc::clone(&self.preview_rgba);
+        let cam_click = Rc::clone(&self.cam_matrix);
+        let full_click = Rc::clone(&self.full_size);
+        let id_click = Rc::clone(&self.active_id);
+        let state_click = Arc::clone(&self.state);
+        let on_click = Arc::clone(&self.on_event);
+        let area_click = self.crop_area.clone();
+        let temp_click = self.temp_scale.clone();
+        let hue_click = self.hue_scale.clone();
+        let suppress_click = Rc::clone(&self.suppress);
+        let wb_lab_click = self.wb_value.clone();
+        click.connect_pressed(move |_g, _count, x, y| {
+            if !picking_click.get() {
+                return; // normal mode: the editor has no other click action
+            }
+            let Some(id) = id_click.get() else { return };
+            let Some(full) = full_click.get() else { return };
+            let Some((data, pw, ph)) = &*rgba_click.borrow() else { return };
+            let (aw, ah) = (area_click.width() as f64, area_click.height() as f64);
+            let Some(p) = project(aw, ah, full) else { return };
+            // Normalized position over the displayed (letterboxed) image.
+            let nx = (x - p.ox) / p.disp_w;
+            let ny = (y - p.oy) / p.disp_h;
+            if !(0.0..=1.0).contains(&nx) || !(0.0..=1.0).contains(&ny) {
+                return; // clicked in the letterbox
+            }
+            let cx = nx * *pw as f64;
+            let cy = ny * *ph as f64;
+            let Some((r, g, b)) = pick_sample(data, *pw, *ph, cx, cy) else { return };
+            let gray = (r + g + b) / 3.0;
+            if gray < 8.0 || gray > 247.0 {
+                on_click(AppEvent::Toast(
+                    "Pick a neutral area (not black or blown out)".to_string(),
+                ));
+                return;
+            }
+            let (offset, hue) =
+                wb_from_pick(r, g, b, cam_matrix3x3(*cam_click.borrow()));
+            apply_wb(id, offset, hue, &state_click, &on_click, &suppress_click, &temp_click, &hue_click, &wb_lab_click);
+        });
+        self.crop_area.add_controller(click);
     }
 
     fn wire_buttons(&self) {
@@ -837,27 +1073,33 @@ impl EditorScreen {
         let wb_lab = self.wb_value.clone();
         let info2 = self.info2.clone();
 
-        // Exposure: Auto / Slide.
-        let (a, o, st) = (
+        // Exposure: Auto / Slide. Both switch to an auto mode whose EV is the
+        // render's auto-EV — show a placeholder until the re-render lands with the
+        // real value (the controller's `set_ev` then updates the label).
+        let (a, o, st, lab) = (
             Rc::clone(&active_id),
             Arc::clone(&on_event),
             Arc::clone(&state),
+            ev_lab.clone(),
         );
         self.auto_exposure_btn.connect_clicked(move |_| {
             let Some(id) = a.get() else { return };
             let mut adj = current_adjustments(&st.read().unwrap(), id);
             adj.exposure_mode = ExposureMode::Auto;
+            lab.set_text("+?.?? EV");
             o(AppEvent::PhotoEdit { id, adjustments: adj });
         });
-        let (a, o, st) = (
+        let (a, o, st, lab) = (
             Rc::clone(&active_id),
             Arc::clone(&on_event),
             Arc::clone(&state),
+            ev_lab.clone(),
         );
         self.slide_exposure_btn.connect_clicked(move |_| {
             let Some(id) = a.get() else { return };
             let mut adj = current_adjustments(&st.read().unwrap(), id);
             adj.exposure_mode = ExposureMode::Aggressive;
+            lab.set_text("+?.?? EV");
             o(AppEvent::PhotoEdit { id, adjustments: adj });
         });
 
@@ -903,6 +1145,45 @@ impl EditorScreen {
             s.set(false);
             lab.set_text("+0.00 · +0.00");
             o(AppEvent::PhotoEdit { id, adjustments: adj });
+        });
+
+        // WB Auto: grey-world over near-neutral bright pixels of the preview,
+        // biased warm ("happy day"). Falls back to the whole-image mean if too few
+        // neutral pixels (photoup `autoWhiteBalance`).
+        let (a, o, st, prgba, cm, s, temp, hue, lab) = (
+            Rc::clone(&active_id),
+            Arc::clone(&on_event),
+            Arc::clone(&state),
+            Rc::clone(&self.preview_rgba),
+            Rc::clone(&self.cam_matrix),
+            Rc::clone(&suppress),
+            // WB Reset's `let` shadowed + moved `temp`/`hue`, so clone fresh here.
+            self.temp_scale.clone(),
+            self.hue_scale.clone(),
+            wb_lab.clone(),
+        );
+        self.wb_auto_button.connect_clicked(move |_| {
+            let Some(id) = a.get() else { return };
+            let Some((data, pw, ph)) = &*prgba.borrow() else { return };
+            let Some((r, g, b)) = auto_wb_mean(data, *pw, *ph) else { return };
+            let (wb_offset, wb_hue) =
+                auto_wb(r, g, b, cam_matrix3x3(*cm.borrow()));
+            apply_wb(id, wb_offset, wb_hue, &st, &o, &s, &temp, &hue, &lab);
+        });
+
+        // Pick: toggle neutral-pick mode. While active, clicking the preview
+        // samples a neutral point (see wire_pick); the button lights up so the
+        // mode is obvious (photoup `pickingNeutral` highlight).
+        let (p, area) = (Rc::clone(&self.picking), self.crop_area.clone());
+        self.pick_button.connect_clicked(move |btn| {
+            let next = !p.get();
+            p.set(next);
+            if next {
+                btn.add_css_class("suggested-action");
+            } else {
+                btn.remove_css_class("suggested-action");
+            }
+            area.queue_draw(); // hide the crop box while picking
         });
 
         // Crop presets (each also mirrors the selection into the overlay).
@@ -980,4 +1261,106 @@ fn section_label(text: &str) -> Label {
     l.add_css_class("editor-section");
     l.set_halign(gtk4::Align::Start);
     l
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn rgba_fill(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+        let mut v = vec![0u8; (w * h * 4) as usize];
+        for px in v.chunks_exact_mut(4) {
+            px[0] = rgb[0];
+            px[1] = rgb[1];
+            px[2] = rgb[2];
+            px[3] = 255;
+        }
+        v
+    }
+
+    /// A test editor wired to a recorder that captures emitted AppEvents.
+    fn test_editor() -> (EditorScreen, Arc<Mutex<Vec<AppEvent>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let on_event: Arc<dyn Fn(AppEvent) + Send + Sync + 'static> = {
+            let events = Arc::clone(&events);
+            Arc::new(move |ev| events.lock().unwrap().push(ev))
+        };
+        let state = Arc::new(RwLock::new(AppState::default()));
+        let editor = EditorScreen::new(state, on_event);
+        (editor, events)
+    }
+
+    #[test]
+    fn wb_mean_helpers_sample() {
+        // Neutral gray: all pixels qualify as near-neutral → mean is exactly gray.
+        let gray = rgba_fill(16, 16, [128, 128, 128]);
+        let (r, g, b) = auto_wb_mean(&gray, 16, 16).expect("gray sample");
+        assert!((r - 128.0).abs() < 0.5 && (g - 128.0).abs() < 0.5 && (b - 128.0).abs() < 0.5);
+
+        // Saturated warm: max-min = 120 > 60 → no neutral pixels → whole-image mean.
+        let warm = rgba_fill(16, 16, [200, 128, 80]);
+        let (r, g, b) = auto_wb_mean(&warm, 16, 16).expect("warm sample");
+        assert!((r - 200.0).abs() < 0.5 && (g - 128.0).abs() < 0.5 && (b - 80.0).abs() < 0.5);
+
+        // Pick: 7×7 window around the center of a uniform warm block.
+        let (r, g, b) = pick_sample(&warm, 16, 16, 8.0, 8.0).expect("pick sample");
+        assert!((r - 200.0).abs() < 0.5 && (g - 128.0).abs() < 0.5 && (b - 80.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn editor_widgets_work() {
+        // One #[test] initializes GTK on a single thread — the parallel test
+        // harness would panic gtk4::init() from a second thread.
+        if gtk4::init().is_err() {
+            eprintln!("skipping: no display");
+            return;
+        }
+
+        // EV indicator: formatted + fixed-width label.
+        let (mut editor, _events) = test_editor();
+        editor.set_photo(1, "test.jpg", &Adjustments::default(), 0.0, false, Some((800, 600)));
+        editor.set_ev(1.5);
+        assert_eq!(editor.ev_value.text(), "+1.50 EV");
+        editor.set_ev(-0.35);
+        assert_eq!(editor.ev_value.text(), "-0.35 EV");
+        editor.set_ev(4.0);
+        assert_eq!(editor.ev_value.text(), "+4.00 EV");
+
+        // Auto-WB on a neutral gray image → warm bias (0.15), no tint.
+        let (mut editor, events) = test_editor();
+        editor.set_photo(7, "gray.jpg", &Adjustments::default(), 0.0, false, Some((16, 16)));
+        editor.set_preview_rgba(rgba_fill(16, 16, [128, 128, 128]), 16, 16);
+        editor.wb_auto_button.emit_clicked();
+        let adj = find_photo_edit(&events, 7).expect("neutral PhotoEdit");
+        assert!((adj.wb_offset - 0.15).abs() < 1e-4, "offset {}", adj.wb_offset);
+        assert!((adj.hue - 0.0).abs() < 1e-4, "hue {}", adj.hue);
+
+        // Auto-WB on a warm image → cools it (negative offset, small negative hue).
+        let (mut editor, events) = test_editor();
+        editor.set_photo(8, "warm.jpg", &Adjustments::default(), 0.0, false, Some((16, 16)));
+        editor.set_preview_rgba(rgba_fill(16, 16, [200, 128, 80]), 16, 16);
+        editor.wb_auto_button.emit_clicked();
+        let adj = find_photo_edit(&events, 8).expect("warm PhotoEdit");
+        assert!(adj.wb_offset < -0.3, "offset {}", adj.wb_offset);
+        assert!((adj.wb_offset - -0.4652).abs() < 1e-3, "offset {}", adj.wb_offset);
+        assert!((adj.hue - -0.0525).abs() < 1e-3, "hue {}", adj.hue);
+
+        // No preview pixels → the handler must not emit anything or crash.
+        let (mut editor, events) = test_editor();
+        editor.set_photo(9, "nopreview.jpg", &Adjustments::default(), 0.0, false, Some((16, 16)));
+        editor.wb_auto_button.emit_clicked();
+        assert!(
+            !events.lock().unwrap().iter().any(|e| matches!(e, AppEvent::PhotoEdit { .. })),
+            "must not emit PhotoEdit without preview pixels"
+        );
+    }
+
+    /// The most recent `PhotoEdit` for `id` recorded by a test editor.
+    fn find_photo_edit(events: &Arc<Mutex<Vec<AppEvent>>>, id: u64) -> Option<Adjustments> {
+        events.lock().unwrap().iter().rev().find_map(|e| match e {
+            AppEvent::PhotoEdit { id: i, adjustments } if *i == id => Some(*adjustments),
+            _ => None,
+        })
+    }
 }

@@ -89,6 +89,9 @@ pub enum AppEvent {
     PhotosRemoved(Vec<u64>),
     /// Telegram logout: drop all photos and return to the login screen.
     Logout,
+    /// Show a transient toast (e.g. a rejected neutral-picker sample). Handled by
+    /// the controller; the reducer treats it as a no-op.
+    Toast(String),
     TargetPeer(TargetPeer),
     SendStarted,
     SendFinished(Result<(), String>),
@@ -169,6 +172,9 @@ pub fn reduce(state: &mut AppState, event: AppEvent) {
             state.telegram.status = AuthStatus::Idle;
         }
         AppEvent::TargetPeer(peer) => state.telegram.target_peer = Some(peer),
+        AppEvent::Toast(_) => {
+            // Shown by the controller; nothing to persist.
+        }
         AppEvent::SendStarted => {
             state.sending = true;
             // Mark selected photos as exporting so the usage label shows the
