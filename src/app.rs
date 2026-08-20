@@ -133,6 +133,9 @@ pub struct AppController {
     // removed best-effort once the send finishes or fails (Task 23).
     send_temp_paths: Vec<PathBuf>,
     send_started_at: Option<std::time::Instant>,
+    /// Last logged adjustments per photo, so "action: edit" lines only fire when
+    /// an edit actually changes the image (not on every slider tick).
+    last_edit_log: std::collections::HashMap<u64, crate::image::types::Adjustments>,
     // Send-footer bookkeeping: export order+names for "Preparing {i}/{n}", the
     // count of completed exports, album-chunk progress, and photos sent so far.
     send_jobs: Vec<(u64, String)>,
@@ -243,6 +246,7 @@ impl AppController {
             pending_exports: HashMap::new(),
             send_temp_paths: Vec::new(),
             send_started_at: None,
+            last_edit_log: std::collections::HashMap::new(),
             send_jobs: Vec::new(),
             send_jobs_done: 0,
             albums_remaining: 0,
@@ -534,6 +538,7 @@ impl AppController {
             }
             AppEvent::RejectActive => return self.handle_reject(),
             AppEvent::ActivePhoto { index: None } => {
+                log::info!("action: close editor");
                 // The editor closed: drop the active photo's decoded base (memory
                 // back) and clear the editor's per-photo preview/matrix data.
                 self.release_active_photo_data();
@@ -1079,6 +1084,18 @@ impl AppController {
             let Some(p) = st.photos.get(i) else { return };
             (p.id, p.source_type, p.adjustments, p.path.clone())
         };
+        // Effective-edit log: only when the settled adjustments actually changed
+        // (this is the debounced render that hits the image — slider drags coalesce
+        // to one commit here, not one log per tick).
+        let name = crate::ui::util::file_name(&path);
+        let changed = self.last_edit_log.get(&id).map_or(true, |last| *last != adjustments);
+        if changed {
+            log::info!(
+                "action: edit {name} → mode={:?} EV={:+.2} wb={:+.2} hue={:+.2}",
+                adjustments.exposure_mode, adjustments.exposure_ev, adjustments.wb_offset, adjustments.hue
+            );
+            self.last_edit_log.insert(id, adjustments);
+        }
         let tx = self.ui_events_sender.clone();
 
         // Fast path: the active photo's decoded base is cached — render from memory
@@ -1464,6 +1481,8 @@ impl AppController {
 
     /// Reset → drop all loaded photos (photoup `clearPhotos`).
     fn on_reset(&mut self) {
+        let n = self.state.read().unwrap().photos.len();
+        log::info!("action: reset — cleared {n} photos");
         self.main_screen.grid_store.remove_all();
         self.row_map.clear();
         self.cam_mul.clear();
@@ -1478,6 +1497,7 @@ impl AppController {
     /// The telegram worker has no logout command, so the session itself stays
     /// authorized (the next launch will skip login); see the report.
     fn on_logout(&mut self) {
+        log::info!("action: logout");
         self.main_screen.grid_store.remove_all();
         self.row_map.clear();
         self.dialogs.clear();
@@ -1610,6 +1630,16 @@ impl AppController {
             let cur = st.active_photo.unwrap_or(0) as i64;
             (cur + delta as i64).clamp(0, n - 1) as usize
         };
+        {
+            let st = self.state.read().unwrap();
+            if let Some(p) = st.photos.get(target) {
+                log::info!(
+                    "action: navigate {} → {}",
+                    if delta < 0 { "prev" } else { "next" },
+                    crate::ui::util::file_name(&p.path)
+                );
+            }
+        }
         reduce(
             &mut *self.state.write().unwrap(),
             AppEvent::ActivePhoto { index: Some(target) },
@@ -1621,11 +1651,12 @@ impl AppController {
     /// Editor Reject: remove the active photo and close the editor (photoup
     /// `rejectCurrent`).
     fn handle_reject(&mut self) {
-        let active_id = {
+        let active = {
             let st = self.state.read().unwrap();
-            st.active_photo.and_then(|i| st.photos.get(i)).map(|p| p.id)
+            st.active_photo.and_then(|i| st.photos.get(i)).map(|p| (p.id, crate::ui::util::file_name(&p.path)))
         };
-        if let Some(id) = active_id {
+        if let Some((id, name)) = active {
+            log::info!("action: reject {name}");
             self.remove_photos_from_ui(vec![id]);
             self.deselect_grid();
         }
@@ -1655,6 +1686,7 @@ impl AppController {
                 p.full_size,
             )
         };
+        log::info!("action: open for edit {}", active.1);
         // A different photo is now active: the previous one's decoded base is
         // useless — drop it (returns its memory) and let the next preview decode
         // re-cache under the new id.
