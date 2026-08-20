@@ -8,10 +8,19 @@ pub const MAX_PHOTO_BYTES: usize = 10_000_000;
 /// quality + chroma_subsample=1(4:4:4), optimize_coding, baseline, trellis.
 /// The mozjpeg crate maps trellis_multipass/opt_zero/opt_table onto mozjpeg's
 /// scan-optimization defaults (`ScanMode::AllComponentsTogether` + use_scans_in_trellis).
-pub fn encode_jpeg_444(rgb: &[u8], width: usize, height: usize, quality: f32) -> Result<Vec<u8>, String> {
+pub fn encode_jpeg_444(
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    quality: f32,
+) -> crate::errors::Result<Vec<u8>> {
     let expected = width * height * 3;
     if rgb.len() != expected {
-        return Err(format!("encode input size mismatch: {} != {}", rgb.len(), expected));
+        return Err(crate::errors::Error::Encode(format!(
+            "encode input size mismatch: {} != {}",
+            rgb.len(),
+            expected
+        )));
     }
     catch_unwind(|| {
         let mut comp = Compress::new(ColorSpace::JCS_RGB);
@@ -27,29 +36,35 @@ pub fn encode_jpeg_444(rgb: &[u8], width: usize, height: usize, quality: f32) ->
         comp.set_optimize_coding(true);
         // Trellis with scan consideration (matches photoup's trellis_multipass).
         comp.set_use_scans_in_trellis(true);
-        let mut started = comp.start_compress(Vec::new()).map_err(|e| e.to_string())?;
+        let mut started = comp
+            .start_compress(Vec::new())
+            .map_err(|e| crate::errors::Error::Encode(e.to_string()))?;
         for row in 0..height {
             let slice = &rgb[row * width * 3..(row + 1) * width * 3];
-            started.write_scanlines(slice).map_err(|e| e.to_string())?;
+            started
+                .write_scanlines(slice)
+                .map_err(|e| crate::errors::Error::Encode(e.to_string()))?;
         }
-        started.finish().map_err(|e| e.to_string())
+        started
+            .finish()
+            .map_err(|e| crate::errors::Error::Encode(e.to_string()))
     })
-    .map_err(|_| "mozjpeg panicked during encode".to_string())?
+    .map_err(|_| crate::errors::Error::Encode("mozjpeg panicked during encode".into()))?
 }
 
 /// Highest quality (≤100) whose file fits `max_bytes`, starting from Q100 and only
-/// lowering when necessary. Port of photoup's `encodeAdaptive` binary search.
+/// lowering when necessary. Falls back to the Q100 result if no quality in [40,100]
+/// fits. Port of photoup's `encodeAdaptive` binary search.
 pub fn encode_jpeg_444_adaptive(
     rgb: &[u8],
     width: usize,
     height: usize,
     max_bytes: usize,
-) -> Result<Vec<u8>, String> {
-    let best = encode_jpeg_444(rgb, width, height, 100.0)?;
+) -> crate::errors::Result<Vec<u8>> {
+    let mut best = encode_jpeg_444(rgb, width, height, 100.0)?;
     if best.len() <= max_bytes {
         return Ok(best);
     }
-    let mut best = best;
     let (mut lo, mut hi) = (40, 100);
     while lo <= hi {
         let mid = (lo + hi) / 2;
@@ -68,7 +83,7 @@ pub fn encode_jpeg_444_adaptive(
 mod tests {
     use super::*;
 
-    /// A 256x256 gradient: encode at Q100 and confirm 4:4:4 header + size.
+    /// Build a `w`x`h` RGB gradient.
     fn gradient_rgb(w: usize, h: usize) -> Vec<u8> {
         let mut v = vec![0u8; w * h * 3];
         for y in 0..h {
@@ -95,7 +110,7 @@ mod tests {
             let marker = jpg[i + 1];
             let seg_len = (jpg[i + 2] as usize) << 8 | jpg[i + 3] as usize;
             if matches!(marker, 0xC0 | 0xC2) {
-                let ncomp = jpg[i + 9] as usize;
+                let ncomp = (jpg[i + 9] as usize).min(3);
                 let mut factors = Vec::new();
                 for c in 0..ncomp {
                     let byte = jpg[i + 10 + c * 3 + 1];
