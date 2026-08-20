@@ -534,7 +534,12 @@ impl AppController {
     fn submit_decode_thumb(&mut self, id: u64, source_type: SourceType, path: PathBuf) {
         let tx = self.ui_events_sender.clone();
         self.pool.submit(move || {
-            let result = run_thumb_job(&path, source_type);
+            // Panic-safe: a panicking decode must surface as JobFailed, or the
+            // photo stays "queued" forever with no feedback.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_thumb_job(&path, source_type)
+            }))
+            .unwrap_or_else(|_| Err("thumbnail job panicked".to_string()));
             let _ = tx.send(match result {
                 Ok((rgba, size, auto_ev, hist, cam)) => UiEvent::ThumbReady {
                     id,
@@ -586,7 +591,11 @@ impl AppController {
         };
         let tx = self.ui_events_sender.clone();
         self.pool.submit(move || {
-            let result = run_preview_job(&path, source_type, &adjustments);
+            // Panic-safe, same rationale as the thumbnail/export jobs.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_preview_job(&path, source_type, &adjustments)
+            }))
+            .unwrap_or_else(|_| Err("preview job panicked".to_string()));
             let _ = tx.send(match result {
                 Ok((rgba, size, auto_ev, hist, cam)) => UiEvent::PreviewReady {
                     id,
@@ -612,7 +621,13 @@ impl AppController {
     ) {
         let tx = self.ui_events_sender.clone();
         self.pool.submit(move || {
-            let result = run_export_job(&path, source_type, &adjustments, cam_mul);
+            // The pool's worker catch_unwinds panics silently; a panicking export
+            // would never emit ExportReady/JobFailed and the send's all_accounted
+            // wait would hang forever. Report the panic as a JobFailed instead.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_export_job(&path, source_type, &adjustments, cam_mul)
+            }))
+            .unwrap_or_else(|_| Err("export job panicked".to_string()));
             let _ = tx.send(match result {
                 Ok((jpeg, width, height)) => UiEvent::ExportReady { id, jpeg, width, height },
                 Err(msg) => UiEvent::JobFailed { id, msg },
@@ -802,6 +817,23 @@ fn run_preview_job(
     Ok((r.rgba, (w, h), r.auto_ev, hist, cam))
 }
 
+/// For RAW exports the effective WB is baked into libraw's `user_mul`
+/// (pre-matrix), so the render must NOT apply `wb_gains` again — otherwise the
+/// warmth/hue is squared vs the preview (photoup's photos.ts renders the baked
+/// export with `wbOffset: 0, hue: 0`). JPEG — and RAW decoded with camera WB
+/// when no `cam_mul` is available — keep render-time WB, exactly like the preview.
+fn export_render_adjustments(
+    source_type: SourceType,
+    user_mul: Option<[f32; 4]>,
+    adjustments: &Adjustments,
+) -> Adjustments {
+    if source_type == SourceType::Raw && user_mul.is_some() {
+        Adjustments { wb_offset: 0.0, hue: 0.0, ..*adjustments }
+    } else {
+        *adjustments
+    }
+}
+
 /// Full-size render ≤2560 + adaptive JPEG encode. RAW bakes the effective WB
 /// (camera as-shot × user warmth/hue) into libraw's pre-matrix `user_mul`,
 /// matching photoup's export path.
@@ -818,7 +850,8 @@ fn run_export_job(
     };
     let (base, _) = decode_base(&data, source_type, true, user_mul)?;
     let size = export_dimensions(base.width(), base.height(), adjustments.crop.as_ref(), EXPORT_EDGE);
-    let r = base.render(adjustments.crop.as_ref(), size, adjustments);
+    let render_adj = export_render_adjustments(source_type, user_mul, adjustments);
+    let r = base.render(render_adj.crop.as_ref(), size, &render_adj);
     let mut rgb = Vec::with_capacity((size.width * size.height * 3) as usize);
     for px in r.rgba.chunks_exact(4) {
         rgb.push(px[0]);
@@ -898,6 +931,29 @@ mod tests {
         let bogus = std::env::temp_dir().join("photoup2-app-test").join("nope.jpg");
         let err = run_thumb_job(&bogus, SourceType::Jpeg).unwrap_err();
         assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn export_neutralizes_wb_only_when_baked() {
+        let mut adj = Adjustments::default();
+        adj.exposure_mode = ExposureMode::Manual;
+        adj.exposure_ev = 1.5;
+        adj.wb_offset = 0.5;
+        adj.hue = -0.3;
+        // RAW + baked user_mul → WB neutralized, exposure/crop kept (photoup parity).
+        let baked = export_render_adjustments(SourceType::Raw, Some([1.0, 1.0, 1.0, 1.0]), &adj);
+        assert_eq!(baked.wb_offset, 0.0);
+        assert_eq!(baked.hue, 0.0);
+        assert_eq!(baked.exposure_ev, 1.5);
+        assert_eq!(baked.exposure_mode, ExposureMode::Manual);
+        // JPEG (WB applied at render time) keeps the full adjustments.
+        let jpeg = export_render_adjustments(SourceType::Jpeg, None, &adj);
+        assert_eq!(jpeg.wb_offset, 0.5);
+        assert_eq!(jpeg.hue, -0.3);
+        // RAW decoded with camera WB (no cam_mul → no bake) also keeps WB.
+        let unbaked = export_render_adjustments(SourceType::Raw, None, &adj);
+        assert_eq!(unbaked.wb_offset, 0.5);
+        assert_eq!(unbaked.hue, -0.3);
     }
 }
 
