@@ -98,13 +98,35 @@ pub(crate) fn install_css() {
 .cell-placeholder { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.6; }
 .cell-placeholder-error { color: #e01b24; }
 .cell-ev {
-    background: rgba(15, 15, 15, 0.78);
-    border: 1px solid rgba(255, 255, 255, 0.28);
+    background: rgba(10, 10, 10, 0.88);
+    border: 1px solid rgba(255, 255, 255, 0.6);
     border-radius: 5px;
-    padding: 0 6px;
+    padding: 1px 7px;
     font-family: monospace;
-    font-size: 10px;
-    font-weight: 600;
+    font-size: 13px;
+    font-weight: 700;
+    color: #fff;
+}
+/* High-contrast checkbox pill (photoup `.tick`): dark box, strong border,
+   clearly visible against any photo. */
+.cell-check {
+    background: rgba(13, 11, 9, 0.82);
+    border: 2px solid rgba(255, 255, 255, 0.85);
+    border-radius: 5px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+}
+.cell-check check {
+    min-width: 16px;
+    min-height: 16px;
+    background: transparent;
+    box-shadow: none;
+}
+.cell-check check:checked {
+    background: #ff7a45;
+    -gtk-icon-source: none;
+}
+.cell-check check:checked image {
+    color: #000;
 }
 .cell-badge {
     border: 1px solid rgba(255, 255, 255, 0.28);
@@ -202,6 +224,8 @@ pub fn build_grid(
         placeholder.set_valign(gtk4::Align::Center);
 
         let check = gtk4::CheckButton::new();
+        check.add_css_class("cell-check");
+        check.set_size_request(22, 22);
         check.set_halign(gtk4::Align::Start);
         check.set_valign(gtk4::Align::Start);
         check.set_margin_top(6);
