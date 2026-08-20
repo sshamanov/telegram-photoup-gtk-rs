@@ -33,6 +33,9 @@ pub struct EditorScreen {
     /// Current photo id (set by `set_photo`), read by the signal closures.
     /// `Rc<Cell<..>>` so each closure can own a clone instead of borrowing the screen.
     pub active_id: Rc<Cell<Option<u64>>>,
+    /// Suppresses PhotoEdit emission while `set_photo` programs the controls
+    /// (their `set_selected`/`set_value` calls fire signals synchronously).
+    suppress: Rc<Cell<bool>>,
     state: Arc<RwLock<AppState>>,
     /// Shared with every control closure (a plain `Box` can't be split across
     /// multiple `'static` signal handlers).
@@ -77,6 +80,9 @@ impl EditorScreen {
         exposure_scale.set_value(0.0);
         exposure_scale.set_draw_value(true);
         exposure_scale.set_digits(1);
+        // EV only matters in Manual; default mode is Auto, so start disabled
+        // (the mode-notify in wire_controls keeps this in sync afterwards).
+        exposure_scale.set_sensitive(false);
         let ev_row = row_labeled("Exposure (EV)", &exposure_scale);
         panel.append(&ev_row);
 
@@ -137,6 +143,7 @@ impl EditorScreen {
             crop_button,
             raw_controls,
             active_id: Rc::new(Cell::new(None)),
+            suppress: Rc::new(Cell::new(false)),
             state,
             on_event,
         };
@@ -147,7 +154,13 @@ impl EditorScreen {
     }
 
     /// Push a photo into the editor: set active id, adjustments, and show/hide RAW controls.
+    ///
+    /// The `set_selected`/`set_value` calls below fire their signals synchronously;
+    /// the `suppress` flag stops them from emitting a PhotoEdit with mixed
+    /// old/new control values. The EV-sensitivity mode-notify is intentionally NOT
+    /// suppressed: it sets the correct enabled/disabled state for the loaded mode.
     pub fn set_photo(&mut self, id: u64, adjustments: &Adjustments, is_raw: bool) {
+        self.suppress.set(true);
         self.active_id.set(Some(id));
         self.raw_controls.set_visible(is_raw);
         self.mode_dropdown.set_selected(match adjustments.exposure_mode {
@@ -158,6 +171,7 @@ impl EditorScreen {
         self.exposure_scale.set_value(adjustments.exposure_ev as f64);
         self.temp_scale.set_value(adjustments.wb_offset as f64);
         self.hue_scale.set_value(adjustments.hue as f64);
+        self.suppress.set(false);
     }
 
     pub fn set_preview(&self, texture: Option<&gdk4::Texture>) {
@@ -185,44 +199,62 @@ impl EditorScreen {
     }
 
     /// Each control closure owns clones of the field handles + a clone of the
-    /// `active_id` slot and the `on_event` callback, so no reference to `self`
-    /// leaks into the `'static` signal handlers.
+    /// `active_id`/`suppress` slots and the `on_event` callback, so no reference
+    /// to `self` leaks into the `'static` signal handlers.
     fn wire_controls(&self) {
         let on_event = Arc::clone(&self.on_event);
         let active_id = Rc::clone(&self.active_id);
+        let suppress = Rc::clone(&self.suppress);
         let mode = self.mode_dropdown.clone();
         let ev = self.exposure_scale.clone();
         let temp = self.temp_scale.clone();
         let hue = self.hue_scale.clone();
 
-        let (a, o, m, e, t, h) =
-            (Rc::clone(&active_id), Arc::clone(&on_event), mode.clone(), ev.clone(), temp.clone(), hue.clone());
-        mode.connect_selected_notify(move |_| emit(&a, &m, &e, &t, &h, &*o));
+        // EV slider is only meaningful in Manual — grey it out otherwise.
+        let mode_for_sens = mode.clone();
+        let ev_for_sens = ev.clone();
+        mode_for_sens.connect_selected_notify(move |d| {
+            let manual = d.selected() == 2;
+            ev_for_sens.set_sensitive(manual);
+        });
 
         let (a, o, m, e, t, h) =
             (Rc::clone(&active_id), Arc::clone(&on_event), mode.clone(), ev.clone(), temp.clone(), hue.clone());
-        ev.connect_value_changed(move |_| emit(&a, &m, &e, &t, &h, &*o));
+        let sup = Rc::clone(&suppress);
+        mode.connect_selected_notify(move |_| emit(&a, &sup, &m, &e, &t, &h, &*o));
 
         let (a, o, m, e, t, h) =
             (Rc::clone(&active_id), Arc::clone(&on_event), mode.clone(), ev.clone(), temp.clone(), hue.clone());
-        temp.connect_value_changed(move |_| emit(&a, &m, &e, &t, &h, &*o));
+        let sup = Rc::clone(&suppress);
+        ev.connect_value_changed(move |_| emit(&a, &sup, &m, &e, &t, &h, &*o));
 
         let (a, o, m, e, t, h) =
             (Rc::clone(&active_id), Arc::clone(&on_event), mode.clone(), ev.clone(), temp.clone(), hue.clone());
-        hue.connect_value_changed(move |_| emit(&a, &m, &e, &t, &h, &*o));
+        let sup = Rc::clone(&suppress);
+        temp.connect_value_changed(move |_| emit(&a, &sup, &m, &e, &t, &h, &*o));
+
+        let (a, o, m, e, t, h) =
+            (Rc::clone(&active_id), Arc::clone(&on_event), mode.clone(), ev.clone(), temp.clone(), hue.clone());
+        let sup = Rc::clone(&suppress);
+        hue.connect_value_changed(move |_| emit(&a, &sup, &m, &e, &t, &h, &*o));
     }
 }
 
 /// Recompute `Adjustments` from the current control values and emit PhotoEdit
-/// for the active photo (no-op while no photo is loaded).
+/// for the active photo (no-op while no photo is loaded, or while `set_photo`
+/// is programming the controls — see the `suppress` flag).
 fn emit(
     active_id: &Cell<Option<u64>>,
+    suppress: &Cell<bool>,
     mode: &gtk4::DropDown,
     ev: &Scale,
     temp: &Scale,
     hue: &Scale,
     on_event: &(dyn Fn(AppEvent) + Send + Sync),
 ) {
+    if suppress.get() {
+        return;
+    }
     if let Some(id) = active_id.get() {
         let adjustments = Adjustments {
             exposure_mode: match mode.selected() {
