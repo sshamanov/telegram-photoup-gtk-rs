@@ -129,7 +129,12 @@ pub fn reduce(state: &mut AppState, event: AppEvent) {
             state.sending = false;
             if result.is_ok() {
                 for p in state.photos.iter_mut() {
-                    if p.selected { p.status = PhotoStatus::Ready; }
+                    // Only recover photos that were actually sent. A photo whose
+                    // export JobFailed is Error(msg) and must stay visible as a
+                    // failure — resetting it to Ready would hide the error.
+                    if p.selected && !matches!(p.status, PhotoStatus::Error(_)) {
+                        p.status = PhotoStatus::Ready;
+                    }
                 }
             }
         }
@@ -181,6 +186,26 @@ mod tests {
         });
         reduce(&mut s, AppEvent::PhotoFailed { id: 3, msg: "decode boom".into() });
         assert_eq!(s.photos[0].status, PhotoStatus::Error("decode boom".into()));
+    }
+
+    #[test]
+    fn send_finished_preserves_error_status() {
+        let mut s = AppState::default();
+        s.photos.push(PhotoState {
+            id: 1, path: PathBuf::from("/x/ok.jpg"), source_type: SourceType::Jpeg,
+            adjustments: Adjustments::default(), auto_ev: 0.0, thumb: None, thumb_size: None,
+            histogram: None, status: PhotoStatus::Ready, selected: true,
+        });
+        s.photos.push(PhotoState {
+            id: 2, path: PathBuf::from("/x/bad.jpg"), source_type: SourceType::Jpeg,
+            adjustments: Adjustments::default(), auto_ev: 0.0, thumb: None, thumb_size: None,
+            histogram: None, status: PhotoStatus::Error("boom".into()), selected: true,
+        });
+        reduce(&mut s, AppEvent::SendFinished(Ok(())));
+        // The successfully-sent photo recovers to Ready...
+        assert_eq!(s.photos[0].status, PhotoStatus::Ready);
+        // ...but the one whose export failed stays visibly Error'd.
+        assert_eq!(s.photos[1].status, PhotoStatus::Error("boom".into()));
     }
 
     #[test]

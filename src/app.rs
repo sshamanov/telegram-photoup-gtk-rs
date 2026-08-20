@@ -227,6 +227,11 @@ impl AppController {
 
     /// Drain all channels and reflect state in the UI. Called every 50ms.
     pub fn poll(&mut self) {
+        // Drain the pool's per-job completion signals (a `()` per finished job).
+        // We don't need the payloads — the real results arrive on `ui_events` —
+        // but leaving them unread leaks 8 bytes/job and leaves the API dead.
+        while self.pool.try_wait_one() {}
+
         while let Ok(ev) = self.screen_events.try_recv() {
             self.handle_app_event(ev);
         }
@@ -386,6 +391,15 @@ impl AppController {
                         size.1 as i32,
                     )));
                     self.editor.set_histogram(&histogram);
+                }
+                // Keep the grid thumbnail in sync with the edited preview; state
+                // now holds the edited render, so the row must show it too.
+                if let Some(row) = self.row_map.get(&id) {
+                    row.set_texture(&crate::ui::util::rgba_to_texture(
+                        &rgba,
+                        size.0 as i32,
+                        size.1 as i32,
+                    ));
                 }
             }
             UiEvent::ExportReady { id, jpeg, .. } => {
