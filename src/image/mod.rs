@@ -1,3 +1,4 @@
+pub mod encode;
 pub mod math;
 pub mod resize;
 pub mod srgb;
