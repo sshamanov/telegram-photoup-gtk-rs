@@ -353,6 +353,13 @@ impl AppController {
         });
         self.window.add_controller(key);
 
+        // Window-level keyboard navigation (photoup App/EditorPanel `onKeyDown`):
+        // Ctrl+A/Cmd+A toggles select-all, Enter opens the editor for the selected
+        // cell, ArrowRight/ArrowLeft navigate the active photo in the editor, and
+        // Escape closes the editor. Added after the Ctrl+V controller, so keys the
+        // paste handler claims (Stop) never reach it.
+        self.wire_keyboard(Rc::clone(&ctl));
+
         // Dev mode (PHOTOUP2_DEV=1): skip Telegram auth and auto-load ./samples/*
         // so the grid/editor can be exercised visually without a real session.
         if std::env::var("PHOTOUP2_DEV").is_ok() {
@@ -373,6 +380,94 @@ impl AppController {
                 }
             });
         }
+    }
+
+    /// Install the window-level keyboard navigation (photoup `App.onKeyDown` +
+    /// `EditorPanel.onKeyDown`): Ctrl+A/Cmd+A toggles select-all on the grid,
+    /// Enter opens the editor for the selected cell, ArrowRight/ArrowLeft
+    /// navigate the active photo in the editor, and Escape closes the editor.
+    fn wire_keyboard(&mut self, ctl: Rc<RefCell<Self>>) {
+        let key_ctl = Rc::clone(&ctl);
+        let key = gtk4::EventControllerKey::new();
+        // Capture phase: run BEFORE the focused widget, so arrows navigate the
+        // editor even when a Scale/slider has focus (photoup's EditorPanel arrows
+        // navigate over a focused range input — it only guards text inputs). The
+        // focus guard below returns Proceed for text entries, so their keys (text
+        // select-all, caret movement) are never stolen.
+        key.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        key.connect_key_pressed(move |_, keyval, _, state| {
+            let mut ctl = key_ctl.borrow_mut();
+            ctl.on_key(keyval, state)
+        });
+        self.window.add_controller(key);
+    }
+
+    /// Dispatch a window key press to the matching action. Returns Stop for the
+    /// keys this controller handles, Proceed otherwise (let GTK / child widgets
+    /// keep unclaimed keys).
+    fn on_key(&mut self, keyval: gtk4::gdk::Key, state: gtk4::gdk::ModifierType) -> glib::Propagation {
+        use gtk4::gdk::{Key, ModifierType};
+        // Focus guard: a focused text entry / text view / other editable keeps
+        // its keys (Ctrl+A = select-all-text, arrows = caret movement). The login
+        // screen's phone/code/password entries are `Entry`s.
+        if self.focus_in_text() {
+            return glib::Propagation::Proceed;
+        }
+        // Ctrl on Linux/Windows; Ctrl or Cmd on macOS (GDK reports Cmd as META).
+        // Gated to macOS: on X11 `META_MASK` can alias Alt (Mod1), which must not
+        // trigger select-all. Mirrors photoup's `event.ctrlKey || event.metaKey`.
+        let ctrl = state.contains(ModifierType::CONTROL_MASK)
+            || (cfg!(target_os = "macos") && state.contains(ModifierType::META_MASK));
+        match keyval {
+            k if (k == Key::a || k == Key::A) && ctrl => {
+                self.on_select_all_toggle();
+                // Always claim Ctrl+A (photoup preventDefaults it even with no
+                // photos loaded).
+                glib::Propagation::Stop
+            }
+            k if k == Key::Return || k == Key::KP_Enter => {
+                // Stop only if we actually opened the editor; otherwise let GTK /
+                // the focused widget keep Return (e.g. activate the grid cell).
+                if self.on_key_enter() {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+            k if k == Key::Right => {
+                if self.on_key_arrow(1) {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+            k if k == Key::Left => {
+                if self.on_key_arrow(-1) {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+            k if k == Key::Escape => {
+                if self.on_key_escape() {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+            _ => glib::Propagation::Proceed,
+        }
+    }
+
+    /// True when the focused widget is a text entry / text view / other editable,
+    /// in which case keyboard navigation must not steal the keys. `Entry` and
+    /// `TextView` are checked explicitly, plus the `Editable` interface (covers
+    /// `SpinButton`, `PasswordEntry`, `SearchEntry`, …) for safety.
+    fn focus_in_text(&self) -> bool {
+        let Some(f) = gtk4::prelude::GtkWindowExt::focus(&self.window) else {
+            return false;
+        };
+        f.is::<gtk4::Entry>() || f.is::<gtk4::TextView>() || f.is::<gtk4::Editable>()
     }
 
     /// Drain all channels and reflect state in the UI. Called every 50ms.
@@ -882,6 +977,10 @@ impl AppController {
         };
         reduce(&mut *self.state.write().unwrap(), AppEvent::PhotosAdded(vec![photo]));
         let row = PhotoRow::new(id);
+        // The grid's checkbox renders from the ROW's `selected` property (not the
+        // state's), so mirror the state default (checked) or the check lies until
+        // the first toggle.
+        row.set_selected(true);
         row.set_name(crate::ui::util::file_name(&path));
         row.set_is_raw(source_type == SourceType::Raw);
         row.set_ev(0.0);
@@ -1386,6 +1485,85 @@ impl AppController {
             }
         }
         reduce(&mut *self.state.write().unwrap(), AppEvent::PhotosRemoved(ids));
+    }
+
+    /// Ctrl+A / Cmd+A: toggle select-all on the grid (photoup `selectAll(!allSelected)`):
+    /// if every photo is selected, deselect all; otherwise select all. Mirrors the
+    /// choice into AppState (a `PhotoSelected` reduce per photo) AND each grid
+    /// row's `selected` property — scroll-recycled cells repaint from the row
+    /// property, and the visible checkbox follows via `selected-notify` (grid.rs).
+    fn on_select_all_toggle(&mut self) {
+        let (all_selected, ids): (bool, Vec<u64>) = {
+            let st = self.state.read().unwrap();
+            (
+                !st.photos.is_empty() && st.photos.iter().all(|p| p.selected),
+                st.photos.iter().map(|p| p.id).collect(),
+            )
+        };
+        let target = !all_selected;
+        let mut st = self.state.write().unwrap();
+        for id in ids {
+            reduce(&mut st, AppEvent::PhotoSelected { id, selected: target });
+        }
+        drop(st);
+        for row in self.row_map.values() {
+            row.set_selected(target);
+        }
+        // Refresh the footer "Send {n} selected" count (and usage indicator).
+        self.refresh_screens();
+    }
+
+    /// Enter / KP_Enter on the main screen: open the editor for the grid's
+    /// selected cell. photoup opens the editor on click; Enter is the keyboard
+    /// analogue (a grid cell must be selected first). Returns true only when the
+    /// editor was actually opened — so unhandled Returns keep propagating (e.g. to
+    /// activate a focused grid cell / button).
+    fn on_key_enter(&mut self) -> bool {
+        if self.state.read().unwrap().active_photo.is_some() {
+            return false; // the editor is already open
+        }
+        if self.stack.visible_child_name().as_deref() != Some("main") {
+            return false; // not on the main (grid) screen
+        }
+        let Some(sel) = self
+            .main_screen
+            .grid
+            .model()
+            .and_then(|m| m.downcast::<gtk4::SingleSelection>().ok())
+        else {
+            return false;
+        };
+        let idx = sel.selected();
+        if idx == gtk4::INVALID_LIST_POSITION {
+            return false;
+        }
+        self.on_grid_selected(idx);
+        true
+    }
+
+    /// ArrowRight / ArrowLeft in the editor: navigate the active photo (photoup
+    /// EditorPanel `onKeyDown` → `onNext`/`onPrev`), reusing the same path the
+    /// editor's Prev/Next buttons use (`AppEvent::Nav`). Returns true only when a
+    /// navigation happened, so arrows outside the editor keep moving grid focus.
+    fn on_key_arrow(&mut self, delta: i8) -> bool {
+        if self.state.read().unwrap().active_photo.is_none() {
+            return false;
+        }
+        self.handle_nav(delta);
+        true
+    }
+
+    /// Escape: close the editor back to the grid. Natural extra — photoup closes
+    /// via the Close button, which emits `ActivePhoto { index: None }`; route
+    /// through the same handler (drops the cached base, deselects the grid row).
+    /// Returns true when the editor was closed.
+    fn on_key_escape(&mut self) -> bool {
+        if self.state.read().unwrap().active_photo.is_none() {
+            return false;
+        }
+        self.handle_app_event(AppEvent::ActivePhoto { index: None });
+        self.refresh_screens();
+        true
     }
 
     /// Editor Prev/Next: move the active photo by `delta`, then reload the editor.

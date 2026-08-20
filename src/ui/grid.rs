@@ -326,6 +326,16 @@ pub fn build_grid(
                 on_toggle(row2.id(), active);
             });
             unsafe { list_item.set_data("check-conn", conn); }
+            // Mirror programmatic selection changes (Ctrl+A select-all toggles the
+            // rows' `selected` property) into the visible checkbox live — a cell
+            // only rebinds on items-changed/scroll recycle, so without this the
+            // check would lag the row property. `set_active` with an unchanged
+            // value doesn't re-emit `toggled`, so there's no feedback loop.
+            let check2 = check.clone();
+            let conn = row.connect_selected_notify(move |r| {
+                check2.set_active(r.selected());
+            });
+            unsafe { list_item.set_data("sel-conn", conn); }
         }
         if let Some(ev) = &ev {
             update_ev(&row, ev);
@@ -372,7 +382,7 @@ pub fn build_grid(
         // Steal (move out) the connection id stored in bind and disconnect it.
         // Safety: see bind — the keys below are SignalHandlerId if present, and
         // steal removes them from the ListItem's qdata so there's no stale entry.
-        for key in ["tex-conn", "check-conn", "err-conn", "ev-conn", "ready-conn"] {
+        for key in ["tex-conn", "check-conn", "sel-conn", "err-conn", "ev-conn", "ready-conn"] {
             if let Some(conn) = unsafe { list_item.steal_data::<glib::SignalHandlerId>(key) } {
                 row.disconnect(conn);
             }
