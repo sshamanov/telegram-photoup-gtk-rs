@@ -1,8 +1,8 @@
 use crate::image::math::{AutoExpOpts, auto_exposure_ev, crop_to_pixels, fit_within};
 use crate::image::resize::{downscale_crop, downscale_rgba};
 use crate::image::srgb::{
-    gain_coefficients, jpeg_tone_lut, raw_tone_lut, srgb_to_linear, tone_index, wb_gains,
-    wb_transform3x3,
+    gain_coefficients, jpeg_tone_lut, linear_to_srgb_byte, raw_tone_lut, srgb_to_linear, tone_index,
+    wb_gains, wb_transform3x3,
 };
 use crate::image::types::{Adjustments, DecodedRaw, ExposureMode, NormalizedCrop, Rect, Size};
 
@@ -206,18 +206,9 @@ impl RawBase {
         );
         let mut lums = vec![0u8; (size.width * size.height) as usize];
         for i in 0..(size.width * size.height) as usize {
-            let to_byte = |lin: f32| -> u8 {
-                let c = lin.clamp(0.0, 1.0);
-                let out = if c <= 0.0031308 {
-                    c * 12.92
-                } else {
-                    1.055 * c.powf(1.0 / 2.4) - 0.055
-                };
-                (out.clamp(0.0, 1.0) * 255.0).round() as u8
-            };
-            let sr = to_byte(r[i]);
-            let sg = to_byte(g[i]);
-            let sb = to_byte(b[i]);
+            let sr = linear_to_srgb_byte(r[i]);
+            let sg = linear_to_srgb_byte(g[i]);
+            let sb = linear_to_srgb_byte(b[i]);
             lums[i] = (0.2126 * sr as f32 + 0.7152 * sg as f32 + 0.0722 * sb as f32).round() as u8;
         }
         lums
@@ -517,5 +508,63 @@ mod raw_base_tests {
             &Adjustments::default(),
         );
         assert!(out.rgba[0] > 100 && out.rgba[0] < 255);
+    }
+
+    fn uniform_dr(w: u32, h: u32, value: f32) -> DecodedRaw {
+        let n = (w * h) as usize;
+        DecodedRaw {
+            width: w,
+            height: h,
+            r: vec![value; n],
+            g: vec![value; n],
+            b: vec![value; n],
+            cam_mul: None,
+            cam_matrix: None,
+        }
+    }
+
+    fn max_byte_diff(a: &[u8], b: &[u8]) -> i32 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (*x as i32 - *y as i32).abs())
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn raw_matrix_matches_per_channel_for_identity() {
+        // Identity camera matrix → T = M·diag(wb)·M⁻¹ = diag(wb), so the matrix path
+        // must produce the same result as per-channel gains (within 1 ulp of float order).
+        let eye = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
+        let mut dr = uniform_dr(32, 32, 0.5);
+        dr.cam_matrix = Some(eye);
+        let with = RawBase::new(dr);
+        let without = RawBase::new(uniform_dr(32, 32, 0.5));
+        let mut adj = Adjustments::default();
+        adj.wb_offset = 0.5;
+        adj.hue = -0.2;
+        let a = with.render(None, Size { width: 16, height: 16 }, &adj);
+        let b = without.render(None, Size { width: 16, height: 16 }, &adj);
+        let d = max_byte_diff(&a.rgba, &b.rgba);
+        assert!(d <= 1, "identity matrix must match per-channel WB, max diff {d}");
+    }
+
+    #[test]
+    fn raw_matrix_mixes_channels_unlike_per_channel() {
+        // A camera-like matrix with cross-channel terms + non-neutral WB must produce
+        // a DIFFERENT result than per-channel gains (which keep gray → gray). This
+        // proves the matrix branch actually mixes channels.
+        let m = [[1.0, 0.2, 0.1, 0.0], [0.05, 1.0, 0.05, 0.0], [0.1, 0.2, 1.0, 0.0]];
+        let mut dr = uniform_dr(16, 16, 0.5);
+        dr.cam_matrix = Some(m);
+        let with = RawBase::new(dr);
+        let without = RawBase::new(uniform_dr(16, 16, 0.5));
+        let mut adj = Adjustments::default();
+        adj.wb_offset = 0.5;
+        adj.hue = 0.2;
+        let a = with.render(None, Size { width: 8, height: 8 }, &adj);
+        let b = without.render(None, Size { width: 8, height: 8 }, &adj);
+        let d = max_byte_diff(&a.rgba, &b.rgba);
+        assert!(d > 1, "cross-channel matrix must mix WB differently than per-channel, max diff {d}");
     }
 }
