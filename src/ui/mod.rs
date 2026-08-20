@@ -72,5 +72,19 @@ fn build_window(app: &adw::Application, state: Arc<RwLock<AppState>>) {
     // (stack → root → header → scroller → grid → store) keeps everything alive.
     // Task 21 restructures screen holding.
 
+    // Editor screen: per-photo controls. Mounted but hidden. The on_event
+    // placeholder mirrors login's; Task 21 rewires everything with the real
+    // channels (the editor needs a shared Arc callback so its four control
+    // closures can each hold a clone).
+    let st = Arc::clone(&state);
+    let on_event = Arc::new(move |_ev: crate::state::AppEvent| {
+        let mut s = st.write().unwrap();
+        // TODO(Task 21): also dispatch to the Telegram channel.
+        reduce(&mut s, _ev);
+    }) as Arc<dyn Fn(crate::state::AppEvent) + Send + Sync + 'static>;
+    let editor = crate::ui::editor::EditorScreen::new(Arc::clone(&state), on_event);
+    stack.add_named(&editor.root, Some("editor"));
+    // Same lifetime story: `editor` drops here but the widget tree keeps the UI alive.
+
     window.present();
 }
