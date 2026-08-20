@@ -1,8 +1,12 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::{Arc, RwLock};
+
 use adw::prelude::AdwApplicationWindowExt;
 use gtk4::prelude::*;
 
-use crate::state::{AppState, AppEvent, reduce};
+use crate::app::AppController;
+use crate::state::AppState;
 
 pub mod editor;
 pub mod grid;
@@ -28,6 +32,10 @@ pub fn run() -> glib::ExitCode {
     app.run()
 }
 
+/// Build the window + controller, then drive everything from one 50ms poll.
+///
+/// The controller owns the screens and channels; this function is just the
+/// assembly: window → toast overlay → root stack, plus the poller.
 fn build_window(app: &adw::Application, state: Arc<RwLock<AppState>>) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -36,55 +44,22 @@ fn build_window(app: &adw::Application, state: Arc<RwLock<AppState>>) {
         .default_height(760)
         .build();
 
-    // Root stack: Login / Main / Editor. Screen switches are driven by state.
-    let stack = gtk4::Stack::new();
-    window.set_content(Some(&stack));
+    let ctl = Rc::new(RefCell::new(AppController::new(state, window.clone())));
+    ctl.borrow_mut().setup(Rc::clone(&ctl));
 
-    // One-shot wiring proof (do NOT make this a repeating timer — it would clobber
-    // AppState.usage every tick once Task 20 drives the usage label).
-    let st = Arc::clone(&state);
-    glib::idle_add_local(move || {
-        let mut s = st.write().unwrap();
-        reduce(&mut s, AppEvent::Usage(crate::state::UsageStats::default()));
-        glib::ControlFlow::Break
+    // The toast overlay is the window's content; the root stack lives inside it.
+    let overlay = ctl.borrow().toast.overlay.clone();
+    let stack = ctl.borrow().stack.clone();
+    overlay.set_child(Some(&stack));
+    window.set_content(Some(&overlay));
+
+    // One poll loop drives the whole app: drains telegram events, pool results,
+    // and screen events, then reflects state in the visible screens.
+    let poll_ctl = Rc::clone(&ctl);
+    glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+        poll_ctl.borrow_mut().poll();
+        glib::ControlFlow::Continue
     });
-
-    // Login screen. `on_event` is a placeholder until Task 21 dispatches AppEvent
-    // through reduce() to the real Telegram channel.
-    let st = Arc::clone(&state);
-    let on_event = Box::new(move |_ev: crate::state::AppEvent| {
-        let mut s = st.write().unwrap();
-        // TODO(Task 21): also dispatch to the Telegram channel.
-        reduce(&mut s, _ev);
-    }) as Box<dyn Fn(crate::state::AppEvent) + Send + 'static>;
-
-    let login = crate::ui::login::LoginScreen::new(Arc::clone(&state), on_event);
-    stack.add_named(&login.root, Some("login"));
-    // The `login` struct handle drops here; the widget tree (stack → root → children)
-    // keeps the visible UI alive. Task 21 must hold the screen handles to switch
-    // steps from AuthStatus (set_data needs Send + 'static, so Rc<RefCell> won't fit).
-
-    // Main screen: group picker + load/send + thumbnail grid. Mounted but hidden —
-    // the login screen is the visible child until Task 21 switches to it on auth.
-    let main = crate::ui::main_screen::MainScreen::new();
-    stack.add_named(&main.root, Some("main"));
-    // Same lifetime story as `login` above: `main` drops here but the widget tree
-    // (stack → root → header → scroller → grid → store) keeps everything alive.
-    // Task 21 restructures screen holding.
-
-    // Editor screen: per-photo controls. Mounted but hidden. The on_event
-    // placeholder mirrors login's; Task 21 rewires everything with the real
-    // channels (the editor needs a shared Arc callback so its four control
-    // closures can each hold a clone).
-    let st = Arc::clone(&state);
-    let on_event = Arc::new(move |_ev: crate::state::AppEvent| {
-        let mut s = st.write().unwrap();
-        // TODO(Task 21): also dispatch to the Telegram channel.
-        reduce(&mut s, _ev);
-    }) as Arc<dyn Fn(crate::state::AppEvent) + Send + Sync + 'static>;
-    let editor = crate::ui::editor::EditorScreen::new(Arc::clone(&state), on_event);
-    stack.add_named(&editor.root, Some("editor"));
-    // Same lifetime story: `editor` drops here but the widget tree keeps the UI alive.
 
     window.present();
 }

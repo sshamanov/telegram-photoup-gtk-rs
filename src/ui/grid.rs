@@ -65,12 +65,22 @@ fn child_by_widget_name<W: IsA<gtk4::Widget>>(parent: &W, name: &str) -> Option<
 
 /// Build the GridView with a list store of rows. Returns (grid, store) so callers
 /// can push rows and update their texture/selected properties.
-pub fn build_grid() -> (gtk4::GridView, gtk4::gio::ListStore) {
+///
+/// `on_toggle` is invoked with (photo id, checked) whenever a cell's checkbox is
+/// toggled by the user, so the controller can mirror selection into AppState.
+pub fn build_grid(
+    on_toggle: impl Fn(u64, bool) + 'static,
+) -> (gtk4::GridView, gtk4::gio::ListStore) {
+    // Shared so the per-cell bind closures can each hold a clone without moving
+    // the `impl Fn` out of the outer `Fn` bind closure.
+    let on_toggle = std::rc::Rc::new(on_toggle);
     let store = gtk4::gio::ListStore::new::<PhotoRow>();
     // SingleSelection (not NoSelection) is load-bearing: Task 19's click-to-edit
     // reads the grid's selection to find the active photo. Task 19/21 wires
     // `grid.connect_selected(...)`.
     let selection = gtk4::SingleSelection::new(Some(store.clone()));
+    // autoselect would auto-open the editor the moment the first photo is added.
+    selection.set_autoselect(false);
     let factory = SignalListItemFactory::new();
 
     factory.connect_setup(|_, item| {
@@ -90,7 +100,8 @@ pub fn build_grid() -> (gtk4::GridView, gtk4::gio::ListStore) {
         item.set_child(Some(&cell));
     });
 
-    factory.connect_bind(|_, item| {
+    let bind_on_toggle = std::rc::Rc::clone(&on_toggle);
+    factory.connect_bind(move |_, item| {
         let Some(list_item) = item.downcast_ref::<ListItem>() else { return };
         // Bind the owned row object to a local so the &PhotoRow borrow is valid.
         let Some(obj) = list_item.item() else { return };
@@ -117,6 +128,17 @@ pub fn build_grid() -> (gtk4::GridView, gtk4::gio::ListStore) {
             .and_then(|w| w.downcast::<gtk4::CheckButton>().ok())
         {
             check.set_active(row.selected());
+            // Clicking the checkbox marks the photo for the album. Mirror into the
+            // row (so scroll-recycling keeps the visual state) and notify the
+            // controller. Mirrors the texture-notify conn/disconnect lifecycle.
+            let row2 = row.clone();
+            let on_toggle = std::rc::Rc::clone(&bind_on_toggle);
+            let conn = check.connect_toggled(move |c| {
+                let active = c.is_active();
+                row2.set_selected(active);
+                on_toggle(row2.id(), active);
+            });
+            unsafe { list_item.set_data("check-conn", conn); }
         }
     });
 
@@ -125,9 +147,12 @@ pub fn build_grid() -> (gtk4::GridView, gtk4::gio::ListStore) {
         let Some(obj) = list_item.item() else { return };
         let Some(row) = obj.downcast_ref::<PhotoRow>() else { return };
         // Steal (move out) the connection id stored in bind and disconnect it.
-        // Safety: see bind — "tex-conn" is SignalHandlerId if present, and steal
-        // removes it from the ListItem's qdata so there's no stale entry.
+        // Safety: see bind — "tex-conn"/"check-conn" are SignalHandlerId if present,
+        // and steal removes them from the ListItem's qdata so there's no stale entry.
         if let Some(conn) = unsafe { list_item.steal_data::<glib::SignalHandlerId>("tex-conn") } {
+            row.disconnect(conn);
+        }
+        if let Some(conn) = unsafe { list_item.steal_data::<glib::SignalHandlerId>("check-conn") } {
             row.disconnect(conn);
         }
     });

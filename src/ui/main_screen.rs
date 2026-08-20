@@ -10,10 +10,11 @@ pub struct MainScreen {
     pub send_button: Button,
     pub usage_label: Label,
     pub grid_store: gtk4::gio::ListStore,
+    pub grid: gtk4::GridView,
 }
 
 impl MainScreen {
-    pub fn new() -> Self {
+    pub fn new(on_toggle: impl Fn(u64, bool) + 'static) -> Self {
         let root = GBox::new(Orientation::Vertical, 8);
         root.set_margin_top(8);
         root.set_margin_bottom(8);
@@ -40,7 +41,7 @@ impl MainScreen {
         root.append(&header);
 
         // Thumbnail grid (lazy-virtualized).
-        let (grid, grid_store) = crate::ui::grid::build_grid();
+        let (grid, grid_store) = crate::ui::grid::build_grid(on_toggle);
         grid.set_max_columns(5);
         grid.set_min_columns(2);
         grid.set_halign(gtk4::Align::Fill);
@@ -50,6 +51,6 @@ impl MainScreen {
         scroller.set_vexpand(true);
         root.append(&scroller);
 
-        Self { root, group_dropdown, load_button, send_button, usage_label, grid_store }
+        Self { root, group_dropdown, load_button, send_button, usage_label, grid_store, grid }
     }
 }

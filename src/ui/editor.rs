@@ -20,6 +20,7 @@ use crate::state::{AppEvent, AppState};
 pub struct EditorScreen {
     pub root: GBox,
     pub preview: Picture,
+    back_button: Button,
     histogram_area: DrawingArea,
     exposure_scale: Scale,
     mode_dropdown: gtk4::DropDown,
@@ -62,6 +63,12 @@ impl EditorScreen {
         // Right: control panel.
         let panel = GBox::new(Orientation::Vertical, 8);
         panel.set_width_request(300);
+
+        // Back to the grid (dispatches ActivePhoto { index: None }).
+        let back_button = Button::with_label("← Back");
+        back_button.add_css_class("flat");
+        back_button.set_halign(gtk4::Align::Start);
+        panel.append(&back_button);
 
         let title = Label::new(Some("Edit photo"));
         title.add_css_class("title-2");
@@ -132,6 +139,7 @@ impl EditorScreen {
         let screen = Self {
             root,
             preview,
+            back_button,
             histogram_area,
             exposure_scale,
             mode_dropdown,
@@ -150,6 +158,11 @@ impl EditorScreen {
 
         // Wire controls → PhotoEdit.
         screen.wire_controls();
+        // Back → clear the active photo (controller switches back to the grid).
+        let on = Arc::clone(&screen.on_event);
+        screen.back_button.connect_clicked(move |_| {
+            on(AppEvent::ActivePhoto { index: None });
+        });
         screen
     }
 
