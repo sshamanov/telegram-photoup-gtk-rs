@@ -57,6 +57,11 @@ pub enum UiEvent {
         auto_ev: f32,
         histogram: Vec<u32>,
         cam_mul: Option<[f32; 4]>,
+        cam_matrix: Option<[[f32; 4]; 3]>,
+        /// Present only on the decode path; the controller caches it as the active
+        /// photo's base so subsequent slider edits render from memory. `None` on
+        /// render-only jobs (the base was already cached).
+        base: Option<Box<dyn Base>>,
         preview_gen: u64,
     },
     ExportReady {
@@ -97,6 +102,9 @@ pub struct AppController {
     // Group dropdown + export bookkeeping.
     dialogs: Vec<DialogInfo>,
     cam_mul: HashMap<u64, Option<[f32; 4]>>,
+    /// Camera→sRGB color matrix per photo id (RAW only; JPEG → absent) for the
+    /// editor's WB Auto/Pick to neutralize through the matrix.
+    cam_matrix: HashMap<u64, Option<[[f32; 4]; 3]>>,
     send_pending: Vec<u64>,
     send_failed: Vec<u64>,
     send_peer: Option<DialogInfo>,
@@ -120,6 +128,11 @@ pub struct AppController {
     // Debounced preview re-render bookkeeping.
     render_debounce: Option<glib::SourceId>,
     render_gen: u64,
+
+    /// Decoded base of the ACTIVE photo (id-keyed), cached so slider edits render
+    /// from memory instead of re-decoding the source every time. Dropped when the
+    /// active photo changes/removes to return the memory.
+    active_base: Option<(u64, Arc<dyn Base>)>,
 
     /// Weak self-handle so async (debounce) callbacks can reach back in.
     ctl: Option<Weak<RefCell<AppController>>>,
@@ -204,6 +217,7 @@ impl AppController {
             config,
             dialogs: Vec::new(),
             cam_mul: HashMap::new(),
+            cam_matrix: HashMap::new(),
             send_pending: Vec::new(),
             send_failed: Vec::new(),
             send_peer: None,
@@ -218,6 +232,7 @@ impl AppController {
             send_backoff: None,
             render_debounce: None,
             render_gen: 0,
+            active_base: None,
             ctl: None,
         };
 
@@ -349,8 +364,15 @@ impl AppController {
                 }
             }
             AppEvent::Nav { delta } => return self.handle_nav(*delta),
+            AppEvent::Toast(msg) => {
+                self.toast.show(msg);
+                return;
+            }
             AppEvent::RejectActive => return self.handle_reject(),
             AppEvent::ActivePhoto { index: None } => {
+                // The editor closed: drop the active photo's decoded base (memory
+                // back) and clear the editor's per-photo preview/matrix data.
+                self.release_active_photo_data();
                 // Deselect the grid row so clicking the same photo again re-opens
                 // the editor (SingleSelection won't re-emit if already selected).
                 // Deferred to an idle callback: we're inside `poll()`'s `RefMut`,
@@ -457,12 +479,27 @@ impl AppController {
                     row.set_ev(auto_ev);
                     row.set_ready(true);
                 }
+                // Keep the editor's EV indicator in sync if this is the active photo.
+                let is_active = {
+                    let st = self.state.read().unwrap();
+                    st.active_photo == self.index_of(id)
+                };
+                if is_active {
+                    self.editor.set_ev(self.effective_ev_for(id, auto_ev));
+                }
             }
-            UiEvent::PreviewReady { id, rgba, size, full, auto_ev, histogram, cam_mul, preview_gen } => {
+            UiEvent::PreviewReady { id, rgba, size, full, auto_ev, histogram, cam_mul, cam_matrix, base, preview_gen } => {
                 if preview_gen != self.render_gen {
                     return; // superseded by a newer edit — drop the stale render
                 }
-                self.cam_mul.insert(id, cam_mul);
+                // Only the decode path carries these; render-only jobs pass `None`
+                // so they must not clobber the values cached from the first decode.
+                if let Some(cm) = cam_mul {
+                    self.cam_mul.insert(id, Some(cm));
+                }
+                if cam_matrix.is_some() {
+                    self.cam_matrix.insert(id, cam_matrix);
+                }
                 let e = AppEvent::PhotoThumbReady {
                     id,
                     rgba: rgba.clone(),
@@ -477,6 +514,13 @@ impl AppController {
                     let st = self.state.read().unwrap();
                     st.active_photo == idx
                 };
+                let decoded = base.is_some();
+                // Cache the freshly-decoded base so slider edits render from memory.
+                if let Some(b) = base {
+                    if is_active {
+                        self.active_base = Some((id, Arc::from(b)));
+                    }
+                }
                 if is_active {
                     self.editor.set_preview(Some(&crate::ui::util::rgba_to_texture(
                         &rgba,
@@ -484,6 +528,13 @@ impl AppController {
                         size.1 as i32,
                     )));
                     self.editor.set_histogram(&histogram);
+                    self.editor.set_preview_rgba(rgba.clone(), size.0, size.1);
+                    self.editor.set_ev(self.effective_ev_for(id, auto_ev));
+                    // The decode path carries the camera matrix the editor's WB
+                    // Auto/Pick need; render-only jobs keep the previously-set one.
+                    if decoded {
+                        self.editor.set_cam_matrix(cam_matrix);
+                    }
                 }
                 // Keep the grid thumbnail in sync with the edited preview; state
                 // now holds the edited render, so the row must show it too.
@@ -782,6 +833,41 @@ impl AppController {
             (p.id, p.source_type, p.adjustments, p.path.clone())
         };
         let tx = self.ui_events_sender.clone();
+
+        // Fast path: the active photo's decoded base is cached — render from memory
+        // (no re-decode). This is what makes slider edits snappy.
+        if let Some((cached_id, base)) = self.active_base.take() {
+            if cached_id == id {
+                self.active_base = Some((cached_id, Arc::clone(&base)));
+                self.pool.submit(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_render_job(base, &adjustments)
+                    }))
+                    .unwrap_or_else(|_| Err("preview render panicked".to_string()));
+                    let _ = tx.send(match result {
+                        Ok((rgba, size, full, auto_ev, hist)) => UiEvent::PreviewReady {
+                            id,
+                            rgba,
+                            size,
+                            full,
+                            auto_ev,
+                            histogram: hist,
+                            cam_mul: None,
+                            cam_matrix: None,
+                            base: None,
+                            preview_gen,
+                        },
+                        Err(msg) => UiEvent::JobFailed { id, msg },
+                    });
+                });
+                return;
+            }
+            // Stale cache (active photo changed) — drop it and decode+render below.
+            self.active_base = None;
+        }
+
+        // Decode + render path (first render, or cache miss). Returns the base so
+        // the controller can cache it for subsequent slider edits.
         self.pool.submit(move || {
             // Panic-safe, same rationale as the thumbnail/export jobs.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -789,16 +875,20 @@ impl AppController {
             }))
             .unwrap_or_else(|_| Err("preview job panicked".to_string()));
             let _ = tx.send(match result {
-                Ok((rgba, size, full, auto_ev, hist, cam)) => UiEvent::PreviewReady {
-                    id,
-                    rgba,
-                    size,
-                    full,
-                    auto_ev,
-                    histogram: hist,
-                    cam_mul: cam,
-                    preview_gen,
-                },
+                Ok((rgba, size, full, auto_ev, hist, cam, cam_matrix, base)) => {
+                    UiEvent::PreviewReady {
+                        id,
+                        rgba,
+                        size,
+                        full,
+                        auto_ev,
+                        histogram: hist,
+                        cam_mul: cam,
+                        cam_matrix,
+                        base: Some(base),
+                        preview_gen,
+                    }
+                }
                 Err(msg) => UiEvent::JobFailed { id, msg },
             });
         });
@@ -1068,6 +1158,19 @@ impl AppController {
         self.state.read().unwrap().photos.iter().position(|p| p.id == id)
     }
 
+    /// The EV the editor's indicator should show after a render of `id`: the
+    /// render's auto EV in Auto/Aggressive mode, the manual EV otherwise.
+    fn effective_ev_for(&self, id: u64, render_auto_ev: f32) -> f32 {
+        let st = self.state.read().unwrap();
+        let Some(adj) = st.photos.iter().find(|p| p.id == id).map(|p| p.adjustments) else {
+            return render_auto_ev;
+        };
+        match adj.exposure_mode {
+            ExposureMode::Manual => adj.exposure_ev,
+            _ => render_auto_ev,
+        }
+    }
+
     fn on_grid_selected(&mut self, idx: u32) {
         if idx == gtk4::INVALID_LIST_POSITION {
             return;
@@ -1111,6 +1214,9 @@ impl AppController {
     fn on_reset(&mut self) {
         self.main_screen.grid_store.remove_all();
         self.row_map.clear();
+        self.cam_mul.clear();
+        self.cam_matrix.clear();
+        self.active_base = None;
         reduce(&mut *self.state.write().unwrap(), AppEvent::PhotosCleared);
         self.deselect_grid();
         self.refresh_screens();
@@ -1123,6 +1229,9 @@ impl AppController {
         self.main_screen.grid_store.remove_all();
         self.row_map.clear();
         self.dialogs.clear();
+        self.cam_mul.clear();
+        self.cam_matrix.clear();
+        self.active_base = None;
         self.main_screen
             .group_dropdown
             .set_model(Some(&gtk4::StringList::new(&[])));
@@ -1146,6 +1255,14 @@ impl AppController {
                         self.main_screen.grid_store.remove(idx);
                     }
                 }
+            }
+        }
+        // Drop the removed photos' caches + camera matrices (memory back).
+        for id in &ids {
+            self.cam_mul.remove(id);
+            self.cam_matrix.remove(id);
+            if self.active_base.as_ref().map_or(false, |(cid, _)| cid == id) {
+                self.active_base = None;
             }
         }
         reduce(&mut *self.state.write().unwrap(), AppEvent::PhotosRemoved(ids));
@@ -1184,6 +1301,13 @@ impl AppController {
         self.refresh_screens();
     }
 
+    /// Drop the cached decoded base of the currently-active photo (returns its
+    /// memory) and clear the editor's per-photo data. Called when the editor closes.
+    fn release_active_photo_data(&mut self) {
+        self.active_base = None;
+        self.editor.release_photo_data();
+    }
+
     /// Load the currently-active photo (state.active_photo) into the editor and
     /// schedule a preview render for it.
     fn open_editor_for_active(&mut self) {
@@ -1200,8 +1324,16 @@ impl AppController {
                 p.full_size,
             )
         };
+        // A different photo is now active: the previous one's decoded base is
+        // useless — drop it (returns its memory) and let the next preview decode
+        // re-cache under the new id.
+        if self.active_base.as_ref().map_or(true, |(cid, _)| *cid != active.0) {
+            self.active_base = None;
+        }
         self.editor
             .set_photo(active.0, &active.1, &active.2, active.3, active.4, active.5);
+        self.editor
+            .set_cam_matrix(self.cam_matrix.get(&active.0).copied().flatten());
         self.schedule_preview(active.0);
     }
 }
@@ -1216,23 +1348,26 @@ fn shown_ev(p: &PhotoState) -> f32 {
 }
 
 /// Decode a file into a renderable base. For RAW, returns the camera as-shot WB
-/// multipliers so exports can bake `export_wb_mul` into libraw's user_mul.
+/// multipliers (so exports can bake `export_wb_mul` into libraw's user_mul) and
+/// the camera→sRGB color matrix (so the editor's WB Auto/Pick can neutralize a
+/// picked pixel through the matrix). JPEG has neither (both `None`).
 fn decode_base(
     data: &[u8],
     source_type: SourceType,
     full_size: bool,
     user_mul: Option<[f32; 4]>,
-) -> Result<(Box<dyn Base>, Option<[f32; 4]>), String> {
+) -> Result<(Box<dyn Base>, Option<[f32; 4]>, Option<[[f32; 4]; 3]>), String> {
     match source_type {
         SourceType::Jpeg => {
             let (size, rgba) = decode_jpeg(data).map_err(|e| e.to_string())?;
-            Ok((Box::new(JpegBase::new(size.width, size.height, rgba)), None))
+            Ok((Box::new(JpegBase::new(size.width, size.height, rgba)), None, None))
         }
         SourceType::Raw => {
             let dr = decode_raw(data, &RawDecodeOpts { full_size, user_mul })
                 .map_err(|e| e.to_string())?;
             let cam = dr.cam_mul;
-            Ok((Box::new(RawBase::new(dr)), cam))
+            let cam_matrix = dr.cam_matrix;
+            Ok((Box::new(RawBase::new(dr)), cam, cam_matrix))
         }
     }
 }
@@ -1246,7 +1381,7 @@ fn run_thumb_job(
     let t0 = std::time::Instant::now();
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     let t_read = t0.elapsed();
-    let (base, cam) = decode_base(&data, source_type, false, None)?;
+    let (base, cam, _cam_matrix) = decode_base(&data, source_type, false, None)?;
     let t_decode = t0.elapsed();
     let full = (base.width(), base.height());
     let (w, h) = fit_within(base.width(), base.height(), 512);
@@ -1261,7 +1396,10 @@ fn run_thumb_job(
     Ok((r.rgba, (w, h), full, r.auto_ev, hist, cam))
 }
 
-/// Decode + render a ≤1024 preview with the photo's current adjustments.
+/// Decode + render a ≤1024 preview with the photo's current adjustments. Also
+/// returns the camera as-shot WB multipliers, the camera→sRGB color matrix, and
+/// the decoded base itself so the controller can cache it (slider edits then
+/// re-render from memory instead of re-decoding — see `run_render_job`).
 ///
 /// The preview ALWAYS shows the full original frame (crop applied with `None`):
 /// the crop is drawn interactively on top in the editor as a selection overlay
@@ -1271,10 +1409,22 @@ fn run_preview_job(
     path: &Path,
     source_type: SourceType,
     adjustments: &Adjustments,
-) -> Result<(Vec<u8>, (u32, u32), (u32, u32), f32, Vec<u32>, Option<[f32; 4]>), String> {
+) -> Result<
+    (
+        Vec<u8>,
+        (u32, u32),
+        (u32, u32),
+        f32,
+        Vec<u32>,
+        Option<[f32; 4]>,
+        Option<[[f32; 4]; 3]>,
+        Box<dyn Base>,
+    ),
+    String,
+> {
     let t0 = std::time::Instant::now();
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
-    let (base, cam) = decode_base(&data, source_type, false, None)?;
+    let (base, cam, cam_matrix) = decode_base(&data, source_type, false, None)?;
     let t_decode = t0.elapsed();
     let full = (base.width(), base.height());
     let (w, h) = fit_within(base.width(), base.height(), PREVIEW_EDGE);
@@ -1286,7 +1436,28 @@ fn run_preview_job(
         "[timing] preview {name} {source_type:?} read+decode {:.3}s render {:.3}s total {:.3}s",
         t_decode.as_secs_f64(), t_render.as_secs_f64(), t_render.as_secs_f64()
     );
-    Ok((r.rgba, (w, h), full, r.auto_ev, hist, cam))
+    Ok((r.rgba, (w, h), full, r.auto_ev, hist, cam, cam_matrix, base))
+}
+
+/// Render a ≤1024 preview from an already-decoded base — no re-decode, so slider
+/// edits on the active photo are snappy (RAW especially). Runs on a pool worker.
+/// Same output shape as `run_preview_job` minus the decode-only extras (cam_mul,
+/// cam_matrix, base); the caller already has those cached.
+fn run_render_job(
+    base: Arc<dyn Base>,
+    adjustments: &Adjustments,
+) -> Result<(Vec<u8>, (u32, u32), (u32, u32), f32, Vec<u32>), String> {
+    let t0 = std::time::Instant::now();
+    let full = (base.width(), base.height());
+    let (w, h) = fit_within(base.width(), base.height(), PREVIEW_EDGE);
+    let r = base.render(None, Size { width: w, height: h }, adjustments);
+    let t_render = t0.elapsed();
+    let hist = compute_histogram(&r.rgba);
+    log::info!(
+        "[timing] preview (cached base) render {:.3}s total {:.3}s",
+        t_render.as_secs_f64(), t_render.as_secs_f64()
+    );
+    Ok((r.rgba, (w, h), full, r.auto_ev, hist))
 }
 
 /// For RAW exports the effective WB is baked into libraw's `user_mul`
@@ -1322,7 +1493,7 @@ fn run_export_job(
         SourceType::Raw => cam_mul.map(|m| export_wb_mul(m, adjustments)),
         SourceType::Jpeg => None,
     };
-    let (base, _) = decode_base(&data, source_type, true, user_mul)?;
+    let (base, _, _) = decode_base(&data, source_type, true, user_mul)?;
     let t_decode = t0.elapsed();
     let size = export_dimensions(base.width(), base.height(), adjustments.crop.as_ref(), EXPORT_EDGE);
     let render_adj = export_render_adjustments(source_type, user_mul, adjustments);
@@ -1395,7 +1566,7 @@ mod tests {
         let mut adj = Adjustments::default();
         adj.exposure_mode = ExposureMode::Manual;
         adj.exposure_ev = -2.0;
-        let (rgba, size, full, _ev, _hist, _cam) =
+        let (rgba, size, full, _ev, _hist, _cam, _cam_matrix, _base) =
             run_preview_job(&path, SourceType::Jpeg, &adj).unwrap();
         assert!(size.0 <= PREVIEW_EDGE && size.1 <= PREVIEW_EDGE);
         assert_eq!(rgba.len(), (size.0 * size.1 * 4) as usize);
