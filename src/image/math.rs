@@ -35,7 +35,12 @@ pub struct AutoExpOpts {
 
 impl Default for AutoExpOpts {
     fn default() -> Self {
-        Self { target: 128.0, min_ev: -3.0, max_ev: 4.0, percentile: 0.6 }
+        Self {
+            target: 128.0,
+            min_ev: -3.0,
+            max_ev: 4.0,
+            percentile: 0.6,
+        }
     }
 }
 
@@ -85,16 +90,35 @@ mod tests {
 
     #[test]
     fn crop_to_pixels_rounds_to_int() {
-        let crop = NormalizedCrop { x: 0.1, y: 0.2, width: 0.5, height: 0.5 };
+        let crop = NormalizedCrop {
+            x: 0.1,
+            y: 0.2,
+            width: 0.5,
+            height: 0.5,
+        };
         let rect = crop_to_pixels(&crop, 1000, 800);
-        assert_eq!(rect, Rect { x: 100, y: 160, width: 500, height: 400 });
+        assert_eq!(
+            rect,
+            Rect {
+                x: 100,
+                y: 160,
+                width: 500,
+                height: 400
+            }
+        );
     }
 
     #[test]
     fn auto_exposure_raises_dark_image() {
         // All pixels at ~1/4 brightness → strong positive EV.
         let lums = vec![60u8; 100];
-        let ev = auto_exposure_ev(&lums, &AutoExpOpts { target: 180.0, ..Default::default() });
+        let ev = auto_exposure_ev(
+            &lums,
+            &AutoExpOpts {
+                target: 180.0,
+                ..Default::default()
+            },
+        );
         assert!(ev > 1.0 && ev < 4.0, "ev was {ev}");
     }
 
@@ -102,7 +126,14 @@ mod tests {
     fn auto_exposure_clamps_max() {
         // Zero luminance → target/measured = 180/1 → log2 ≈ 7.49 EV, above max_ev.
         let lums = vec![0u8; 100];
-        let ev = auto_exposure_ev(&lums, &AutoExpOpts { target: 180.0, max_ev: 0.5, ..Default::default() });
+        let ev = auto_exposure_ev(
+            &lums,
+            &AutoExpOpts {
+                target: 180.0,
+                max_ev: 0.5,
+                ..Default::default()
+            },
+        );
         assert_eq!(ev, 0.5, "expected clamp to max_ev, got {ev}");
     }
 
@@ -110,7 +141,14 @@ mod tests {
     fn auto_exposure_clamps_min() {
         // Max-brightness, target 128 → log2(128/255) ≈ −0.99, below min_ev.
         let lums = vec![255u8; 100];
-        let ev = auto_exposure_ev(&lums, &AutoExpOpts { target: 128.0, min_ev: 0.0, ..Default::default() });
+        let ev = auto_exposure_ev(
+            &lums,
+            &AutoExpOpts {
+                target: 128.0,
+                min_ev: 0.0,
+                ..Default::default()
+            },
+        );
         assert_eq!(ev, 0.0, "expected clamp to min_ev, got {ev}");
     }
 }

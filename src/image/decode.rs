@@ -8,7 +8,13 @@ pub fn decode_jpeg(data: &[u8]) -> Result<(Size, Vec<u8>)> {
     let img = image::load_from_memory(data).map_err(|e| Error::Image(e.to_string()))?;
     let rgba = img.into_rgba8();
     let (w, h) = (rgba.width(), rgba.height());
-    Ok((Size { width: w, height: h }, rgba.into_raw()))
+    Ok((
+        Size {
+            width: w,
+            height: h,
+        },
+        rgba.into_raw(),
+    ))
 }
 
 #[cfg(test)]
@@ -30,8 +36,17 @@ mod tests {
     fn decodes_png_dimensions_and_pixels() {
         let png = make_png_png(8, 8);
         let (size, rgba) = decode_jpeg(&png).expect("decode");
-        assert_eq!(size, Size { width: 8, height: 8 });
+        assert_eq!(
+            size,
+            Size {
+                width: 8,
+                height: 8
+            }
+        );
         assert_eq!(rgba.len(), 8 * 8 * 4);
-        assert!(rgba.chunks_exact(4).all(|p| p == [255, 0, 0, 255]), "not all pixels are red");
+        assert!(
+            rgba.chunks_exact(4).all(|p| p == [255, 0, 0, 255]),
+            "not all pixels are red"
+        );
     }
 }

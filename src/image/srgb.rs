@@ -8,7 +8,11 @@ pub fn srgb_to_linear() -> &'static [f32; 256] {
         let mut lut = [0.0f32; 256];
         for (i, v) in lut.iter_mut().enumerate() {
             let c = i as f32 / 255.0;
-            *v = if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+            *v = if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            };
         }
         lut
     })
@@ -29,7 +33,11 @@ pub fn srgb16_to_linear() -> &'static [f32; 65536] {
 
 pub fn linear_to_srgb_byte(v: f32) -> u8 {
     let c = clamp(v, 0.0, 1.0);
-    let out = if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+    let out = if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    };
     (clamp(out, 0.0, 1.0) * 255.0).round() as u8
 }
 
@@ -62,8 +70,16 @@ pub fn build_tone_lut(apply_camera_curve: bool, hard_clip: bool) -> Vec<u8> {
     let mut lut = Vec::with_capacity(65536);
     for i in 0..65536u32 {
         let x = (i as f32 / 65535.0) * 2.0;
-        let b = if hard_clip { linear_to_srgb_byte(x) } else { linear_to_srgb_byte(highlight_rolloff(x)) };
-        lut.push(if apply_camera_curve { camera_curve_byte(b) } else { b });
+        let b = if hard_clip {
+            linear_to_srgb_byte(x)
+        } else {
+            linear_to_srgb_byte(highlight_rolloff(x))
+        };
+        lut.push(if apply_camera_curve {
+            camera_curve_byte(b)
+        } else {
+            b
+        });
     }
     lut
 }
@@ -144,14 +160,21 @@ pub fn wb_transform3x3(m: &[[f32; 3]; 3], wb: (f32, f32, f32)) -> Option<[f32; 9
     let minv = invert3x3(m)?;
     // M·diag(wb) — scale columns of M.
     let a = [
-        m[0][0] * wb.0, m[0][1] * wb.1, m[0][2] * wb.2,
-        m[1][0] * wb.0, m[1][1] * wb.1, m[1][2] * wb.2,
-        m[2][0] * wb.0, m[2][1] * wb.1, m[2][2] * wb.2,
+        m[0][0] * wb.0,
+        m[0][1] * wb.1,
+        m[0][2] * wb.2,
+        m[1][0] * wb.0,
+        m[1][1] * wb.1,
+        m[1][2] * wb.2,
+        m[2][0] * wb.0,
+        m[2][1] * wb.1,
+        m[2][2] * wb.2,
     ];
     let mut t = [0.0f32; 9];
     for i in 0..3 {
         for j in 0..3 {
-            t[i * 3 + j] = a[i * 3] * minv[0][j] + a[i * 3 + 1] * minv[1][j] + a[i * 3 + 2] * minv[2][j];
+            t[i * 3 + j] =
+                a[i * 3] * minv[0][j] + a[i * 3 + 1] * minv[1][j] + a[i * 3 + 2] * minv[2][j];
         }
     }
     Some(t)
@@ -221,7 +244,9 @@ mod tests {
         for i in 0..3 {
             for j in 0..3 {
                 let mut dot = 0.0;
-                for k in 0..3 { dot += m[i][k] * inv[k][j]; }
+                for k in 0..3 {
+                    dot += m[i][k] * inv[k][j];
+                }
                 let expected = if i == j { 1.0 } else { 0.0 };
                 assert!((dot - expected).abs() < 1e-5, "M·M⁻¹[{i}][{j}]={dot}");
             }
@@ -235,7 +260,9 @@ mod tests {
         let wb = (2.0, 1.0, 1.5);
         let t = wb_transform3x3(&eye, wb).expect("transform");
         // row-major 3x3: [t00,t01,t02, t10,t11,t12, t20,t21,t22]
-        assert!((t[0] - 2.0).abs() < 1e-6 && (t[4] - 1.0).abs() < 1e-6 && (t[8] - 1.5).abs() < 1e-6);
+        assert!(
+            (t[0] - 2.0).abs() < 1e-6 && (t[4] - 1.0).abs() < 1e-6 && (t[8] - 1.5).abs() < 1e-6
+        );
         assert_eq!(t[1], 0.0); // off-diagonals zero
         assert_eq!(t[3], 0.0);
         assert_eq!(t[5], 0.0);

@@ -1,1 +1,3 @@
-pub fn run() -> glib::ExitCode { glib::ExitCode::SUCCESS }
+pub fn run() -> glib::ExitCode {
+    glib::ExitCode::SUCCESS
+}
