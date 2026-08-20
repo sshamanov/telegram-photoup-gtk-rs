@@ -1,4 +1,7 @@
 //! Thumbnail grid: a GObject row type + a GtkGridView fed by a GListStore.
+//! Cell layout mirrors photoup's `PhotoThumb`: a square-ish image area with a
+//! checkbox (top-left), an EV badge (top-right), and a bottom meta row with the
+//! truncated filename + a RAW/JPG badge.
 //! Thread: UI (GTK main loop) only.
 use gtk4::prelude::*;
 use gtk4::{glib, ListItem, SignalListItemFactory};
@@ -15,6 +18,19 @@ pub struct PhotoRowInner {
     pub selected: std::cell::RefCell<bool>,
     #[property(get, set)]
     pub error: std::cell::RefCell<bool>,
+    /// Effective exposure correction for the EV badge (auto → computed autoEV).
+    #[property(get, set)]
+    pub ev: std::cell::RefCell<f32>,
+    /// Display name (file name) shown under the thumbnail.
+    #[property(get, set)]
+    pub name: std::cell::RefCell<String>,
+    /// True when the source is a RAW file → "RAW" badge, else "JPG".
+    #[property(get, set)]
+    pub is_raw: std::cell::RefCell<bool>,
+    /// True once a thumbnail render succeeded (photoup `status === 'ready'`).
+    /// The EV badge only shows when ready AND |ev| > 0.05.
+    #[property(get, set)]
+    pub ready: std::cell::RefCell<bool>,
 }
 
 #[glib::object_subclass]
@@ -50,30 +66,63 @@ impl PhotoRow {
     }
 }
 
-/// Find a direct child of `parent` whose widget name equals `name`.
+/// Depth-first search for a descendant widget whose widget name equals `name`.
 ///
 /// gtk4 0.11 has no `Widget::child_by_widget_name`, so we walk the
-/// first_child → next_sibling chain (the cell is exactly 2 widgets deep).
-fn child_by_widget_name<W: IsA<gtk4::Widget>>(parent: &W, name: &str) -> Option<gtk4::Widget> {
-    let mut child = parent.first_child();
+/// first_child → next_sibling tree ourselves. The cell is now several levels
+/// deep (overlay → picture / placeholder / checkbox / ev label).
+fn find_by_name<W: IsA<gtk4::Widget>>(w: &W, name: &str) -> Option<gtk4::Widget> {
+    if w.widget_name() == name {
+        return Some(w.clone().upcast());
+    }
+    let mut child = w.first_child();
     while let Some(c) = child {
-        if c.widget_name() == name {
-            return Some(c);
+        if let Some(found) = find_by_name(&c, name) {
+            return Some(found);
         }
         child = c.next_sibling();
     }
     None
 }
 
-/// One-time install of the `.cell-error` style (red outline marking a photo whose
-/// decode/export failed). Idempotent across grid rebuilds; matches toast.rs's
-/// provider registration.
-fn install_css() {
+/// One-time install of the cell styles. Idempotent across grid rebuilds; matches
+/// toast.rs's provider registration. Also used by the editor/main screen.
+pub(crate) fn install_css() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let css = gtk4::CssProvider::new();
-        css.load_from_string(".cell-error { border: 2px solid #e01b24; }");
+        css.load_from_string(
+            r#"
+.cell-error { border: 2px solid #e01b24; }
+.cell-placeholder { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.6; }
+.cell-placeholder-error { color: #e01b24; }
+.cell-ev {
+    background: rgba(15, 15, 15, 0.78);
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    border-radius: 5px;
+    padding: 0 6px;
+    font-family: monospace;
+    font-size: 10px;
+    font-weight: 600;
+}
+.cell-badge {
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    border-radius: 5px;
+    padding: 1px 5px;
+    font-size: 10px;
+    letter-spacing: 0.1em;
+}
+.editor-section { font-size: 10px; letter-spacing: 0.14em; opacity: 0.7; }
+.editor-reject { color: #e01b24; border-color: #e01b24; }
+.editor-mono { font-family: monospace; font-size: 13px; }
+.editor-value { font-family: monospace; font-size: 12px; opacity: 0.85; }
+.editor-file { font-family: monospace; font-size: 13px; font-weight: 500; }
+.upload-zone { border: 1.5px dashed rgba(255, 255, 255, 0.4); border-radius: 12px; background: transparent; }
+.upload-zone:hover { border-color: #ff7a45; }
+.usage-dot { color: #ff7a45; }
+"#,
+        );
         if let Some(display) = gtk4::gdk::Display::default() {
             gtk4::style_context_add_provider_for_display(
                 &display,
@@ -82,6 +131,35 @@ fn install_css() {
             );
         }
     });
+}
+
+/// Show/hide the EV badge: only when the thumb is ready and the effective EV is
+/// non-trivial (photoup `showEv = status === 'ready' && |ev| > 0.05`).
+fn update_ev(row: &PhotoRow, ev: &gtk4::Label) {
+    let v = row.ev();
+    if row.ready() && v.abs() > 0.05 {
+        ev.set_text(&format!("{v:+.1}"));
+        ev.set_visible(true);
+    } else {
+        ev.set_text("");
+        ev.set_visible(false);
+    }
+}
+
+/// Show the "developing…" / "error" placeholder while the async thumb hasn't
+/// arrived (or the decode failed), hiding it once a texture is present.
+fn update_placeholder(row: &PhotoRow, ph: &gtk4::Label) {
+    if row.error() {
+        ph.set_text("error");
+        ph.add_css_class("cell-placeholder-error");
+        ph.set_visible(true);
+    } else if row.texture().is_none() {
+        ph.set_text("developing…");
+        ph.remove_css_class("cell-placeholder-error");
+        ph.set_visible(true);
+    } else {
+        ph.set_visible(false);
+    }
 }
 
 /// Build the GridView with a list store of rows. Returns (grid, store) so callers
@@ -109,21 +187,63 @@ pub fn build_grid(
         let Some(item) = item.downcast_ref::<ListItem>() else { return };
         let cell = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
         cell.set_margin_bottom(8);
+
+        // Square-ish image area: the Picture is the Overlay's main child, so its
+        // size drives the overlay. A fixed size request guarantees display space
+        // before the async thumbnail arrives (it scales to fill via cover).
         let image = gtk4::Picture::new();
-        image.set_vexpand(true);
         image.set_hexpand(true);
-        // GridView measures cells from natural size; a Picture with no paintable is
-        // 0×0, so cells collapsed to checkbox height and thumbnails never got display
-        // space. A minimum height guarantees the photo area renders even before the
-        // async thumbnail arrives (it scales to fit via content-fit=contain).
-        image.set_size_request(0, 150);
+        image.set_content_fit(gtk4::ContentFit::Cover);
+        image.set_size_request(170, 170);
+
+        let placeholder = gtk4::Label::new(Some("developing…"));
+        placeholder.add_css_class("cell-placeholder");
+        placeholder.set_halign(gtk4::Align::Center);
+        placeholder.set_valign(gtk4::Align::Center);
+
         let check = gtk4::CheckButton::new();
-        check.set_valign(gtk4::Align::End);
-        cell.append(&image);
-        cell.append(&check);
-        // Keep the two widgets addressable from bind().
+        check.set_halign(gtk4::Align::Start);
+        check.set_valign(gtk4::Align::Start);
+        check.set_margin_top(6);
+        check.set_margin_start(6);
+
+        let ev = gtk4::Label::new(Some(""));
+        ev.add_css_class("cell-ev");
+        ev.set_halign(gtk4::Align::End);
+        ev.set_valign(gtk4::Align::Start);
+        ev.set_margin_top(6);
+        ev.set_margin_end(6);
+
+        let overlay = gtk4::Overlay::new();
+        overlay.set_child(Some(&image));
+        overlay.add_overlay(&placeholder);
+        overlay.add_overlay(&check);
+        overlay.add_overlay(&ev);
+        cell.append(&overlay);
+
+        // Bottom meta row: truncated filename + RAW/JPG badge.
+        let meta = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        meta.set_margin_start(10);
+        meta.set_margin_end(10);
+        meta.set_margin_top(2);
+        let name = gtk4::Label::new(Some(""));
+        name.set_hexpand(true);
+        name.set_halign(gtk4::Align::Start);
+        name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        let badge = gtk4::Label::new(Some("JPG"));
+        badge.add_css_class("cell-badge");
+        badge.set_halign(gtk4::Align::End);
+        meta.append(&name);
+        meta.append(&badge);
+        cell.append(&meta);
+
+        // Keep the widgets addressable from bind().
         image.set_widget_name("cell-image");
+        placeholder.set_widget_name("cell-placeholder");
         check.set_widget_name("cell-check");
+        ev.set_widget_name("cell-ev");
+        name.set_widget_name("cell-name");
+        badge.set_widget_name("cell-badge");
         item.set_child(Some(&cell));
     });
 
@@ -134,38 +254,44 @@ pub fn build_grid(
         let Some(obj) = list_item.item() else { return };
         let Some(row) = obj.downcast_ref::<PhotoRow>() else { return };
         let Some(cell) = list_item.child().and_then(|c| c.downcast::<gtk4::Box>().ok()) else { return };
-        // Bind the row's texture → Picture, selected → checkbox.
-        if let Some(image) = child_by_widget_name(&cell, "cell-image")
-            .and_then(|w| w.downcast::<gtk4::Picture>().ok())
-        {
+
+        let image = find_by_name(&cell, "cell-image")
+            .and_then(|w| w.downcast::<gtk4::Picture>().ok());
+        let placeholder = find_by_name(&cell, "cell-placeholder")
+            .and_then(|w| w.downcast::<gtk4::Label>().ok());
+        let check = find_by_name(&cell, "cell-check")
+            .and_then(|w| w.downcast::<gtk4::CheckButton>().ok());
+        let ev = find_by_name(&cell, "cell-ev").and_then(|w| w.downcast::<gtk4::Label>().ok());
+        let name = find_by_name(&cell, "cell-name").and_then(|w| w.downcast::<gtk4::Label>().ok());
+        let badge = find_by_name(&cell, "cell-badge").and_then(|w| w.downcast::<gtk4::Label>().ok());
+
+        if let Some(image) = &image {
             image.set_paintable(row.texture().as_ref());
             if row.error() {
                 image.add_css_class("cell-error");
             } else {
-                // GridView recycles cells: a cell that previously showed a failed
-                // photo must drop the red border when rebound to a healthy row.
                 image.remove_css_class("cell-error");
             }
             // GridView only re-binds on items-changed / scroll recycle — NOT when a
             // row's properties change. So subscribe to the row's texture-notify so
-            // async thumbnail arrival (Task 21 `set_texture`) repaints this Picture
-            // in place. The handler id lives in the ListItem's qdata; unbind
-            // disconnects it so a scrolled-away row can't touch a recycled cell.
-            // Safety: "tex-conn" is only ever stored/read here as SignalHandlerId.
+            // async thumbnail arrival repaints this Picture in place. The handler
+            // id lives in the ListItem's qdata; unbind disconnects it.
             let image2 = image.clone();
+            let ph2 = placeholder.clone();
             let conn = row.connect_texture_notify(move |r| {
                 image2.set_paintable(r.texture().as_ref());
+                if let Some(ph) = &ph2 {
+                    update_placeholder(r, ph);
+                }
             });
             unsafe { list_item.set_data("tex-conn", conn); }
         }
-        if let Some(check) = child_by_widget_name(&cell, "cell-check")
-            .and_then(|w| w.downcast::<gtk4::CheckButton>().ok())
-        {
+        if let Some(check) = &check {
             check.set_active(row.selected());
             check.set_sensitive(!row.error());
             // Clicking the checkbox marks the photo for the album. Mirror into the
             // row (so scroll-recycling keeps the visual state) and notify the
-            // controller. Mirrors the texture-notify conn/disconnect lifecycle.
+            // controller.
             let row2 = row.clone();
             let on_toggle = std::rc::Rc::clone(&bind_on_toggle);
             let conn = check.connect_toggled(move |c| {
@@ -175,15 +301,30 @@ pub fn build_grid(
             });
             unsafe { list_item.set_data("check-conn", conn); }
         }
-        // Error state: red outline on the Picture + disabled checkbox. Applied
-        // above at bind time; this notify keeps the cell in sync when the row's
-        // `error` property changes after binding (Task 23), same lifecycle as the
-        // texture/check connections.
-        let err_image = child_by_widget_name(&cell, "cell-image")
-            .and_then(|w| w.downcast::<gtk4::Picture>().ok());
-        let err_check = child_by_widget_name(&cell, "cell-check")
-            .and_then(|w| w.downcast::<gtk4::CheckButton>().ok());
-        if let (Some(image), Some(check)) = (err_image, err_check) {
+        if let Some(ev) = &ev {
+            update_ev(&row, ev);
+            let ev2 = ev.clone();
+            let conn = row.connect_ev_notify(move |r| update_ev(r, &ev2));
+            unsafe { list_item.set_data("ev-conn", conn); }
+            let ev3 = ev.clone();
+            let conn = row.connect_ready_notify(move |r| update_ev(r, &ev3));
+            unsafe { list_item.set_data("ready-conn", conn); }
+        }
+        if let Some(name) = &name {
+            name.set_text(row.name().as_str());
+        }
+        if let Some(badge) = &badge {
+            badge.set_text(if row.is_raw() { "RAW" } else { "JPG" });
+        }
+        if let Some(placeholder) = &placeholder {
+            update_placeholder(&row, placeholder);
+        }
+
+        // Error state: red outline on the Picture + disabled checkbox + "error"
+        // placeholder. Kept in sync when the row's `error` property changes after
+        // binding, same lifecycle as the texture/check connections.
+        if let (Some(image), Some(check), Some(placeholder)) = (&image, &check, &placeholder) {
+            let (image, check, placeholder) = (image.clone(), check.clone(), placeholder.clone());
             let conn = row.connect_error_notify(move |r| {
                 if r.error() {
                     image.add_css_class("cell-error");
@@ -192,6 +333,7 @@ pub fn build_grid(
                     image.remove_css_class("cell-error");
                     check.set_sensitive(true);
                 }
+                update_placeholder(r, &placeholder);
             });
             unsafe { list_item.set_data("err-conn", conn); }
         }
@@ -202,16 +344,12 @@ pub fn build_grid(
         let Some(obj) = list_item.item() else { return };
         let Some(row) = obj.downcast_ref::<PhotoRow>() else { return };
         // Steal (move out) the connection id stored in bind and disconnect it.
-        // Safety: see bind — "tex-conn"/"check-conn" are SignalHandlerId if present,
-        // and steal removes them from the ListItem's qdata so there's no stale entry.
-        if let Some(conn) = unsafe { list_item.steal_data::<glib::SignalHandlerId>("tex-conn") } {
-            row.disconnect(conn);
-        }
-        if let Some(conn) = unsafe { list_item.steal_data::<glib::SignalHandlerId>("check-conn") } {
-            row.disconnect(conn);
-        }
-        if let Some(conn) = unsafe { list_item.steal_data::<glib::SignalHandlerId>("err-conn") } {
-            row.disconnect(conn);
+        // Safety: see bind — the keys below are SignalHandlerId if present, and
+        // steal removes them from the ListItem's qdata so there's no stale entry.
+        for key in ["tex-conn", "check-conn", "err-conn", "ev-conn", "ready-conn"] {
+            if let Some(conn) = unsafe { list_item.steal_data::<glib::SignalHandlerId>(key) } {
+                row.disconnect(conn);
+            }
         }
     });
 
