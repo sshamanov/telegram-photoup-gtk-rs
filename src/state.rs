@@ -66,10 +66,12 @@ pub struct UsageStats {
     pub sent: usize,
 }
 
+#[derive(Debug)]
 pub enum AppEvent {
     Auth(AuthEvent),
     PhotosAdded(Vec<PhotoState>),
     PhotoThumbReady { id: u64, rgba: Vec<u8>, size: (u32, u32), auto_ev: f32, histogram: Vec<u32> },
+    PhotoFailed { id: u64, msg: String },
     PhotoEdit { id: u64, adjustments: Adjustments },
     PhotoSelected { id: u64, selected: bool },
     ActivePhoto { index: Option<usize> },
@@ -79,6 +81,7 @@ pub enum AppEvent {
     Usage(UsageStats),
 }
 
+#[derive(Debug)]
 pub enum AuthEvent {
     PhoneRequested,
     CodeEntered { code: String },
@@ -91,8 +94,8 @@ pub enum AuthEvent {
 pub fn reduce(state: &mut AppState, event: AppEvent) {
     match event {
         AppEvent::PhotosAdded(photos) => {
+            state.usage.queued += photos.len();
             state.photos.extend(photos);
-            state.usage.queued += 1;
         }
         AppEvent::PhotoThumbReady { id, rgba, size, auto_ev, histogram } => {
             if let Some(p) = state.photos.iter_mut().find(|p| p.id == id) {
@@ -101,6 +104,11 @@ pub fn reduce(state: &mut AppState, event: AppEvent) {
                 p.auto_ev = auto_ev;
                 p.histogram = Some(histogram);
                 p.status = PhotoStatus::Ready;
+            }
+        }
+        AppEvent::PhotoFailed { id, msg } => {
+            if let Some(p) = state.photos.iter_mut().find(|p| p.id == id) {
+                p.status = PhotoStatus::Error(msg);
             }
         }
         AppEvent::PhotoEdit { id, adjustments } => {
@@ -161,6 +169,18 @@ mod tests {
         reduce(&mut s, AppEvent::PhotoThumbReady { id: 1, rgba: vec![0u8; 4], size: (1, 1), auto_ev: 0.5, histogram: vec![0; 256] });
         assert_eq!(s.photos[0].status, PhotoStatus::Ready);
         assert_eq!(s.photos[0].auto_ev, 0.5);
+    }
+
+    #[test]
+    fn photo_failed_sets_error_status() {
+        let mut s = AppState::default();
+        s.photos.push(PhotoState {
+            id: 3, path: PathBuf::from("/x"), source_type: SourceType::Jpeg,
+            adjustments: Adjustments::default(), auto_ev: 0.0, thumb: None, thumb_size: None,
+            histogram: None, status: PhotoStatus::Processing, selected: true,
+        });
+        reduce(&mut s, AppEvent::PhotoFailed { id: 3, msg: "decode boom".into() });
+        assert_eq!(s.photos[0].status, PhotoStatus::Error("decode boom".into()));
     }
 
     #[test]
