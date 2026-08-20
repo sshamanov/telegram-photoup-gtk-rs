@@ -1,5 +1,6 @@
 use std::sync::{Arc, RwLock};
-use gtk4::{prelude::*, Application, ApplicationWindow};
+use adw::prelude::AdwApplicationWindowExt;
+use gtk4::prelude::*;
 
 use crate::state::{AppState, AppEvent, reduce};
 
@@ -12,16 +13,22 @@ pub mod util;
 const APP_ID: &str = "dev.shamanov.photoup2";
 
 pub fn run() -> glib::ExitCode {
-    let app = Application::builder().application_id(APP_ID).build();
+    adw::init().expect("adw init");
+    let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(|app| {
+        // Single-instance: re-activate (dock click / relaunch) just re-presents.
+        if let Some(win) = app.active_window() {
+            win.present();
+            return;
+        }
         let state = Arc::new(RwLock::new(AppState::default()));
         build_window(app, state);
     });
     app.run()
 }
 
-fn build_window(app: &Application, state: Arc<RwLock<AppState>>) {
-    let window = ApplicationWindow::builder()
+fn build_window(app: &adw::Application, state: Arc<RwLock<AppState>>) {
+    let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("photoup2")
         .default_width(1100)
@@ -30,15 +37,15 @@ fn build_window(app: &Application, state: Arc<RwLock<AppState>>) {
 
     // Root stack: Login / Main / Editor. Screen switches are driven by state.
     let stack = gtk4::Stack::new();
-    window.set_child(Some(&stack));
+    window.set_content(Some(&stack));
 
-    // Poll thread events on the main loop (channels → glib::idle_add).
-    // Task 21 wires the actual channels; for now a placeholder reduce wiring.
+    // One-shot wiring proof (do NOT make this a repeating timer — it would clobber
+    // AppState.usage every tick once Task 20 drives the usage label).
     let st = Arc::clone(&state);
-    glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+    glib::idle_add_local(move || {
         let mut s = st.write().unwrap();
         reduce(&mut s, AppEvent::Usage(crate::state::UsageStats::default()));
-        glib::ControlFlow::Continue
+        glib::ControlFlow::Break
     });
 
     window.present();
