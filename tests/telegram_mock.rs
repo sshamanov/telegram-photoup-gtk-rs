@@ -18,7 +18,7 @@ fn dialogs_and_album_send() {
     let dialogs = tg.handle(TCommand::LoadDialogs);
     assert!(matches!(&dialogs[0], photoup2::telegram::TEvent::Dialogs(d) if d.len() == 2));
     let paths = vec![std::path::PathBuf::from("/a.jpg"), std::path::PathBuf::from("/b.jpg")];
-    let evs = tg.handle(TCommand::SendAlbum { peer_id: 1, paths: paths.clone(), caption: None });
+    let evs = tg.handle(TCommand::SendAlbum { peer_id: 1, access_hash: None, paths: paths.clone(), caption: None });
     assert!(matches!(&evs[0], photoup2::telegram::TEvent::Sent { ok: 2, .. }));
     assert_eq!(tg.sent_album.as_ref().unwrap().len(), 2);
 }

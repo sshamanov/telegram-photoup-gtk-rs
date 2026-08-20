@@ -41,8 +41,8 @@ impl TelegramAdapter for MockAdapter {
             }
             TCommand::LoadDialogs => {
                 vec![TEvent::Dialogs(vec![
-                    DialogInfo { id: 1, title: "My Group".into(), is_group: true },
-                    DialogInfo { id: 2, title: "Test Group".into(), is_group: true },
+                    DialogInfo { id: 1, title: "My Group".into(), is_group: true, access_hash: Some(1) },
+                    DialogInfo { id: 2, title: "Test Group".into(), is_group: true, access_hash: Some(1) },
                 ])]
             }
             TCommand::SendPhoto { .. } => {

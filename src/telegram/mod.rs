@@ -10,6 +10,9 @@ pub struct DialogInfo {
     pub id: i64,
     pub title: String,
     pub is_group: bool,
+    /// Telegram access hash for the peer, needed to send to channels/supergroups.
+    /// `None` when the peer is a basic group or user (or the hash is unknown).
+    pub access_hash: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -37,9 +40,9 @@ pub enum TCommand {
     /// Load dialogs → `TEvent::Dialogs(Vec<DialogInfo>)`.
     LoadDialogs,
     /// Upload one photo file and send it (single). Returns `TEvent::Sent`.
-    SendPhoto { peer_id: i64, path: PathBuf, caption: Option<String> },
+    SendPhoto { peer_id: i64, access_hash: Option<i64>, path: PathBuf, caption: Option<String> },
     /// Upload several photos and send them as an album.
-    SendAlbum { peer_id: i64, paths: Vec<PathBuf>, caption: Option<String> },
+    SendAlbum { peer_id: i64, access_hash: Option<i64>, paths: Vec<PathBuf>, caption: Option<String> },
     /// Check whether the session is already authorized.
     CheckAuth,
 }

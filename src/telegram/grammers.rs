@@ -74,22 +74,18 @@ impl GrammersSession {
         let mut it = self.client.iter_dialogs();
         let mut out = Vec::new();
         while let Some(dialog) = it.next().await.map_err(|e| e.to_string())? {
-            let peer = dialog.peer();
-            // Bot-API tagged id: embeds the peer kind so `send_album` can rebuild the PeerRef.
-            let id = peer.id().bot_api_dialog_id_unchecked();
-            let title = peer.name().unwrap_or("").to_string();
-            let is_group = matches!(peer, Peer::Group(_) | Peer::Channel(_));
-            out.push(DialogInfo { id, title, is_group });
+            out.push(peer_to_dialog(dialog.peer()).await?);
             if out.len() >= 200 { break; }
         }
         Ok(out)
     }
 
     /// Upload each path and send them as a single album (or a single photo).
-    pub async fn send_album(&self, peer_id: i64, paths: &[PathBuf], caption: Option<&str>) -> Result<SentResult, String> {
+    pub async fn send_album(&self, peer_id: i64, access_hash: Option<i64>, paths: &[PathBuf], caption: Option<&str>) -> Result<SentResult, String> {
         let peer_id = PeerId::from_bot_api_dialog_id(peer_id)
             .ok_or_else(|| format!("invalid peer id {peer_id}"))?;
-        let peer = PeerRef { id: peer_id, auth: PeerAuth::default() };
+        let auth = access_hash.map(PeerAuth::from_hash).unwrap_or_default();
+        let peer = PeerRef { id: peer_id, auth };
         let mut medias = Vec::with_capacity(paths.len());
         for (i, p) in paths.iter().enumerate() {
             let uploaded = self.client.upload_file(p).await.map_err(|e| e.to_string())?;
@@ -105,4 +101,17 @@ impl GrammersSession {
         let ids = messages.iter().flatten().map(|m| m.id()).collect();
         Ok(SentResult { message_ids: ids })
     }
+}
+
+/// Extract a `DialogInfo` from a freshly-fetched dialog peer.
+///
+/// The id is stored in Bot-API tagged form (embeds the peer kind) so `send_album` can
+/// rebuild a `PeerRef`. The access hash comes from the peer's cached auth; `None` when
+/// the hash is unavailable (e.g. a minimal user or a plain basic group).
+async fn peer_to_dialog(peer: &Peer) -> Result<DialogInfo, String> {
+    let id = peer.id().bot_api_dialog_id_unchecked();
+    let title = peer.name().unwrap_or("").to_string();
+    let is_group = matches!(peer, Peer::Group(_) | Peer::Channel(_));
+    let access_hash = peer.to_ref().await.ok().flatten().map(|pr| pr.auth.hash());
+    Ok(DialogInfo { id, title, is_group, access_hash })
 }
