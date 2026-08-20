@@ -18,14 +18,20 @@ pub fn srgb_to_linear() -> &'static [f32; 256] {
     })
 }
 
-/// 16-bit sRGB → linear. Index = u16. (8-bit values are scaled by 257.)
+/// 16-bit sRGB → linear. Index = u16. TRUE 16-bit transfer function (photoup's
+/// `SRGB16_TO_LINEAR`) — do NOT quantize to 8-bit buckets, that defeats the 16-bit
+/// highlight headroom of `output_bps=16` RAW decode.
 pub fn srgb16_to_linear() -> &'static [f32; 65536] {
     static LUT: std::sync::OnceLock<[f32; 65536]> = std::sync::OnceLock::new();
     LUT.get_or_init(|| {
-        let s = srgb_to_linear();
         let mut lut = [0.0f32; 65536];
         for (i, v) in lut.iter_mut().enumerate() {
-            *v = s[((i / 257) % 256) as usize];
+            let c = i as f32 / 65535.0;
+            *v = if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            };
         }
         lut
     })
@@ -208,6 +214,19 @@ mod tests {
         let lin = srgb_to_linear()[128];
         assert!((lin - 0.2140).abs() < 0.002, "lin {lin}");
         assert_eq!(linear_to_srgb_byte(lin), 128);
+    }
+
+    #[test]
+    fn srgb16_lut_is_true_transfer_function() {
+        let lut = srgb16_to_linear();
+        assert_eq!(lut[0], 0.0);
+        assert_eq!(lut[65535], 1.0);
+        // Monotonic non-decreasing.
+        for i in 1..65536 {
+            assert!(lut[i] >= lut[i - 1], "dip at {i}");
+        }
+        // 0.5 sRGB (16-bit) must agree with the 8-bit LUT's mid-gray within tolerance.
+        assert!((lut[32768] - srgb_to_linear()[128]).abs() < 0.01);
     }
 
     #[test]
