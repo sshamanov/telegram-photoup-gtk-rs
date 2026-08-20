@@ -32,9 +32,10 @@ use crate::ui::main_screen::MainScreen;
 use crate::ui::toast::Toast;
 
 /// Longest edge of an interactive preview render.
-// Editor preview edge. 768 (not 1024) keeps live EV/WB slider updates fast —
-// the render cost scales with pixels², so 768 is ~44% less work than 1024.
-const PREVIEW_EDGE: u32 = 768;
+// Editor preview: live slider edits render at LIVE_EDGE (512px — snappy), then
+// upgrade to the sharp FINAL_EDGE (1024px) once the edit settles (~400ms idle).
+const LIVE_EDGE: u32 = 512;
+const FINAL_EDGE: u32 = 1024;
 /// Longest edge of an export render (Telegram photo size cap).
 const EXPORT_EDGE: u32 = 2560;
 /// Debounce window for slider-drag preview re-renders.
@@ -138,6 +139,9 @@ pub struct AppController {
     /// Last logged adjustments per photo, so "action: edit" lines only fire when
     /// an edit actually changes the image (not on every slider tick).
     last_edit_log: std::collections::HashMap<u64, crate::image::types::Adjustments>,
+    /// Pending settle-upgrade timer: after a 512px live render, this fires once
+    /// the edit has gone quiet and re-renders the preview at 1024px.
+    settle_source: Option<glib::SourceId>,
     // Send-footer bookkeeping: export order+names for "Preparing {i}/{n}", the
     // count of completed exports, album-chunk progress, and photos sent so far.
     send_jobs: Vec<(u64, String)>,
@@ -249,6 +253,7 @@ impl AppController {
             send_temp_paths: Vec::new(),
             send_started_at: None,
             last_edit_log: std::collections::HashMap::new(),
+            settle_source: None,
             send_jobs: Vec::new(),
             send_jobs_done: 0,
             albums_remaining: 0,
@@ -713,6 +718,24 @@ impl AppController {
                     if decoded {
                         self.editor.set_cam_matrix(cam_matrix);
                     }
+                    // Live render was 512px (fast). Once the edit settles (~400ms
+                    // of no new input), upgrade to the sharp 1024px preview.
+                    if let Some(src) = self.settle_source.take() {
+                        src.remove();
+                    }
+                    let settle_gen = preview_gen;
+                    let Some(w) = self.ctl.as_ref().and_then(|w| w.upgrade()) else {
+                        return;
+                    };
+                    let src = glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(400),
+                        move || {
+                            let mut ctl = w.borrow_mut();
+                            ctl.settle_source = None;
+                            ctl.submit_settle(settle_gen);
+                        },
+                    );
+                    self.settle_source = Some(src);
                 }
                 // Keep the grid thumbnail in sync with the edited preview; state
                 // now holds the edited render, so the row must show it too.
@@ -1060,6 +1083,10 @@ impl AppController {
         if let Some(src) = self.render_debounce.take() {
             src.remove();
         }
+        // A new edit cancels any pending settle-upgrade (we're back in live mode).
+        if let Some(src) = self.settle_source.take() {
+            src.remove();
+        }
         let preview_gen = self.render_gen + 1;
         self.render_gen = preview_gen;
         let Some(w) = self.ctl.as_ref().and_then(|w| w.upgrade()) else {
@@ -1107,7 +1134,7 @@ impl AppController {
                 self.active_base = Some((cached_id, Arc::clone(&base)));
                 self.pool.submit(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run_render_job(base, &adjustments)
+                        run_render_job(base, &adjustments, LIVE_EDGE)
                     }))
                     .unwrap_or_else(|_| Err("preview render panicked".to_string()));
                     let _ = tx.send(match result {
@@ -1155,6 +1182,49 @@ impl AppController {
                         preview_gen,
                     }
                 }
+                Err(msg) => UiEvent::JobFailed { id, msg },
+            });
+        });
+    }
+
+    /// Settle-upgrade: once the edit has gone quiet, re-render the active photo's
+    /// preview at the sharp FINAL_EDGE (1024) from the cached base — no re-decode.
+    /// The live 512px render stays on screen until this lands.
+    fn submit_settle(&mut self, preview_gen: u64) {
+        if preview_gen != self.render_gen {
+            return; // a newer edit superseded this settle
+        }
+        let (id, adjustments) = {
+            let st = self.state.read().unwrap();
+            let Some(i) = st.active_photo else { return };
+            let Some(p) = st.photos.get(i) else { return };
+            (p.id, p.adjustments)
+        };
+        let Some((cached_id, base)) = self.active_base.take() else { return };
+        if cached_id != id {
+            self.active_base = None;
+            return;
+        }
+        self.active_base = Some((cached_id, Arc::clone(&base)));
+        let tx = self.ui_events_sender.clone();
+        self.pool.submit(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_render_job(base, &adjustments, FINAL_EDGE)
+            }))
+            .unwrap_or_else(|_| Err("settle render panicked".to_string()));
+            let _ = tx.send(match result {
+                Ok((rgba, size, full, auto_ev, hist)) => UiEvent::PreviewReady {
+                    id,
+                    rgba,
+                    size,
+                    full,
+                    auto_ev,
+                    histogram: hist,
+                    cam_mul: None,
+                    cam_matrix: None,
+                    base: None,
+                    preview_gen,
+                },
                 Err(msg) => UiEvent::JobFailed { id, msg },
             });
         });
@@ -1707,6 +1777,18 @@ impl AppController {
                 self.editor.set_preview(Some(&tex));
             }
         }
+        // Push the thumbnail pixels to the editor too, so WB Auto/Pick can sample
+        // them instantly after a photo switch — the sharper preview rgba arrives a
+        // moment later and replaces them. (Without this, the first Auto-WB click
+        // right after switching finds no pixels and silently does nothing.)
+        {
+            let st = self.state.read().unwrap();
+            if let Some(p) = st.photos.iter().find(|p| p.id == active.0) {
+                if let (Some(rgba), Some(sz)) = (&p.thumb, p.thumb_size) {
+                    self.editor.set_preview_rgba(rgba.clone(), sz.0, sz.1);
+                }
+            }
+        }
         self.schedule_preview(active.0);
     }
 }
@@ -1800,7 +1882,7 @@ fn run_preview_job(
     let (base, cam, cam_matrix) = decode_base(&data, source_type, false, None)?;
     let t_decode = t0.elapsed();
     let full = (base.width(), base.height());
-    let (w, h) = fit_within(base.width(), base.height(), PREVIEW_EDGE);
+    let (w, h) = fit_within(base.width(), base.height(), FINAL_EDGE);
     let r = base.render(None, Size { width: w, height: h }, adjustments);
     let t_render = t0.elapsed();
     let hist = compute_histogram(&r.rgba);
@@ -1812,17 +1894,19 @@ fn run_preview_job(
     Ok((r.rgba, (w, h), full, r.auto_ev, hist, cam, cam_matrix, base))
 }
 
-/// Render a ≤1024 preview from an already-decoded base — no re-decode, so slider
-/// edits on the active photo are snappy (RAW especially). Runs on a pool worker.
+/// Render a preview from an already-decoded base — no re-decode, so slider edits
+/// on the active photo are snappy (RAW especially). Runs on a pool worker.
+/// `edge` is LIVE_EDGE (512, during a drag) or FINAL_EDGE (1024, once settled).
 /// Same output shape as `run_preview_job` minus the decode-only extras (cam_mul,
 /// cam_matrix, base); the caller already has those cached.
 fn run_render_job(
     base: Arc<dyn Base>,
     adjustments: &Adjustments,
+    edge: u32,
 ) -> Result<(Vec<u8>, (u32, u32), (u32, u32), f32, Vec<u32>), String> {
     let t0 = std::time::Instant::now();
     let full = (base.width(), base.height());
-    let (w, h) = fit_within(base.width(), base.height(), PREVIEW_EDGE);
+    let (w, h) = fit_within(base.width(), base.height(), edge);
     let r = base.render(None, Size { width: w, height: h }, adjustments);
     let t_render = t0.elapsed();
     let hist = compute_histogram(&r.rgba);
@@ -1941,7 +2025,7 @@ mod tests {
         adj.exposure_ev = -2.0;
         let (rgba, size, full, _ev, _hist, _cam, _cam_matrix, _base) =
             run_preview_job(&path, SourceType::Jpeg, &adj).unwrap();
-        assert!(size.0 <= PREVIEW_EDGE && size.1 <= PREVIEW_EDGE);
+        assert!(size.0 <= FINAL_EDGE && size.1 <= FINAL_EDGE);
         assert_eq!(rgba.len(), (size.0 * size.1 * 4) as usize);
         assert_eq!(full, (800, 600));
     }
