@@ -77,13 +77,21 @@ pub static RAW_TONE_LUT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new
 pub static JPEG_HARD_LUT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 pub static RAW_HARD_LUT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 
-pub fn tone_luts(hard_clip: bool, apply_camera_curve: bool) -> &'static [u8] {
+/// JPEG tone LUT (no camera S-curve). `hard_clip` = aggressive auto (no rolloff).
+pub fn jpeg_tone_lut(hard_clip: bool) -> &'static [u8] {
     if hard_clip {
-        if apply_camera_curve { RAW_HARD_LUT.get_or_init(|| build_tone_lut(true, true)) } else { JPEG_HARD_LUT.get_or_init(|| build_tone_lut(false, true)) }
-    } else if apply_camera_curve {
-        RAW_TONE_LUT.get_or_init(|| build_tone_lut(true, false))
+        JPEG_HARD_LUT.get_or_init(|| build_tone_lut(false, true))
     } else {
         JPEG_TONE_LUT.get_or_init(|| build_tone_lut(false, false))
+    }
+}
+
+/// RAW tone LUT (with the camera-Standard S-curve). `hard_clip` = aggressive auto (no rolloff).
+pub fn raw_tone_lut(hard_clip: bool) -> &'static [u8] {
+    if hard_clip {
+        RAW_HARD_LUT.get_or_init(|| build_tone_lut(true, true))
+    } else {
+        RAW_TONE_LUT.get_or_init(|| build_tone_lut(true, false))
     }
 }
 
@@ -173,7 +181,7 @@ mod tests {
 
     #[test]
     fn srgb_roundtrip_midgray() {
-        // 0.5 sRGB → linear ≈ 0.214, and back → 128.
+        // 0.5 sRGB → linear ≈ 0.216, and back → 128.
         let lin = srgb_to_linear()[128];
         assert!((lin - 0.2140).abs() < 0.002, "lin {lin}");
         assert_eq!(linear_to_srgb_byte(lin), 128);
@@ -203,5 +211,35 @@ mod tests {
         let out = export_wb_mul([2.0, 1.0, 1.5, 1.0], &Adjustments::default());
         assert_eq!(out[1], 1.0);
         assert!((out[0] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn invert3x3_roundtrips_to_identity() {
+        let m = [[0.7, 0.2, 0.1], [0.1, 0.8, 0.1], [0.05, 0.1, 0.85]];
+        let inv = invert3x3(&m).expect("invertible");
+        // M * M⁻¹ ≈ I
+        for i in 0..3 {
+            for j in 0..3 {
+                let mut dot = 0.0;
+                for k in 0..3 { dot += m[i][k] * inv[k][j]; }
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!((dot - expected).abs() < 1e-5, "M·M⁻¹[{i}][{j}]={dot}");
+            }
+        }
+    }
+
+    #[test]
+    fn wb_transform_identity_matrix_is_diagonal_gains() {
+        // Identity camera matrix → T = diag(wb), i.e. per-channel gains only.
+        let eye = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let wb = (2.0, 1.0, 1.5);
+        let t = wb_transform3x3(&eye, wb).expect("transform");
+        // row-major 3x3: [t00,t01,t02, t10,t11,t12, t20,t21,t22]
+        assert!((t[0] - 2.0).abs() < 1e-6 && (t[4] - 1.0).abs() < 1e-6 && (t[8] - 1.5).abs() < 1e-6);
+        assert_eq!(t[1], 0.0); // off-diagonals zero
+        assert_eq!(t[3], 0.0);
+        assert_eq!(t[5], 0.0);
+        assert_eq!(t[6], 0.0);
+        assert_eq!(t[7], 0.0);
     }
 }
