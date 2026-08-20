@@ -2,6 +2,7 @@ pub mod decode;
 pub mod encode;
 pub mod math;
 pub mod pipeline;
+pub mod pool;
 pub mod process;
 pub mod rawffi;
 pub mod resize;
