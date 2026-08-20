@@ -32,7 +32,9 @@ use crate::ui::main_screen::MainScreen;
 use crate::ui::toast::Toast;
 
 /// Longest edge of an interactive preview render.
-const PREVIEW_EDGE: u32 = 1024;
+// Editor preview edge. 768 (not 1024) keeps live EV/WB slider updates fast —
+// the render cost scales with pixels², so 768 is ~44% less work than 1024.
+const PREVIEW_EDGE: u32 = 768;
 /// Longest edge of an export render (Telegram photo size cap).
 const EXPORT_EDGE: u32 = 2560;
 /// Debounce window for slider-drag preview re-renders.

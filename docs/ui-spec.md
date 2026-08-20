@@ -59,9 +59,11 @@ Layout top to bottom:
 Full-window overlay (dimmed backdrop). Left = preview, right = 332px panel.
 
 **Left (preview):** the photo, `object-fit: contain`, with an interactive crop
-overlay when a crop is set — drag handles (nw/n/ne/e/se/s/sw/w) to resize, drag
-inside to move, Shift keeps ratio. A "Pick" neutral-WB mode turns the preview
-into a crosshair for selecting the gray point.
+overlay **visible from the start** — with no crop set it spans the whole image
+(so you can drag/resize without clicking a preset first). Drag handles
+(nw/n/ne/e/se/s/sw/w) to resize, drag inside to move, Shift keeps ratio. A
+"Pick" neutral-WB mode turns the preview into a crosshair for selecting the gray
+point.
 
 **Right panel, top to bottom:**
 

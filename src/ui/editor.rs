@@ -480,6 +480,9 @@ pub struct EditorScreen {
     /// neutral point. Toggled by the Pick button.
     picking: Rc<Cell<bool>>,
     is_raw: Rc<Cell<bool>>,
+    /// The active exposure mode — `set_ev` only moves the EV slider in auto
+    /// modes (in Manual the slider IS the user's manual value and must not jump).
+    current_mode: Rc<Cell<ExposureMode>>,
     /// Suppresses PhotoEdit emission while `set_photo`/buttons program the
     /// controls (their `set_value` calls fire signals synchronously).
     suppress: Rc<Cell<bool>>,
@@ -555,6 +558,8 @@ impl EditorScreen {
         let exposure_scale = Scale::new(gtk4::Orientation::Horizontal, Some(&ev_adj));
         exposure_scale.set_value(0.0);
         exposure_scale.set_draw_value(false);
+        // Mark the zero-correction position (photoup's `zero` center).
+        exposure_scale.add_mark(0.0, gtk4::PositionType::Bottom, None);
         panel.append(&exposure_scale);
 
         let ev_row = GBox::new(Orientation::Horizontal, 6);
@@ -580,12 +585,14 @@ impl EditorScreen {
         let temp_scale = Scale::new(gtk4::Orientation::Horizontal, Some(&temp_adj));
         temp_scale.set_value(0.0);
         temp_scale.set_draw_value(false);
+        temp_scale.add_mark(0.0, gtk4::PositionType::Bottom, None);
         panel.append(&temp_scale);
 
         let hue_adj = gtk4::Adjustment::new(0.0, -2.0, 2.0, 0.05, 0.5, 0.0);
         let hue_scale = Scale::new(gtk4::Orientation::Horizontal, Some(&hue_adj));
         hue_scale.set_value(0.0);
         hue_scale.set_draw_value(false);
+        hue_scale.add_mark(0.0, gtk4::PositionType::Bottom, None);
         panel.append(&hue_scale);
 
         let wb_row = GBox::new(Orientation::Horizontal, 6);
@@ -698,6 +705,7 @@ impl EditorScreen {
             cam_matrix: Rc::new(RefCell::new(None)),
             picking: Rc::new(Cell::new(false)),
             is_raw: Rc::new(Cell::new(false)),
+            current_mode: Rc::new(Cell::new(ExposureMode::Auto)),
             suppress: Rc::new(Cell::new(false)),
             state,
             on_event,
@@ -724,6 +732,7 @@ impl EditorScreen {
         self.suppress.set(true);
         self.active_id.set(Some(id));
         self.is_raw.set(is_raw);
+        self.current_mode.set(adjustments.exposure_mode);
         self.full_size.set(full_size);
         self.crop.replace(adjustments.crop);
         // New photo: drop the previous photo's per-photo data (preview pixels for
@@ -748,9 +757,16 @@ impl EditorScreen {
     }
 
     /// Set the EV indicator ("+0.35 EV"); `{:+.2}` keeps the width fixed so the
-    /// label doesn't jitter as auto/manual EVs change.
+    /// label doesn't jitter as auto/manual EVs change. Also moves the EV slider to
+    /// the real EV in auto modes (photoup: the slider value = the effective EV,
+    /// so "0 correction" sits where the correction is, not always at the center).
     pub fn set_ev(&self, ev: f32) {
         self.ev_value.set_text(&format!("{ev:+.2} EV"));
+        if self.current_mode.get() != ExposureMode::Manual {
+            self.suppress.set(true);
+            self.exposure_scale.set_value(ev as f64);
+            self.suppress.set(false);
+        }
     }
 
     /// Cache the active photo's rendered preview pixels (≤1024 edge) so WB Auto
@@ -916,7 +932,13 @@ impl EditorScreen {
             if picking_draw.get() {
                 return;
             }
-            let Some(c) = *crop_draw.borrow() else { return };
+            // Crop box is visible from the start: with no crop set it spans the
+            // whole image (photoup shows the full-frame selection immediately, so
+            // you can drag/resize without clicking a preset first).
+            let c = match *crop_draw.borrow() {
+                Some(c) => c,
+                None => NormalizedCrop { x: 0.0, y: 0.0, width: 1.0, height: 1.0 },
+            };
             let Some(full) = full_draw.get() else { return };
             draw_crop_overlay(cr, width as f64, height as f64, full, c);
         });
