@@ -67,6 +67,9 @@ fn child_by_widget_name<W: IsA<gtk4::Widget>>(parent: &W, name: &str) -> Option<
 /// can push rows and update their texture/selected properties.
 pub fn build_grid() -> (gtk4::GridView, gtk4::gio::ListStore) {
     let store = gtk4::gio::ListStore::new::<PhotoRow>();
+    // SingleSelection (not NoSelection) is load-bearing: Task 19's click-to-edit
+    // reads the grid's selection to find the active photo. Task 19/21 wires
+    // `grid.connect_selected(...)`.
     let selection = gtk4::SingleSelection::new(Some(store.clone()));
     let factory = SignalListItemFactory::new();
 
@@ -88,22 +91,44 @@ pub fn build_grid() -> (gtk4::GridView, gtk4::gio::ListStore) {
     });
 
     factory.connect_bind(|_, item| {
-        let Some(item) = item.downcast_ref::<ListItem>() else { return };
+        let Some(list_item) = item.downcast_ref::<ListItem>() else { return };
         // Bind the owned row object to a local so the &PhotoRow borrow is valid.
-        let Some(obj) = item.item() else { return };
+        let Some(obj) = list_item.item() else { return };
         let Some(row) = obj.downcast_ref::<PhotoRow>() else { return };
-        let Some(cell) = item.child().and_then(|c| c.downcast::<gtk4::Box>().ok()) else { return };
+        let Some(cell) = list_item.child().and_then(|c| c.downcast::<gtk4::Box>().ok()) else { return };
         // Bind the row's texture → Picture, selected → checkbox.
         if let Some(image) = child_by_widget_name(&cell, "cell-image")
             .and_then(|w| w.downcast::<gtk4::Picture>().ok())
         {
-            let tex = row.texture();
-            image.set_paintable(tex.as_ref());
+            image.set_paintable(row.texture().as_ref());
+            // GridView only re-binds on items-changed / scroll recycle — NOT when a
+            // row's properties change. So subscribe to the row's texture-notify so
+            // async thumbnail arrival (Task 21 `set_texture`) repaints this Picture
+            // in place. The handler id lives in the ListItem's qdata; unbind
+            // disconnects it so a scrolled-away row can't touch a recycled cell.
+            // Safety: "tex-conn" is only ever stored/read here as SignalHandlerId.
+            let image2 = image.clone();
+            let conn = row.connect_texture_notify(move |r| {
+                image2.set_paintable(r.texture().as_ref());
+            });
+            unsafe { list_item.set_data("tex-conn", conn); }
         }
         if let Some(check) = child_by_widget_name(&cell, "cell-check")
             .and_then(|w| w.downcast::<gtk4::CheckButton>().ok())
         {
             check.set_active(row.selected());
+        }
+    });
+
+    factory.connect_unbind(|_, item| {
+        let Some(list_item) = item.downcast_ref::<ListItem>() else { return };
+        let Some(obj) = list_item.item() else { return };
+        let Some(row) = obj.downcast_ref::<PhotoRow>() else { return };
+        // Steal (move out) the connection id stored in bind and disconnect it.
+        // Safety: see bind — "tex-conn" is SignalHandlerId if present, and steal
+        // removes it from the ListItem's qdata so there's no stale entry.
+        if let Some(conn) = unsafe { list_item.steal_data::<glib::SignalHandlerId>("tex-conn") } {
+            row.disconnect(conn);
         }
     });
 
