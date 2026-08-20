@@ -52,8 +52,9 @@ fn build_window(app: &adw::Application, state: Arc<RwLock<AppState>>) {
     // through reduce() to the real Telegram channel.
     let st = Arc::clone(&state);
     let on_event = Box::new(move |_ev: crate::state::AppEvent| {
-        let _guard = st.write().unwrap();
-        // TODO(Task 21): dispatch AppEvent to reduce + the Telegram channel.
+        let mut s = st.write().unwrap();
+        // TODO(Task 21): also dispatch to the Telegram channel.
+        reduce(&mut s, _ev);
     }) as Box<dyn Fn(crate::state::AppEvent) + Send + 'static>;
 
     let login = crate::ui::login::LoginScreen::new(Arc::clone(&state), on_event);
