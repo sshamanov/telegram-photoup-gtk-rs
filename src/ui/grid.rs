@@ -142,6 +142,8 @@ pub(crate) fn install_css() {
 .editor-file { font-family: monospace; font-size: 13px; font-weight: 500; }
 .upload-zone { border: 1.5px dashed rgba(255, 255, 255, 0.4); border-radius: 12px; background: transparent; }
 .upload-zone:hover { border-color: #ff7a45; }
+/* Drag-over highlight while a file is hovering the upload zone (photoup `.zone` hover). */
+.upload-zone.drag-over { border-color: #ff7a45; background: rgba(255, 122, 69, 0.08); }
 .usage-dot { color: #ff7a45; }
 "#,
         );

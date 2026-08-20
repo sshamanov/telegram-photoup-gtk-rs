@@ -37,6 +37,25 @@ const PREVIEW_EDGE: u32 = 1024;
 const EXPORT_EDGE: u32 = 2560;
 /// Debounce window for slider-drag preview re-renders.
 const PREVIEW_DEBOUNCE_MS: u64 = 150;
+/// Image extensions the upload zone accepts (drag-drop, Ctrl+V paste, and the
+/// file picker filter all funnel through this). photoup's `UploadZone` accepts
+/// `image/*` plus NEF/CR2; we pin the five the picker advertises.
+const IMAGE_EXTS: [&str; 5] = ["jpg", "jpeg", "png", "nef", "cr2"];
+
+/// Is `path` a photo we accept? Extension-only check, case-insensitive
+/// (photoup UploadZone `isPhoto`).
+pub fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .map(|s| IMAGE_EXTS.contains(&s.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Keep only accepted photo paths. The drag-drop and Ctrl+V paste handlers funnel
+/// through here so non-photo files dropped/pasted are silently ignored.
+pub fn filter_photo_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.into_iter().filter(|p| is_image_path(p)).collect()
+}
 
 /// Pool job results, carried back to the UI thread.
 pub enum UiEvent {
@@ -287,6 +306,53 @@ impl AppController {
             .send_button
             .connect_clicked(move |_| send_ctl.borrow_mut().on_send());
 
+        // Drag-and-drop of files onto the upload zone (photoup UploadZone
+        // `onDrop`). `GdkFileList` deserializes the dropped `text/uri-list`
+        // (file-manager drags) into paths; `on_paths` filters to image types.
+        let zone = self.main_screen.upload_zone.clone();
+        let drop_target = gtk4::DropTarget::new(
+            gtk4::gdk::FileList::static_type(),
+            gtk4::gdk::DragAction::COPY,
+        );
+        {
+            let zone = zone.clone();
+            drop_target.connect_enter(move |_, _, _| {
+                zone.add_css_class("drag-over");
+                gtk4::gdk::DragAction::COPY
+            });
+        }
+        drop_target.connect_leave(move |_| {
+            zone.remove_css_class("drag-over");
+        });
+        let drop_ctl = Rc::clone(&ctl);
+        drop_target.connect_drop(move |_, value, _, _| {
+            let Some(file_list) = value.get::<gtk4::gdk::FileList>().ok() else {
+                return false;
+            };
+            let paths: Vec<PathBuf> =
+                file_list.files().iter().filter_map(|f| f.path()).collect();
+            if paths.is_empty() {
+                return false;
+            }
+            drop_ctl.borrow_mut().on_paths(paths);
+            true
+        });
+        self.main_screen.upload_zone.add_controller(drop_target);
+
+        // Ctrl+V paste anywhere in the window (photoup UploadZone `onPaste`):
+        // files copied from a file manager, or an image copied in a browser.
+        let paste_ctl = Rc::clone(&ctl);
+        let key = gtk4::EventControllerKey::new();
+        key.connect_key_pressed(move |_, keyval, _, state| {
+            let is_v = keyval == gtk4::gdk::Key::v || keyval == gtk4::gdk::Key::V;
+            if is_v && state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
+                paste_ctl.borrow_mut().on_paste();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        self.window.add_controller(key);
+
         // Dev mode (PHOTOUP2_DEV=1): skip Telegram auth and auto-load ./samples/*
         // so the grid/editor can be exercised visually without a real session.
         if std::env::var("PHOTOUP2_DEV").is_ok() {
@@ -297,16 +363,10 @@ impl AppController {
             let ctl = Rc::clone(&ctl);
             glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
                 let mut ctl = ctl.borrow_mut();
-                let exts = ["jpg", "jpeg", "png", "nef", "cr2"];
                 if let Ok(rd) = std::fs::read_dir("samples") {
                     for e in rd.flatten() {
                         let p = e.path();
-                        let is_photo = p
-                            .extension()
-                            .and_then(|s| s.to_str())
-                            .map(|s| exts.contains(&s.to_ascii_lowercase().as_str()))
-                            .unwrap_or(false);
-                        if is_photo {
+                        if is_image_path(&p) {
                             ctl.add_photo(p);
                         }
                     }
@@ -738,7 +798,67 @@ impl AppController {
         );
     }
 
-    fn add_photo(&mut self, path: PathBuf) {
+    /// Add photos from arbitrary paths, silently dropping any that aren't an
+    /// accepted image type. Entry point for drag-drop and Ctrl+V paste (photoup
+    /// UploadZone `handleFiles` → `isPhoto` filter).
+    pub fn on_paths(&mut self, paths: Vec<PathBuf>) {
+        for path in filter_photo_paths(paths) {
+            self.add_photo(path);
+        }
+    }
+
+    /// Ctrl+V paste → add photos from the clipboard. Files copied from a file
+    /// manager surface as `text/uri-list` and are added directly; an image
+    /// copied in a browser (e.g. a screenshot) surfaces as a `GdkTexture` and is
+    /// saved to a temp PNG before being loaded like any other file (photoup
+    /// UploadZone `onPaste` prefers `files`, then falls back to image `items`).
+    /// Runs on the GTK main thread (key events); the async clipboard reads return
+    /// to the same thread, so `borrow_mut` below is always on the main loop.
+    fn on_paste(&mut self) {
+        let clipboard = gtk4::prelude::WidgetExt::display(&self.window).clipboard();
+        let Some(w) = self.ctl.as_ref().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        // File-manager copies are advertised as text/uri-list → read as a FileList.
+        if clipboard.formats().contain_mime_type("text/uri-list") {
+            let clipboard = clipboard.clone();
+            clipboard.read_value_async(
+                gtk4::gdk::FileList::static_type(),
+                glib::Priority::DEFAULT,
+                None::<&gio::Cancellable>,
+                move |res| {
+                    let Ok(value) = res else { return };
+                    let paths: Vec<PathBuf> = value
+                        .get::<gtk4::gdk::FileList>()
+                        .map(|fl| fl.files().iter().filter_map(|f| f.path()).collect())
+                        .unwrap_or_default();
+                    if !paths.is_empty() {
+                        w.borrow_mut().on_paths(paths);
+                    }
+                },
+            );
+        } else {
+            // Browser image copies surface as a texture → temp PNG, then load.
+            let clipboard = clipboard.clone();
+            clipboard.read_texture_async(None::<&gio::Cancellable>, move |res| {
+                let Ok(Some(texture)) = res else { return };
+                let bytes = texture.save_to_png_bytes();
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let path = std::env::temp_dir().join(format!("photoup2-paste-{ts}.png"));
+                if std::fs::write(&path, &bytes).is_ok() {
+                    w.borrow_mut().add_photo(path);
+                }
+            });
+        }
+    }
+
+    /// Load a photo file into the grid: create its `PhotoState` + row and submit
+    /// a thumbnail decode. The file picker, drag-drop, and Ctrl+V paste all feed
+    /// through this (photoup `addPhotos`).
+    pub fn add_photo(&mut self, path: PathBuf) {
         let id = self.next_photo_id;
         self.next_photo_id += 1;
         let source_type = match path.extension().and_then(|s| s.to_str()) {
@@ -1589,6 +1709,37 @@ mod tests {
         let bogus = std::env::temp_dir().join("photoup2-app-test").join("nope.jpg");
         let err = run_thumb_job(&bogus, SourceType::Jpeg).unwrap_err();
         assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn image_extension_filter_accepts_supported_types() {
+        for name in ["a.jpg", "a.jpeg", "a.JPG", "a.PnG", "A.NEF", "b.cr2"] {
+            assert!(is_image_path(Path::new(name)), "{name} should be accepted");
+        }
+    }
+
+    #[test]
+    fn image_extension_filter_rejects_other_files() {
+        for name in ["a.txt", "a.png.txt", "a.jpeg.bak", "notes", "", ".jpg", "a.svg", "a.gif"] {
+            assert!(!is_image_path(Path::new(name)), "{name:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn filter_photo_paths_keeps_only_images() {
+        let mixed = vec![
+            PathBuf::from("/tmp/a.jpg"),
+            PathBuf::from("/tmp/b.txt"),
+            PathBuf::from("/tmp/c.NEF"),
+            PathBuf::from("/tmp/no_ext"),
+            PathBuf::from("/tmp/d.png"),
+        ];
+        let kept = filter_photo_paths(mixed);
+        let names: Vec<&str> = kept
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|s| s.to_str()))
+            .collect();
+        assert_eq!(names, ["a.jpg", "c.NEF", "d.png"]);
     }
 
     #[test]
