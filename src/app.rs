@@ -1262,6 +1262,11 @@ fn run_thumb_job(
 }
 
 /// Decode + render a ≤1024 preview with the photo's current adjustments.
+///
+/// The preview ALWAYS shows the full original frame (crop applied with `None`):
+/// the crop is drawn interactively on top in the editor as a selection overlay
+/// (photoup `object-fit: contain` + `.crop-box`), and is applied only at export
+/// (`run_export_job`). Exposure/WB still apply.
 fn run_preview_job(
     path: &Path,
     source_type: SourceType,
@@ -1273,7 +1278,7 @@ fn run_preview_job(
     let t_decode = t0.elapsed();
     let full = (base.width(), base.height());
     let (w, h) = fit_within(base.width(), base.height(), PREVIEW_EDGE);
-    let r = base.render(adjustments.crop.as_ref(), Size { width: w, height: h }, adjustments);
+    let r = base.render(None, Size { width: w, height: h }, adjustments);
     let t_render = t0.elapsed();
     let hist = compute_histogram(&r.rgba);
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
