@@ -27,11 +27,20 @@ impl AppConfig {
     }
 
     pub fn load() -> Self {
-        Self::load_from(&Self::path()).unwrap_or_else(|_| {
-            let cfg = Self::default();
-            let _ = cfg.save();
-            cfg
-        })
+        match Self::load_from(&Self::path()) {
+            Ok(cfg) => cfg,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let cfg = Self::default();
+                let _ = cfg.save();
+                cfg
+            }
+            Err(_) => {
+                // Corrupt/unreadable config: keep the file, surface a clear default
+                // (the user is told which file to fix).
+                log::error!("config at {} is unreadable — using defaults", Self::path().display());
+                Self::default()
+            }
+        }
     }
 
     /// Load from an explicit path (test-friendly; never touches the real config).

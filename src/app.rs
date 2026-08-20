@@ -136,7 +136,7 @@ impl AppController {
             // No credentials configured: the worker will fail to connect. Point the
             // user at the config file rather than a cryptic connect error.
             toast.show(&format!(
-                "Set TG_API_ID / TG_API_HASH in {}",
+                "Set api_id / api_hash in {}",
                 crate::config::AppConfig::path().display()
             ));
         }
