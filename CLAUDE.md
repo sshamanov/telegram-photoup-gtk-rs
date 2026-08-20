@@ -33,6 +33,22 @@ Implementation plan: `docs/superpowers/plans/2026-08-19-photoup2.md`
   sample file exists in `./samples/` or `../photoup/samples/` (it skips
   otherwise). Samples are gitignored and never committed.
 
+## Debug & timing
+
+- `RUST_LOG=info cargo run` prints `[timing]` lines from the pipeline jobs in
+  `src/app.rs` (`run_thumb_job` / `run_preview_job` / `run_export_job`) with
+  read/decode/render/encode phase durations, plus a send-upload total on
+  `TEvent::Sent`. Use this to find bottlenecks; do not guess at performance.
+- `PHOTOUP2_DEV=1 cargo run` skips Telegram auth and auto-loads `./samples/*`,
+  so the grid/editor can be exercised headless without logging in.
+- **Always measure with `--release`.** The debug build runs the pure-Rust JPEG
+  decoder ~10× slower (a 36MP JPG thumbnail ~7 s debug vs <1 s release); libraw
+  is compiled C++ and fast in both. Timings from a debug build are misleading.
+- The UI flow is a port of photoup's (login → grid with default-checked
+  thumbnails → editor → send-as-album) — see the README "UI flow" section.
+  Known gaps vs photoup: no neutral-picker, Crop button not functional, no QR
+  login.
+
 ## Architecture
 
 Three Kingdoms threading (borrowed from mpd-client), all in one Rust crate

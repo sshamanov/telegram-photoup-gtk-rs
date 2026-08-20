@@ -103,6 +103,7 @@ pub struct AppController {
     // Temp export files handed to the telegram worker for the in-flight send;
     // removed best-effort once the send finishes or fails (Task 23).
     send_temp_paths: Vec<PathBuf>,
+    send_started_at: Option<std::time::Instant>,
     // Pending 2s re-enable of the Send button after a failed send (Task 23);
     // cancelled on success so it can't fight the immediate re-enable.
     send_backoff: Option<glib::SourceId>,
@@ -199,6 +200,7 @@ impl AppController {
             send_peer: None,
             pending_exports: HashMap::new(),
             send_temp_paths: Vec::new(),
+            send_started_at: None,
             send_backoff: None,
             render_debounce: None,
             render_gen: 0,
@@ -359,6 +361,13 @@ impl AppController {
             }
             TEvent::Dialogs(dialogs) => self.populate_group_picker(dialogs),
             TEvent::Sent { ok, failed } => {
+                if let Some(t0) = self.send_started_at.take() {
+                    log::info!(
+                        "[timing] send album ok={ok} failed={} upload_total {:.2}s",
+                        failed.len(),
+                        t0.elapsed().as_secs_f64()
+                    );
+                }
                 reduce(
                     &mut *self.state.write().unwrap(),
                     AppEvent::SendFinished(Ok(())),
@@ -511,10 +520,16 @@ impl AppController {
 
     fn update_usage_label(&mut self) {
         let st = self.state.read().unwrap();
-        let (mut queued, mut processing, mut ready) = (0usize, 0usize, 0usize);
+        // "queued" here means a job is submitted but its status hasn't been flipped
+        // to Processing yet (there's no job-started event), so count it as in-flight
+        // work together with Processing/Exporting — otherwise a batch of large photos
+        // looks stuck at "queued 17 · processing 0" while their thumbnails render.
+        let mut queued = 0usize;
+        let mut processing = 0usize;
+        let mut ready = 0usize;
         for p in &st.photos {
             match p.status {
-                PhotoStatus::Queued => queued += 1,
+                PhotoStatus::Queued => processing += 1,
                 PhotoStatus::Processing | PhotoStatus::Exporting => processing += 1,
                 PhotoStatus::Ready => ready += 1,
                 PhotoStatus::Error(_) => {}
@@ -523,7 +538,7 @@ impl AppController {
         let sent = st.usage.sent;
         drop(st);
         self.main_screen.usage_label.set_text(&format!(
-            "queued {queued} · processing {processing} · ready {ready} · sent {sent}"
+            "working {processing} · ready {ready} · sent {sent}"
         ));
     }
 
@@ -819,6 +834,7 @@ impl AppController {
         // Remember the temp files so the worker's send can be followed up with a
         // best-effort cleanup once it finishes or fails (Task 23).
         self.send_temp_paths = paths.clone();
+        self.send_started_at = Some(std::time::Instant::now());
         let _ = self.telegram_cmd.send(TCommand::SendAlbum {
             peer_id: peer.id,
             access_hash: peer.access_hash,
@@ -923,11 +939,20 @@ fn run_thumb_job(
     path: &Path,
     source_type: SourceType,
 ) -> Result<(Vec<u8>, (u32, u32), f32, Vec<u32>, Option<[f32; 4]>), String> {
+    let t0 = std::time::Instant::now();
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
+    let t_read = t0.elapsed();
     let (base, cam) = decode_base(&data, source_type, false, None)?;
+    let t_decode = t0.elapsed();
     let (w, h) = fit_within(base.width(), base.height(), 512);
     let r = base.render(None, Size { width: w, height: h }, &Adjustments::default());
+    let t_render = t0.elapsed();
     let hist = compute_histogram(&r.rgba);
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+    log::info!(
+        "[timing] thumb {name} {source_type:?} read {:.3}s decode {:.3}s render {:.3}s total {:.3}s",
+        t_read.as_secs_f64(), t_decode.as_secs_f64(), t_render.as_secs_f64(), t_render.as_secs_f64()
+    );
     Ok((r.rgba, (w, h), r.auto_ev, hist, cam))
 }
 
@@ -937,11 +962,19 @@ fn run_preview_job(
     source_type: SourceType,
     adjustments: &Adjustments,
 ) -> Result<(Vec<u8>, (u32, u32), f32, Vec<u32>, Option<[f32; 4]>), String> {
+    let t0 = std::time::Instant::now();
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     let (base, cam) = decode_base(&data, source_type, false, None)?;
+    let t_decode = t0.elapsed();
     let (w, h) = fit_within(base.width(), base.height(), PREVIEW_EDGE);
     let r = base.render(adjustments.crop.as_ref(), Size { width: w, height: h }, adjustments);
+    let t_render = t0.elapsed();
     let hist = compute_histogram(&r.rgba);
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+    log::info!(
+        "[timing] preview {name} {source_type:?} read+decode {:.3}s render {:.3}s total {:.3}s",
+        t_decode.as_secs_f64(), t_render.as_secs_f64(), t_render.as_secs_f64()
+    );
     Ok((r.rgba, (w, h), r.auto_ev, hist, cam))
 }
 
@@ -971,15 +1004,19 @@ fn run_export_job(
     adjustments: &Adjustments,
     cam_mul: Option<[f32; 4]>,
 ) -> Result<(Vec<u8>, u32, u32), String> {
+    let t0 = std::time::Instant::now();
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
+    let t_read = t0.elapsed();
     let user_mul = match source_type {
         SourceType::Raw => cam_mul.map(|m| export_wb_mul(m, adjustments)),
         SourceType::Jpeg => None,
     };
     let (base, _) = decode_base(&data, source_type, true, user_mul)?;
+    let t_decode = t0.elapsed();
     let size = export_dimensions(base.width(), base.height(), adjustments.crop.as_ref(), EXPORT_EDGE);
     let render_adj = export_render_adjustments(source_type, user_mul, adjustments);
     let r = base.render(render_adj.crop.as_ref(), size, &render_adj);
+    let t_render = t0.elapsed();
     let mut rgb = Vec::with_capacity((size.width * size.height * 3) as usize);
     for px in r.rgba.chunks_exact(4) {
         rgb.push(px[0]);
@@ -993,6 +1030,14 @@ fn run_export_job(
         MAX_PHOTO_BYTES,
     )
     .map_err(|e| e.to_string())?;
+    let t_encode = t0.elapsed();
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+    log::info!(
+        "[timing] export {name} {source_type:?} full_size=({}x{}) read {:.3}s decode {:.3}s render {:.3}s encode {:.3}s total {:.3}s -> {} bytes",
+        size.width, size.height,
+        t_read.as_secs_f64(), t_decode.as_secs_f64(), t_render.as_secs_f64(), t_encode.as_secs_f64(), t_encode.as_secs_f64(),
+        jpeg.len()
+    );
     Ok((jpeg, size.width, size.height))
 }
 

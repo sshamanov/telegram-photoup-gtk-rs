@@ -82,6 +82,39 @@ development tools (create an app). On first launch, log in with phone number →
 SMS code → 2FA password (if set); the session is persisted to the session file,
 so later launches skip login.
 
+## UI flow
+
+Mirrors photoup's flow, one screen at a time:
+
+1. **Login** — phone → SMS code → 2FA. (grammers 0.10 dropped QR, so no QR option.)
+2. **Main screen** — pick a target group (remembered after first send), *Load
+   photos…* (JPEG/PNG/NEF/CR2), and a thumbnail grid. Every loaded photo is
+   auto-exposed immediately; each grid cell shows the processed preview with a
+   **checkbox checked by default**.
+3. **Editor** — click any thumbnail to open it: exposure mode
+   (Auto / Slide / Manual) + EV slider, RAW-only Temperature / Hue / Auto-WB,
+   Reset / Auto / Crop, a live preview, and a 256-bin luminance histogram.
+   Changes re-render the preview (debounced) from the original decoded base.
+4. **Back** returns to the grid. **Send** exports the selected photos
+   (≤2560, 4:4:4, Q100-adaptive) in parallel and uploads them as an
+   inline-photo album to the chosen group.
+
+**Known gaps vs photoup** (accepted for now): the drag-to-pick **neutral
+picker** for white balance is not yet implemented (Temperature/Hue sliders +
+Auto-WB are); the **Crop** button is present but not yet functional; QR login is
+unavailable (grammers 0.10).
+
+## Development
+
+- `PHOTOUP2_DEV=1 cargo run` — skips Telegram auth and auto-loads `./samples/*`
+  so the grid/editor can be exercised without logging in.
+- `RUST_LOG=info cargo run` — prints `[timing]` lines for the thumb/preview/
+  export decode–render–encode phases and the send upload, so bottlenecks are
+  measurable.
+- Use `cargo run --release` for realistic performance. The debug build runs the
+  pure-Rust JPEG decoder ~10× slower (a 36MP JPG thumbnail takes ~7 s in debug,
+  <1 s in release); libraw is compiled C++ and is fast in both.
+
 ## Accepted limitations
 
 - **Progressive, not baseline, JPEG.** mozjpeg's Rust binding has no baseline
