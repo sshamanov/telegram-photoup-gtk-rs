@@ -1,12 +1,11 @@
 use gtk4::{prelude::*, Box as GBox, Button, Entry, Label, Orientation};
-use crate::state::AppState;
+use crate::state::{AppEvent, AppState, AuthEvent, AuthStatus};
 use std::sync::{Arc, RwLock};
 
 /// Login screen: phone → code → 2FA, rendered from `AppState::telegram.status`.
 ///
-/// Field handles (step_label, entries, primary) are kept for Task 21 to switch
-/// steps from `AuthStatus`; they are not read yet, hence `#[allow(dead_code)]`.
-#[allow(dead_code)]
+/// Buttons dispatch `AppEvent::Auth` through `on_event`; the controller (Task 21)
+/// forwards those to the Telegram worker and reduces the result into state.
 pub struct LoginScreen {
     pub root: GBox,
     step_label: Label,
@@ -17,7 +16,7 @@ pub struct LoginScreen {
 }
 
 impl LoginScreen {
-    pub fn new(_state: Arc<RwLock<AppState>>, on_event: Box<dyn Fn(crate::state::AppEvent) + Send + 'static>) -> Self {
+    pub fn new(state: Arc<RwLock<AppState>>, on_event: Box<dyn Fn(crate::state::AppEvent) + Send + 'static>) -> Self {
         let root = GBox::new(Orientation::Vertical, 12);
         root.set_margin_top(40);
         root.set_margin_bottom(40);
@@ -53,14 +52,63 @@ impl LoginScreen {
         primary.add_css_class("suggested-action");
         root.append(&primary);
 
+        // The button emits the event for whatever step is currently visible, read
+        // from state so the phone/code/password text goes to the right command.
         let on = on_event;
-        // Clone so the closure can own it while the struct keeps its own handle.
-        let phone_entry_for_click = phone_entry.clone();
+        let st = Arc::clone(&state);
+        let phone = phone_entry.clone();
+        let code = code_entry.clone();
+        let password = password_entry.clone();
         primary.connect_clicked(move |_| {
-            let _phone = phone_entry_for_click.text().to_string();
-            on(crate::state::AppEvent::Auth(crate::state::AuthEvent::PhoneRequested));
+            let status = st.read().unwrap().telegram.status.clone();
+            match status {
+                AuthStatus::AwaitingCode => {
+                    on(AppEvent::Auth(AuthEvent::CodeEntered { code: code.text().to_string() }));
+                }
+                AuthStatus::Awaiting2fa => {
+                    on(AppEvent::Auth(AuthEvent::PasswordEntered { password: password.text().to_string() }));
+                }
+                _ => {
+                    on(AppEvent::Auth(AuthEvent::PhoneRequested { phone: phone.text().to_string() }));
+                }
+            }
         });
 
         Self { root, step_label, phone_entry, code_entry, password_entry, primary }
+    }
+
+    /// Reflect `AuthStatus` in the entry/button/step-label UI. Called by the
+    /// controller whenever Telegram events change the auth status.
+    pub fn render(&self, status: &AuthStatus) {
+        match status {
+            AuthStatus::AwaitingCode => {
+                self.phone_entry.set_visible(false);
+                self.code_entry.set_visible(true);
+                self.password_entry.set_visible(false);
+                self.primary.set_label("Submit code");
+                self.step_label.set_text("Enter the login code sent to your phone");
+            }
+            AuthStatus::Awaiting2fa => {
+                self.phone_entry.set_visible(false);
+                self.code_entry.set_visible(false);
+                self.password_entry.set_visible(true);
+                self.primary.set_label("Submit 2FA password");
+                self.step_label.set_text("This account requires a 2FA password");
+            }
+            AuthStatus::Failed(msg) => {
+                self.phone_entry.set_visible(true);
+                self.code_entry.set_visible(false);
+                self.password_entry.set_visible(false);
+                self.primary.set_label("Request code");
+                self.step_label.set_text(&format!("Login failed: {msg}"));
+            }
+            _ => {
+                self.phone_entry.set_visible(true);
+                self.code_entry.set_visible(false);
+                self.password_entry.set_visible(false);
+                self.primary.set_label("Request code");
+                self.step_label.set_text("Enter your phone number to start");
+            }
+        }
     }
 }

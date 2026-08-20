@@ -83,7 +83,7 @@ pub enum AppEvent {
 
 #[derive(Debug)]
 pub enum AuthEvent {
-    PhoneRequested,
+    PhoneRequested { phone: String },
     CodeEntered { code: String },
     PasswordEntered { password: String },
     Success,
@@ -135,7 +135,7 @@ pub fn reduce(state: &mut AppState, event: AppEvent) {
         }
         AppEvent::Usage(u) => state.usage = u,
         AppEvent::Auth(ev) => match ev {
-            AuthEvent::PhoneRequested => state.telegram.status = AuthStatus::AwaitingCode,
+            AuthEvent::PhoneRequested { .. } => state.telegram.status = AuthStatus::AwaitingCode,
             AuthEvent::CodeEntered { .. } => state.telegram.status = AuthStatus::Awaiting2fa,
             AuthEvent::PasswordEntered { .. } => state.telegram.status = AuthStatus::Authenticated,
             AuthEvent::Success => state.telegram.status = AuthStatus::Authenticated,
