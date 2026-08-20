@@ -84,25 +84,23 @@ so later launches skip login.
 
 ## UI flow
 
-Mirrors photoup's flow, one screen at a time:
+The UI is a port of photoup's — same screens, captions, buttons, and layout.
+The exact spec (extracted from photoup's components) is the authority document:
 
-1. **Login** — phone → SMS code → 2FA. (grammers 0.10 dropped QR, so no QR option.)
-2. **Main screen** — pick a target group (remembered after first send), *Load
-   photos…* (JPEG/PNG/NEF/CR2), and a thumbnail grid. Every loaded photo is
-   auto-exposed immediately; each grid cell shows the processed preview with a
-   **checkbox checked by default**.
-3. **Editor** — click any thumbnail to open it: exposure mode
-   (Auto / Slide / Manual) + EV slider, RAW-only Temperature / Hue / Auto-WB,
-   Reset / Auto / Crop, a live preview, and a 256-bin luminance histogram.
-   Changes re-render the preview (debounced) from the original decoded base.
-4. **Back** returns to the grid. **Send** exports the selected photos
-   (≤2560, 4:4:4, Q100-adaptive) in parallel and uploads them as an
-   inline-photo album to the chosen group.
+**`docs/ui-spec.md`**
 
-**Known gaps vs photoup** (accepted for now): the drag-to-pick **neutral
-picker** for white balance is not yet implemented (Temperature/Hue sliders +
-Auto-WB are); the **Crop** button is present but not yet functional; QR login is
-unavailable (grammers 0.10).
+In short: Login (phone/code/2FA) → Main screen (header with group selector +
+**Reset** + **Logout**; upload zone; "Processing {name} (n queued)" usage
+indicator; a square-thumbnail grid with checkbox top-left, EV badge top-right,
+filename + RAW/JPG badge) → Editor (preview + right panel: histogram, Exposure
+[Auto/Slide/Rest + EV], White balance [Auto/Pick/Reset + temp/hue], Crop
+[1:1/2:3/3:2/Original], Image [EXIF + output size], Prev/Next, Reject/Close) →
+sticky **Send {n} selected** footer (Preparing/Sending progress; sent photos
+are removed after a successful send).
+
+Known gaps vs photoup (tracked in `docs/ui-spec.md`): QR login is unavailable
+(grammers 0.10); the neutral-picker (Pick) and interactive crop may be
+implemented incrementally.
 
 ## Development
 
