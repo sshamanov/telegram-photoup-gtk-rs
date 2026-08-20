@@ -41,8 +41,10 @@ mod integration_tests {
         image::codecs::png::PngEncoder::new(&mut png)
             .write_image(&img, w, h, image::ExtendedColorType::Rgba8)
             .expect("png");
-        let (jpeg, _auto_ev) = process_jpeg_to_export(&png, &Adjustments::default()).expect("pipeline");
+        let (jpeg, auto_ev) = process_jpeg_to_export(&png, &Adjustments::default()).expect("pipeline");
         assert!(jpeg.len() <= MAX_PHOTO_BYTES);
+        // The whole point of the pipeline: a ~1% sRGB dark input MUST be auto-exposed up.
+        assert!(auto_ev > 0.0, "auto-exposure did not lift the dark input (auto_ev={auto_ev})");
         // Write where the user can open it (dev-only; not committed).
         let out = "/tmp/photoup2-verify.jpg";
         std::fs::write(out, &jpeg).expect("write out");
