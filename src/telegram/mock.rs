@@ -45,7 +45,7 @@ impl TelegramAdapter for MockAdapter {
                     DialogInfo { id: 2, title: "Test Group".into(), is_group: true },
                 ])]
             }
-            TCommand::SendPhoto { path, .. } => {
+            TCommand::SendPhoto { .. } => {
                 vec![TEvent::Sent { ok: 1, failed: vec![] }]
             }
             TCommand::SendAlbum { paths, .. } => {
