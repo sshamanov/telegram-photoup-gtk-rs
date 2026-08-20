@@ -1,5 +1,6 @@
 use crate::errors::{Error, Result};
-use crate::image::types::Size;
+use crate::image::rawffi::Raw;
+use crate::image::types::{DecodedRaw, Size};
 
 /// Decode JPEG/PNG to sRGB RGBA8 at full resolution (JPEG base).
 /// `image` crate output is already sRGB; photoup keeps JPEGs in sRGB space and
@@ -15,6 +16,75 @@ pub fn decode_jpeg(data: &[u8]) -> Result<(Size, Vec<u8>)> {
         },
         rgba.into_raw(),
     ))
+}
+
+/// Decode a camera RAW (NEF/CR2) to LINEAR float RGB (camera WB, sRGB primaries).
+/// Mirrors photoup `decodeRaw` options exactly. `half_size` keeps interactive
+/// decodes small; exports pass `false` and get full resolution.
+pub fn decode_raw(data: &[u8], opts: &RawDecodeOpts) -> Result<DecodedRaw> {
+    let raw = Raw::new()?;
+    {
+        let p = raw.params();
+        // A custom WB (user_mul) overrides camera WB and is applied pre-matrix.
+        match opts.user_mul {
+            Some(mul) => {
+                p.use_camera_wb = 0;
+                p.user_mul = mul;
+            }
+            None => {
+                p.use_camera_wb = 1;
+            }
+        }
+        p.use_camera_matrix = 1;
+        p.output_color = 1; // sRGB primaries + gamma
+        p.output_bps = 16;
+        p.no_auto_bright = 1;
+        p.half_size = if opts.full_size { 0 } else { 1 };
+        p.user_qual = 3;
+    }
+    raw.open_buffer(data)?;
+    raw.unpack()?;
+    raw.process()?;
+    raw.make_mem_image()
+}
+
+pub struct RawDecodeOpts {
+    pub full_size: bool,
+    pub user_mul: Option<[f32; 4]>,
+}
+
+#[cfg(test)]
+mod raw_tests {
+    use super::*;
+
+    /// Decode a sample NEF/CR2 if one exists locally. Sample photos are never committed.
+    fn sample() -> Option<std::path::PathBuf> {
+        for dir in ["samples", "../photoup/samples"] {
+            let d = std::path::Path::new(dir);
+            if let Ok(rd) = std::fs::read_dir(d) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if matches!(p.extension().and_then(|s| s.to_str()), Some("NEF") | Some("nef") | Some("CR2") | Some("cr2")) {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn decodes_real_raw_if_sample_present() {
+        let Some(path) = sample() else {
+            eprintln!("skipping: no NEF/CR2 sample found");
+            return;
+        };
+        let data = std::fs::read(&path).expect("read sample");
+        let decoded = decode_raw(&data, &RawDecodeOpts { full_size: false, user_mul: None }).expect("decode raw");
+        assert!(decoded.width > 0 && decoded.height > 0);
+        assert_eq!(decoded.r.len(), (decoded.width * decoded.height) as usize);
+        eprintln!("decoded {}x{} from {}", decoded.width, decoded.height, path.display());
+    }
 }
 
 #[cfg(test)]
