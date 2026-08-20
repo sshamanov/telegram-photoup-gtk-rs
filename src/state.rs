@@ -124,7 +124,17 @@ pub fn reduce(state: &mut AppState, event: AppEvent) {
         }
         AppEvent::ActivePhoto { index } => state.active_photo = index,
         AppEvent::TargetPeer(peer) => state.telegram.target_peer = Some(peer),
-        AppEvent::SendStarted => state.sending = true,
+        AppEvent::SendStarted => {
+            state.sending = true;
+            // Mark selected photos as exporting so the usage label shows the
+            // in-flight send (counted as "processing"). Reset back to Ready when
+            // SendFinished arrives.
+            for p in state.photos.iter_mut() {
+                if p.selected && !matches!(p.status, PhotoStatus::Error(_)) {
+                    p.status = PhotoStatus::Exporting;
+                }
+            }
+        }
         AppEvent::SendFinished(result) => {
             state.sending = false;
             if result.is_ok() {
@@ -221,5 +231,22 @@ mod tests {
         reduce(&mut s, AppEvent::PhotoEdit { id: 7, adjustments: adj });
         assert_eq!(s.photos[0].status, PhotoStatus::Processing);
         assert_eq!(s.photos[0].adjustments.exposure_mode, ExposureMode::Manual);
+    }
+
+    #[test]
+    fn send_started_marks_selected_exporting() {
+        let mut s = AppState::default();
+        for (id, selected) in [(1, true), (2, true), (3, false)] {
+            s.photos.push(PhotoState {
+                id, path: PathBuf::from("/x"), source_type: SourceType::Jpeg,
+                adjustments: Adjustments::default(), auto_ev: 0.0, thumb: None, thumb_size: None,
+                histogram: None, status: PhotoStatus::Ready, selected,
+            });
+        }
+        reduce(&mut s, AppEvent::SendStarted);
+        assert_eq!(s.photos[0].status, PhotoStatus::Exporting);
+        assert_eq!(s.photos[1].status, PhotoStatus::Exporting);
+        assert_eq!(s.photos[2].status, PhotoStatus::Ready); // unselected untouched
+        assert!(s.sending);
     }
 }

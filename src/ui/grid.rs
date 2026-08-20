@@ -112,6 +112,11 @@ pub fn build_grid(
         let image = gtk4::Picture::new();
         image.set_vexpand(true);
         image.set_hexpand(true);
+        // GridView measures cells from natural size; a Picture with no paintable is
+        // 0×0, so cells collapsed to checkbox height and thumbnails never got display
+        // space. A minimum height guarantees the photo area renders even before the
+        // async thumbnail arrives (it scales to fit via content-fit=contain).
+        image.set_size_request(0, 150);
         let check = gtk4::CheckButton::new();
         check.set_valign(gtk4::Align::End);
         cell.append(&image);

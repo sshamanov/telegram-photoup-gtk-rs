@@ -245,6 +245,33 @@ impl AppController {
         self.main_screen
             .send_button
             .connect_clicked(move |_| send_ctl.borrow_mut().on_send());
+
+        // Dev mode (PHOTOUP2_DEV=1): skip Telegram auth and auto-load ./samples/*
+        // so the grid/editor can be exercised visually without a real session.
+        if std::env::var("PHOTOUP2_DEV").is_ok() {
+            reduce(
+                &mut *self.state.write().unwrap(),
+                AppEvent::Auth(AuthEvent::Success),
+            );
+            let ctl = Rc::clone(&ctl);
+            glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
+                let mut ctl = ctl.borrow_mut();
+                let exts = ["jpg", "jpeg", "png", "nef", "cr2"];
+                if let Ok(rd) = std::fs::read_dir("samples") {
+                    for e in rd.flatten() {
+                        let p = e.path();
+                        let is_photo = p
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .map(|s| exts.contains(&s.to_ascii_lowercase().as_str()))
+                            .unwrap_or(false);
+                        if is_photo {
+                            ctl.add_photo(p);
+                        }
+                    }
+                }
+            });
+        }
     }
 
     /// Drain all channels and reflect state in the UI. Called every 50ms.
@@ -578,7 +605,7 @@ impl AppController {
             thumb_size: None,
             histogram: None,
             status: PhotoStatus::Queued,
-            selected: false,
+            selected: true, // photoup defaults checkboxes to checked
         };
         reduce(&mut *self.state.write().unwrap(), AppEvent::PhotosAdded(vec![photo]));
         let row = PhotoRow::new(id);
