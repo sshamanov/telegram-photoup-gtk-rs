@@ -5,9 +5,13 @@ use std::panic::catch_unwind;
 pub const MAX_PHOTO_BYTES: usize = 10_000_000;
 
 /// Single export format: JPEG 4:4:4 mozjpeg. Port of photoup `makeOptions`:
-/// quality + chroma_subsample=1(4:4:4), optimize_coding, baseline, trellis.
-/// The mozjpeg crate maps trellis_multipass/opt_zero/opt_table onto mozjpeg's
-/// scan-optimization defaults (`ScanMode::AllComponentsTogether` + use_scans_in_trellis).
+/// quality + chroma_subsample=1(4:4:4), optimize_coding, trellis.
+/// NOTE: mozjpeg defaults to PROGRESSIVE (its `jpeg_set_defaults` enables
+/// `progressive_mode`, and the Rust crate exposes no baseline switch). photoup
+/// encoded baseline (`baseline: true`), but scan order is pixel-neutral — the
+/// decoded pixels are identical — so this is not a quality divergence. The trellis
+/// options map onto mozjpeg's scan-optimization defaults
+/// (`ScanMode::AllComponentsTogether` + use_scans_in_trellis).
 pub fn encode_jpeg_444(
     rgb: &[u8],
     width: usize,
