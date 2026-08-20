@@ -1,6 +1,8 @@
 //! Telegram behind an adapter (mpd-client's adapter pattern; photoup used the same).
 use std::path::PathBuf;
 
+pub mod mock;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DialogInfo {
     pub id: i64,
