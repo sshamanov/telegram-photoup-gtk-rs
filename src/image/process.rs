@@ -1,7 +1,10 @@
 use crate::image::math::{AutoExpOpts, auto_exposure_ev, crop_to_pixels, fit_within};
-use crate::image::resize::downscale_rgba;
-use crate::image::srgb::{gain_coefficients, jpeg_tone_lut, srgb_to_linear, tone_index};
-use crate::image::types::{Adjustments, ExposureMode, NormalizedCrop, Rect, Size};
+use crate::image::resize::{downscale_crop, downscale_rgba};
+use crate::image::srgb::{
+    gain_coefficients, jpeg_tone_lut, raw_tone_lut, srgb_to_linear, tone_index, wb_gains,
+    wb_transform3x3,
+};
+use crate::image::types::{Adjustments, DecodedRaw, ExposureMode, NormalizedCrop, Rect, Size};
 
 /// A decoded source ready to render at any size. Mirrors photoup's `DecodedBase`.
 pub trait Base: Send + Sync {
@@ -145,6 +148,167 @@ impl Base for JpegBase {
             dst[1] = lut[tone_index(g)];
             dst[2] = lut[tone_index(b)];
             dst[3] = 255;
+        }
+
+        RenderResult { rgba, auto_ev }
+    }
+}
+
+/// RAW path: downscale in LINEAR space, then apply exposure/WB (through the camera
+/// matrix when available) + rolloff + camera-Standard curve. Port of `LinearRgbBase`.
+pub struct RawBase {
+    width: u32,
+    height: u32,
+    full: DecodedRaw,
+    cam_matrix3: Option<[[f32; 3]; 3]>,
+}
+
+impl RawBase {
+    pub fn new(full: DecodedRaw) -> Self {
+        // rgb_cam[3][4]; use first 3 columns as the 3x3.
+        let cam_matrix3 = full.cam_matrix.map(|m| [
+            [m[0][0] as f32, m[0][1] as f32, m[0][2] as f32],
+            [m[1][0] as f32, m[1][1] as f32, m[1][2] as f32],
+            [m[2][0] as f32, m[2][1] as f32, m[2][2] as f32],
+        ]);
+        Self {
+            width: full.width,
+            height: full.height,
+            full,
+            cam_matrix3,
+        }
+    }
+
+    fn luminance_sample(&self, rect: &Rect, size: Size) -> Vec<u8> {
+        let r = downscale_crop(
+            &self.full.r,
+            self.full.width,
+            self.full.height,
+            rect,
+            size.width,
+            size.height,
+        );
+        let g = downscale_crop(
+            &self.full.g,
+            self.full.width,
+            self.full.height,
+            rect,
+            size.width,
+            size.height,
+        );
+        let b = downscale_crop(
+            &self.full.b,
+            self.full.width,
+            self.full.height,
+            rect,
+            size.width,
+            size.height,
+        );
+        let mut lums = vec![0u8; (size.width * size.height) as usize];
+        for i in 0..(size.width * size.height) as usize {
+            let to_byte = |lin: f32| -> u8 {
+                let c = lin.clamp(0.0, 1.0);
+                let out = if c <= 0.0031308 {
+                    c * 12.92
+                } else {
+                    1.055 * c.powf(1.0 / 2.4) - 0.055
+                };
+                (out.clamp(0.0, 1.0) * 255.0).round() as u8
+            };
+            let sr = to_byte(r[i]);
+            let sg = to_byte(g[i]);
+            let sb = to_byte(b[i]);
+            lums[i] = (0.2126 * sr as f32 + 0.7152 * sg as f32 + 0.0722 * sb as f32).round() as u8;
+        }
+        lums
+    }
+}
+
+impl Base for RawBase {
+    fn width(&self) -> u32 {
+        self.width
+    }
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    fn render(
+        &self,
+        crop: Option<&NormalizedCrop>,
+        size: Size,
+        adjustments: &Adjustments,
+    ) -> RenderResult {
+        let rect = crop_rect(self.width, self.height, crop);
+        let aggressive = adjustments.exposure_mode == ExposureMode::Aggressive;
+
+        let ev_sample = fit_within(rect.width, rect.height, 128);
+        let lums = self.luminance_sample(
+            &rect,
+            Size {
+                width: ev_sample.0,
+                height: ev_sample.1,
+            },
+        );
+        let auto_ev = auto_ev_for(&lums, aggressive);
+        let ev = effective_ev(adjustments.exposure_mode, adjustments.exposure_ev, auto_ev);
+
+        let r = downscale_crop(
+            &self.full.r,
+            self.full.width,
+            self.full.height,
+            &rect,
+            size.width,
+            size.height,
+        );
+        let g = downscale_crop(
+            &self.full.g,
+            self.full.width,
+            self.full.height,
+            &rect,
+            size.width,
+            size.height,
+        );
+        let b = downscale_crop(
+            &self.full.b,
+            self.full.width,
+            self.full.height,
+            &rect,
+            size.width,
+            size.height,
+        );
+
+        let gain = 2.0f32.powf(ev);
+        let (wr, wg, wb) = wb_gains(adjustments.wb_offset, adjustments.hue);
+        let lut = raw_tone_lut(aggressive); // RAW gets the camera-Standard S-curve
+        let mut rgba = vec![0u8; (size.width * size.height * 4) as usize];
+
+        // With the camera color matrix, apply WB as T = M·diag(wb)·M⁻¹ so the preview
+        // matches the pre-matrix userMul export (photoup `applyLinearTransform`).
+        let t = self
+            .cam_matrix3
+            .as_ref()
+            .and_then(|m| wb_transform3x3(m, (wr, wg, wb)));
+
+        let n = (size.width * size.height) as usize;
+        if let Some(t) = t {
+            for i in 0..n {
+                let o = i * 4;
+                let r1 = (t[0] * r[i] + t[1] * g[i] + t[2] * b[i]) * gain;
+                let g1 = (t[3] * r[i] + t[4] * g[i] + t[5] * b[i]) * gain;
+                let b1 = (t[6] * r[i] + t[7] * g[i] + t[8] * b[i]) * gain;
+                rgba[o] = lut[tone_index(r1)];
+                rgba[o + 1] = lut[tone_index(g1)];
+                rgba[o + 2] = lut[tone_index(b1)];
+                rgba[o + 3] = 255;
+            }
+        } else {
+            for i in 0..n {
+                let o = i * 4;
+                rgba[o] = lut[tone_index(r[i] * gain * wr)];
+                rgba[o + 1] = lut[tone_index(g[i] * gain * wg)];
+                rgba[o + 2] = lut[tone_index(b[i] * gain * wb)];
+                rgba[o + 3] = 255;
+            }
         }
 
         RenderResult { rgba, auto_ev }
@@ -299,5 +463,59 @@ mod tests {
         );
         let hist = compute_histogram(&out.rgba);
         assert_eq!(hist.iter().sum::<u32>(), 16 * 16);
+    }
+}
+
+#[cfg(test)]
+mod raw_base_tests {
+    use super::*;
+    use crate::image::types::DecodedRaw;
+
+    fn synth_raw(w: u32, h: u32, value: f32) -> RawBase {
+        let n = (w * h) as usize;
+        let mut dr = DecodedRaw {
+            width: w,
+            height: h,
+            r: vec![value; n],
+            g: vec![value; n],
+            b: vec![value; n],
+            cam_mul: None,
+            cam_matrix: None,
+        };
+        // give it a slight gradient so downscale is exercised
+        for i in 0..n {
+            dr.r[i] = value + (i % 7) as f32 * 0.001;
+        }
+        RawBase::new(dr)
+    }
+
+    #[test]
+    fn raw_auto_exposure_lifts_dark() {
+        let base = synth_raw(256, 256, 0.06);
+        let out = base.render(
+            None,
+            Size {
+                width: 128,
+                height: 128,
+            },
+            &Adjustments::default(),
+        );
+        assert!(out.auto_ev > 0.0);
+        assert!(out.rgba[0] > 60, "got {}", out.rgba[0]);
+    }
+
+    #[test]
+    fn raw_matches_jpeg_rolloff_baseline() {
+        // Neutral WB, auto exposure, mid-gray linear 0.5 → should not clip or vanish.
+        let base = synth_raw(64, 64, 0.5);
+        let out = base.render(
+            None,
+            Size {
+                width: 32,
+                height: 32,
+            },
+            &Adjustments::default(),
+        );
+        assert!(out.rgba[0] > 100 && out.rgba[0] < 255);
     }
 }
