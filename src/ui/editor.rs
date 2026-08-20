@@ -5,7 +5,7 @@
 //! The controls emit `AppEvent::PhotoEdit { id, adjustments }` through the
 //! `on_event` callback; the wiring re-renders the preview and pushes the result
 //! back via `set_preview`/`set_histogram`/`set_photo`.
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 
@@ -36,14 +36,251 @@ fn output_line(full: (u32, u32), crop: Option<NormalizedCrop>) -> String {
     format!("output {} × {} px", out.width, out.height)
 }
 
+// ---- Crop overlay (photoup `.stage` + `.crop-box`) ----
+
+/// Minimum crop size in normalized units (photoup `MIN_CROP`).
+const MIN_CROP: f32 = 0.05;
+/// Accent color, photoup `--accent` #ff7a45.
+const ACCENT: (f64, f64, f64) = (0xFF as f64 / 255.0, 0x7A as f64 / 255.0, 0x45 as f64 / 255.0);
+/// Handle fill, photoup `.h` background #f2eadf.
+const HANDLE_FILL: (f64, f64, f64) = (0xF2 as f64 / 255.0, 0xEA as f64 / 255.0, 0xDF as f64 / 255.0);
+/// Handle square size in px.
+const HANDLE_SIZE: f64 = 14.0;
+/// Half-extent hit radius (px) around a handle anchor for grabbing it.
+const HANDLE_HIT: f64 = 26.0;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Handle {
+    Nw,
+    N,
+    Ne,
+    E,
+    Se,
+    S,
+    Sw,
+    W,
+}
+
+#[derive(Clone, Copy)]
+enum DragKind {
+    Move,
+    Resize { handle: Handle },
+}
+
+/// In-flight drag bookkeeping (mirrors photoup's `DragState`).
+#[derive(Clone, Copy)]
+struct DragState {
+    kind: DragKind,
+    start_crop: NormalizedCrop,
+    disp_w: f64,
+    disp_h: f64,
+}
+
+/// Letterboxed display rect of the full image inside the preview area, under
+/// `object-fit: contain` (photoup `contentRect`).
+struct Projection {
+    disp_w: f64,
+    disp_h: f64,
+    ox: f64,
+    oy: f64,
+}
+
+fn project(area_w: f64, area_h: f64, full: (u32, u32)) -> Option<Projection> {
+    let fw = full.0 as f64;
+    let fh = full.1 as f64;
+    if fw <= 0.0 || fh <= 0.0 {
+        return None;
+    }
+    let scale = (area_w / fw).min(area_h / fh);
+    let disp_w = fw * scale;
+    let disp_h = fh * scale;
+    Some(Projection {
+        disp_w,
+        disp_h,
+        ox: (area_w - disp_w) / 2.0,
+        oy: (area_h - disp_h) / 2.0,
+    })
+}
+
+/// The crop selection rect in widget px.
+fn crop_rect(p: &Projection, c: &NormalizedCrop) -> (f64, f64, f64, f64) {
+    (
+        p.ox + c.x as f64 * p.disp_w,
+        p.oy + c.y as f64 * p.disp_h,
+        c.width as f64 * p.disp_w,
+        c.height as f64 * p.disp_h,
+    )
+}
+
+/// The 8 handle anchors (corners + edge midpoints) of the crop rect.
+fn handle_anchors(rx: f64, ry: f64, rw: f64, rh: f64) -> [(Handle, f64, f64); 8] {
+    [
+        (Handle::Nw, rx, ry),
+        (Handle::N, rx + rw / 2.0, ry),
+        (Handle::Ne, rx + rw, ry),
+        (Handle::E, rx + rw, ry + rh / 2.0),
+        (Handle::Se, rx + rw, ry + rh),
+        (Handle::S, rx + rw / 2.0, ry + rh),
+        (Handle::Sw, rx, ry + rh),
+        (Handle::W, rx, ry + rh / 2.0),
+    ]
+}
+
+/// Drag inside the selection: shift the rect, clamped to [0,1].
+fn move_crop(c: NormalizedCrop, ndx: f32, ndy: f32) -> NormalizedCrop {
+    NormalizedCrop {
+        x: (c.x + ndx).clamp(0.0, 1.0 - c.width),
+        y: (c.y + ndy).clamp(0.0, 1.0 - c.height),
+        ..c
+    }
+}
+
+/// Resize one edge/corner; the opposite edge stays put (photoup default path).
+fn resize_crop(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> NormalizedCrop {
+    let mut x = c.x;
+    let mut y = c.y;
+    let mut width = c.width;
+    let mut height = c.height;
+    if matches!(handle, Handle::E | Handle::Ne | Handle::Se) {
+        width = (c.width + ndx).clamp(MIN_CROP, 1.0 - c.x);
+    }
+    if matches!(handle, Handle::W | Handle::Nw | Handle::Sw) {
+        x = (c.x + ndx).clamp(0.0, c.x + c.width - MIN_CROP);
+        width = c.x + c.width - x;
+    }
+    if matches!(handle, Handle::S | Handle::Se | Handle::Sw) {
+        height = (c.height + ndy).clamp(MIN_CROP, 1.0 - c.y);
+    }
+    if matches!(handle, Handle::N | Handle::Nw | Handle::Ne) {
+        y = (c.y + ndy).clamp(0.0, c.y + c.height - MIN_CROP);
+        height = c.y + c.height - y;
+    }
+    NormalizedCrop { x, y, width, height }
+}
+
+/// Shift pressed: keep the aspect ratio (photoup `resizeCrop` shift branch).
+fn resize_crop_shift(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> NormalizedCrop {
+    let is_side = matches!(handle, Handle::N | Handle::S | Handle::E | Handle::W);
+    if is_side {
+        if matches!(handle, Handle::E | Handle::W) {
+            let (x, w) = if handle == Handle::E {
+                (c.x, (c.width + ndx).clamp(MIN_CROP, 1.0 - c.x))
+            } else {
+                let x = (c.x + ndx).clamp(0.0, c.x + c.width - MIN_CROP);
+                (x, c.x + c.width - x)
+            };
+            let h = c.height * (w / c.width);
+            return NormalizedCrop { x, y: c.y + (c.height - h) / 2.0, width: w, height: h };
+        }
+        let (y, h) = if handle == Handle::S {
+            (c.y, (c.height + ndy).clamp(MIN_CROP, 1.0 - c.y))
+        } else {
+            let y = (c.y + ndy).clamp(0.0, c.y + c.height - MIN_CROP);
+            (y, c.y + c.height - y)
+        };
+        let w = c.width * (h / c.height);
+        return NormalizedCrop { x: c.x + (c.width - w) / 2.0, y, width: w, height: h };
+    }
+    // Corner handles anchor the opposite corner.
+    let sx = match handle {
+        Handle::E | Handle::Ne | Handle::Se => ndx,
+        Handle::W | Handle::Nw | Handle::Sw => -ndx,
+        _ => 0.0,
+    } / c.width;
+    let sy = match handle {
+        Handle::S | Handle::Se | Handle::Sw => ndy,
+        Handle::N | Handle::Nw | Handle::Ne => -ndy,
+        _ => 0.0,
+    } / c.height;
+    let s = 1.0 + sx.max(sy);
+    let max_w = if matches!(handle, Handle::W | Handle::Nw | Handle::Sw) {
+        c.x + c.width
+    } else {
+        1.0 - c.x
+    };
+    let max_h = if matches!(handle, Handle::N | Handle::Nw | Handle::Ne) {
+        c.y + c.height
+    } else {
+        1.0 - c.y
+    };
+    let scale = ((c.width * s).clamp(MIN_CROP, max_w) / c.width)
+        .min((c.height * s).clamp(MIN_CROP, max_h) / c.height);
+    let w = c.width * scale;
+    let h = c.height * scale;
+    let x = if matches!(handle, Handle::W | Handle::Nw | Handle::Sw) {
+        c.x + c.width - w
+    } else {
+        c.x
+    };
+    let y = if matches!(handle, Handle::N | Handle::Nw | Handle::Ne) {
+        c.y + c.height - h
+    } else {
+        c.y
+    };
+    NormalizedCrop { x, y, width: w, height: h }
+}
+
+fn rounded_rect(cr: &gtk4::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
+    let r = r.min(w / 2.0).min(h / 2.0);
+    cr.new_sub_path();
+    cr.arc(x + w - r, y + r, r, -std::f64::consts::FRAC_PI_2, 0.0);
+    cr.arc(x + w - r, y + h - r, r, 0.0, std::f64::consts::FRAC_PI_2);
+    cr.arc(x + r, y + h - r, r, std::f64::consts::FRAC_PI_2, std::f64::consts::PI);
+    cr.arc(x + r, y + r, r, std::f64::consts::PI, 1.5 * std::f64::consts::PI);
+    cr.close_path();
+}
+
+/// Draw the dim-outside + accent border + 8 handles for the current crop.
+fn draw_crop_overlay(
+    cr: &gtk4::cairo::Context,
+    area_w: f64,
+    area_h: f64,
+    full: (u32, u32),
+    c: NormalizedCrop,
+) {
+    let Some(p) = project(area_w, area_h, full) else {
+        return;
+    };
+    let (rx, ry, rw, rh) = crop_rect(&p, &c);
+
+    // Dim everything outside the selection (photoup `box-shadow: 0 0 0 9999px`).
+    cr.rectangle(0.0, 0.0, area_w, area_h);
+    cr.rectangle(rx, ry, rw, rh);
+    cr.set_fill_rule(gtk4::cairo::FillRule::EvenOdd);
+    cr.set_source_rgba(6.0 / 255.0, 5.0 / 255.0, 4.0 / 255.0, 0.45);
+    let _ = cr.fill();
+
+    // Accent border.
+    let lw = 1.5;
+    cr.set_line_width(lw);
+    cr.set_source_rgb(ACCENT.0, ACCENT.1, ACCENT.2);
+    cr.rectangle(rx + lw / 2.0, ry + lw / 2.0, rw - lw, rh - lw);
+    let _ = cr.stroke();
+
+    // 8 drag handles at corners/edges.
+    let hs = HANDLE_SIZE;
+    for (_h, hx, hy) in handle_anchors(rx, ry, rw, rh) {
+        rounded_rect(cr, hx - hs / 2.0, hy - hs / 2.0, hs, hs, 3.0);
+        cr.set_source_rgb(HANDLE_FILL.0, HANDLE_FILL.1, HANDLE_FILL.2);
+        let _ = cr.fill_preserve();
+        cr.set_line_width(1.5);
+        cr.set_source_rgb(ACCENT.0, ACCENT.1, ACCENT.2);
+        let _ = cr.stroke();
+    }
+}
+
 /// A click handler that applies a crop-preset ratio (photoup `applyPreset`):
 /// computes a centered crop rect matching the ratio against the source aspect.
+/// The result updates the overlay selection (crop cell + redraw), the output
+/// line, and the photo's adjustments.
 fn crop_preset_handler(
     ratio: f32,
     active_id: Rc<Cell<Option<u64>>>,
     state: Arc<RwLock<AppState>>,
     on_event: Arc<dyn Fn(AppEvent) + Send + Sync + 'static>,
     full_size: Rc<Cell<Option<(u32, u32)>>>,
+    crop_cell: Rc<RefCell<Option<NormalizedCrop>>>,
+    crop_area: DrawingArea,
     info2: Label,
 ) -> impl Fn(&Button) + 'static {
     move |_| {
@@ -64,6 +301,8 @@ fn crop_preset_handler(
             width: w,
             height: h,
         };
+        *crop_cell.borrow_mut() = Some(crop);
+        crop_area.queue_draw();
         let mut adj = current_adjustments(&state.read().unwrap(), id);
         adj.crop = Some(crop);
         info2.set_text(&output_line((fw, fh), Some(crop)));
@@ -74,6 +313,8 @@ fn crop_preset_handler(
 pub struct EditorScreen {
     pub root: GBox,
     pub preview: Picture,
+    /// Overlay that draws the crop-selection rectangle + handles + dim.
+    crop_area: DrawingArea,
     pub nav_prev: Button,
     pub nav_next: Button,
     file_label: Label,
@@ -99,6 +340,9 @@ pub struct EditorScreen {
     active_id: Rc<Cell<Option<u64>>>,
     /// Full source dimensions, needed for the Image section + crop presets.
     full_size: Rc<Cell<Option<(u32, u32)>>>,
+    /// The active crop selection, mirrored from the photo's adjustments and
+    /// updated live by presets / drags; the overlay draws from this.
+    crop: Rc<RefCell<Option<NormalizedCrop>>>,
     is_raw: Rc<Cell<bool>>,
     /// Suppresses PhotoEdit emission while `set_photo`/buttons program the
     /// controls (their `set_value` calls fire signals synchronously).
@@ -120,15 +364,35 @@ impl EditorScreen {
         root.set_margin_start(8);
         root.set_margin_end(8);
 
-        // Left: live preview (contain, like photoup's object-fit: contain).
+        // Left: live preview (contain, like photoup's object-fit: contain) with a
+        // transparent crop-selection overlay on top (photoup's `.stage` + `.crop-box`).
+        let overlay = gtk4::Overlay::new();
+        overlay.set_vexpand(true);
+        overlay.set_hexpand(true);
         let preview = Picture::new();
         preview.set_vexpand(true);
         preview.set_hexpand(true);
         preview.set_content_fit(gtk4::ContentFit::Contain);
-        root.append(&preview);
+        overlay.set_child(Some(&preview));
+        let crop_area = DrawingArea::new();
+        // Keep the overlay's size request driven by the preview, not this
+        // DrawingArea: request ~0 so it never squeezes the 332px panel. It still
+        // fills the overlay via the Fill alignment below.
+        crop_area.set_width_request(1);
+        crop_area.set_height_request(1);
+        crop_area.set_vexpand(true);
+        crop_area.set_hexpand(true);
+        crop_area.set_halign(gtk4::Align::Fill);
+        crop_area.set_valign(gtk4::Align::Fill);
+        overlay.add_overlay(&crop_area);
+        root.append(&overlay);
+        let crop: Rc<RefCell<Option<NormalizedCrop>>> = Rc::new(RefCell::new(None));
 
-        // Right: control panel, scrollable if the window is short.
+        // Right: control panel, scrollable if the window is short. The scrolled
+        // window must keep its 332px minimum, or the preview picture (which
+        // requests its full texture width) would squeeze the panel away.
         let panel_scroll = gtk4::ScrolledWindow::new();
+        panel_scroll.set_width_request(332);
         let panel = GBox::new(Orientation::Vertical, 10);
         panel.set_width_request(332);
         panel.set_margin_start(4);
@@ -265,6 +529,7 @@ impl EditorScreen {
         let screen = Self {
             root,
             preview,
+            crop_area,
             nav_prev,
             nav_next,
             file_label,
@@ -288,12 +553,14 @@ impl EditorScreen {
             close_button,
             active_id: Rc::new(Cell::new(None)),
             full_size: Rc::new(Cell::new(None)),
+            crop,
             is_raw: Rc::new(Cell::new(false)),
             suppress: Rc::new(Cell::new(false)),
             state,
             on_event,
         };
 
+        screen.wire_crop_overlay();
         screen.wire_controls();
         screen.wire_buttons();
         screen
@@ -315,6 +582,8 @@ impl EditorScreen {
         self.active_id.set(Some(id));
         self.is_raw.set(is_raw);
         self.full_size.set(full_size);
+        self.crop.replace(adjustments.crop);
+        self.crop_area.queue_draw();
         self.file_label.set_text(name);
         self.file_label.set_tooltip_text(Some(name));
         self.exposure_scale.set_value(shown_ev as f64);
@@ -452,6 +721,109 @@ impl EditorScreen {
         });
     }
 
+    /// Wire the crop-selection overlay: a draw func that renders the selection
+    /// (dim-outside + accent border + 8 handles) and a drag gesture that moves /
+    /// resizes it. Dragging updates the crop cell + redraw + output line live,
+    /// and commits the crop to the photo's adjustments on release (photoup
+    /// `commitCrop` — the preview itself is NOT re-rendered on crop).
+    fn wire_crop_overlay(&self) {
+        let crop_draw = Rc::clone(&self.crop);
+        let full_draw = Rc::clone(&self.full_size);
+        let area = self.crop_area.clone();
+        area.set_draw_func(move |_a, cr, width, height| {
+            let Some(c) = *crop_draw.borrow() else { return };
+            let Some(full) = full_draw.get() else { return };
+            draw_crop_overlay(cr, width as f64, height as f64, full, c);
+        });
+
+        let gesture = gtk4::GestureDrag::new();
+        let drag: Rc<RefCell<Option<DragState>>> = Rc::new(RefCell::new(None));
+
+        // Press: pick a handle (resize) or the rect interior (move).
+        let crop_begin = Rc::clone(&self.crop);
+        let full_begin = Rc::clone(&self.full_size);
+        let area_begin = self.crop_area.clone();
+        let drag_begin = Rc::clone(&drag);
+        gesture.connect_drag_begin(move |_g, x, y| {
+            let Some(c) = *crop_begin.borrow() else { return };
+            let Some(full) = full_begin.get() else { return };
+            let (aw, ah) = (area_begin.width() as f64, area_begin.height() as f64);
+            let Some(p) = project(aw, ah, full) else { return };
+            let (rx, ry, rw, rh) = crop_rect(&p, &c);
+
+            let hit2 = HANDLE_HIT * HANDLE_HIT;
+            let mut best: Option<(Handle, f64)> = None;
+            for (handle, hx, hy) in handle_anchors(rx, ry, rw, rh) {
+                let dx = x - hx;
+                let dy = y - hy;
+                let d2 = dx * dx + dy * dy;
+                if d2 <= hit2 && best.map_or(true, |(_, bd)| d2 < bd) {
+                    best = Some((handle, d2));
+                }
+            }
+            let kind = match best {
+                Some((handle, _)) => DragKind::Resize { handle },
+                None if x >= rx && x <= rx + rw && y >= ry && y <= ry + rh => DragKind::Move,
+                _ => return,
+            };
+            *drag_begin.borrow_mut() = Some(DragState {
+                kind,
+                start_crop: c,
+                disp_w: p.disp_w,
+                disp_h: p.disp_h,
+            });
+        });
+
+        // Drag: apply move/resize (Shift keeps ratio), live redraw + output line.
+        let crop_update = Rc::clone(&self.crop);
+        let full_update = Rc::clone(&self.full_size);
+        let area_update = self.crop_area.clone();
+        let drag_update = Rc::clone(&drag);
+        let info2_update = self.info2.clone();
+        gesture.connect_drag_update(move |gesture, x, y| {
+            let Some(d) = *drag_update.borrow() else { return };
+            let ndx = (x / d.disp_w) as f32;
+            let ndy = (y / d.disp_h) as f32;
+            let shift = gesture.current_event_state().contains(gdk4::ModifierType::SHIFT_MASK);
+            let new = match d.kind {
+                DragKind::Move => move_crop(d.start_crop, ndx, ndy),
+                DragKind::Resize { handle } => {
+                    if shift {
+                        resize_crop_shift(d.start_crop, handle, ndx, ndy)
+                    } else {
+                        resize_crop(d.start_crop, handle, ndx, ndy)
+                    }
+                }
+            };
+            *crop_update.borrow_mut() = Some(new);
+            area_update.queue_draw();
+            if let Some(full) = full_update.get() {
+                info2_update.set_text(&output_line(full, Some(new)));
+            }
+        });
+
+        // Release: commit the crop onto the photo's adjustments (keeps exposure/WB).
+        let crop_end = Rc::clone(&self.crop);
+        let drag_end = Rc::clone(&drag);
+        let id_end = Rc::clone(&self.active_id);
+        let state_end = Arc::clone(&self.state);
+        let on_end = Arc::clone(&self.on_event);
+        gesture.connect_drag_end(move |_g, _x, _y| {
+            if drag_end.borrow().is_none() {
+                return;
+            }
+            let new_crop = *crop_end.borrow();
+            *drag_end.borrow_mut() = None;
+            let Some(c) = new_crop else { return };
+            let Some(id) = id_end.get() else { return };
+            let mut adj = current_adjustments(&state_end.read().unwrap(), id);
+            adj.crop = Some(c);
+            on_end(AppEvent::PhotoEdit { id, adjustments: adj });
+        });
+
+        self.crop_area.add_controller(gesture);
+    }
+
     fn wire_buttons(&self) {
         let on_event = Arc::clone(&self.on_event);
         let active_id = Rc::clone(&self.active_id);
@@ -533,13 +905,15 @@ impl EditorScreen {
             o(AppEvent::PhotoEdit { id, adjustments: adj });
         });
 
-        // Crop presets.
+        // Crop presets (each also mirrors the selection into the overlay).
         self.crop_11.connect_clicked(crop_preset_handler(
             1.0,
             Rc::clone(&active_id),
             Arc::clone(&state),
             Arc::clone(&on_event),
             Rc::clone(&full_size),
+            Rc::clone(&self.crop),
+            self.crop_area.clone(),
             info2.clone(),
         ));
         self.crop_23.connect_clicked(crop_preset_handler(
@@ -548,6 +922,8 @@ impl EditorScreen {
             Arc::clone(&state),
             Arc::clone(&on_event),
             Rc::clone(&full_size),
+            Rc::clone(&self.crop),
+            self.crop_area.clone(),
             info2.clone(),
         ));
         self.crop_32.connect_clicked(crop_preset_handler(
@@ -556,21 +932,27 @@ impl EditorScreen {
             Arc::clone(&state),
             Arc::clone(&on_event),
             Rc::clone(&full_size),
+            Rc::clone(&self.crop),
+            self.crop_area.clone(),
             info2.clone(),
         ));
 
-        // Original: no crop.
-        let (a, o, st, full, i2) = (
+        // Original: no crop → no selection box drawn.
+        let (a, o, st, full, crop_cell, area, i2) = (
             Rc::clone(&active_id),
             Arc::clone(&on_event),
             Arc::clone(&state),
             Rc::clone(&full_size),
+            Rc::clone(&self.crop),
+            self.crop_area.clone(),
             info2,
         );
         self.crop_orig.connect_clicked(move |_| {
             let Some(id) = a.get() else { return };
             let mut adj = current_adjustments(&st.read().unwrap(), id);
             adj.crop = None;
+            *crop_cell.borrow_mut() = None;
+            area.queue_draw();
             if let Some(full) = full.get() {
                 i2.set_text(&output_line(full, None));
             }
