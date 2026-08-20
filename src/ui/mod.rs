@@ -23,10 +23,12 @@ pub fn run() -> glib::ExitCode {
     app.connect_activate(|app| {
         // Single-instance: re-activate (dock click / relaunch) just re-presents.
         if let Some(win) = app.active_window() {
+            log::info!("single-instance: another instance already running — re-presenting window");
             win.present();
             return;
         }
         let state = Arc::new(RwLock::new(AppState::default()));
+        log::info!("creating main window");
         build_window(app, state);
     });
     app.run()

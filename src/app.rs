@@ -281,7 +281,16 @@ impl AppController {
         {
             let ctl = Rc::clone(&ctl);
             sel.connect_selected_notify(move |sel| {
-                ctl.borrow_mut().on_grid_selected(sel.selected());
+                let idx = sel.selected();
+                // Defer to idle: this signal fires SYNCHRONOUSLY when the model
+                // changes (e.g. rows removed after a send fires g_list_store_remove
+                // → selected_notify). Calling borrow_mut() here would re-borrow the
+                // controller while poll() already holds it → "RefCell already
+                // borrowed" panic. Run on the next main-loop iteration instead.
+                let ctl = Rc::clone(&ctl);
+                glib::idle_add_local_once(move || {
+                    ctl.borrow_mut().on_grid_selected(idx);
+                });
             });
         }
 
@@ -553,17 +562,20 @@ impl AppController {
     fn handle_telegram_event(&mut self, ev: TEvent) {
         match ev {
             TEvent::AuthStep(AuthStep::Ready) => {
+                log::info!("telegram: authenticated — loading dialogs");
                 reduce(&mut *self.state.write().unwrap(), AppEvent::Auth(AuthEvent::Success));
                 let _ = self.telegram_cmd.send(TCommand::LoadDialogs);
             }
             TEvent::AuthStep(_) => {}
             TEvent::CodeRequested => {
+                log::info!("telegram: login code requested");
                 reduce(
                     &mut *self.state.write().unwrap(),
                     AppEvent::Auth(AuthEvent::PhoneRequested { phone: String::new() }),
                 );
             }
             TEvent::PasswordRequired { hint } => {
+                log::info!("telegram: 2FA password required");
                 reduce(
                     &mut *self.state.write().unwrap(),
                     AppEvent::Auth(AuthEvent::CodeEntered { code: String::new() }),
@@ -573,13 +585,17 @@ impl AppController {
                 }
             }
             TEvent::AuthFailed(msg) => {
+                log::warn!("telegram: auth failed: {msg}");
                 reduce(
                     &mut *self.state.write().unwrap(),
                     AppEvent::Auth(AuthEvent::Failure(msg.clone())),
                 );
                 self.toast.show(&msg);
             }
-            TEvent::Dialogs(dialogs) => self.populate_group_picker(dialogs),
+            TEvent::Dialogs(dialogs) => {
+                log::info!("telegram: loaded {} dialogs", dialogs.len());
+                self.populate_group_picker(dialogs);
+            }
             TEvent::Sent { ok, failed } => {
                 self.photos_sent += ok;
                 if self.albums_remaining > 0 {
@@ -737,6 +753,16 @@ impl AppController {
     /// Set stack visibility + login step + usage indicator + footer + nav from state.
     fn refresh_screens(&mut self) {
         let st = self.state.read().unwrap();
+        let target = match &st.telegram.status {
+            AuthStatus::Authenticated => {
+                if st.active_photo.is_some() { "editor" } else { "main" }
+            }
+            _ => "login",
+        };
+        // Log only on an actual screen change (this runs every 50 ms poll).
+        if self.stack.visible_child_name().as_deref() != Some(target) {
+            log::info!("screen: {target}");
+        }
         match &st.telegram.status {
             AuthStatus::Authenticated => {
                 if st.active_photo.is_some() {
@@ -962,6 +988,8 @@ impl AppController {
             }
             _ => SourceType::Jpeg,
         };
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+        log::info!("photo added: id={id} {name} ({source_type:?})");
         let photo = PhotoState {
             id,
             path: path.clone(),
@@ -1192,6 +1220,7 @@ impl AppController {
             self.toast.show("No exportable photos selected");
             return;
         }
+        log::info!("send: exporting {} selected photos → {}", jobs.len(), peer.title);
 
         // Reset the footer bookkeeping for the new batch.
         self.send_jobs = jobs
@@ -1264,6 +1293,10 @@ impl AppController {
     /// remove the actually-sent photos from the grid, and re-enable the footer.
     fn finish_send(&mut self, result: Result<(), String>, worker_failed: Vec<PathBuf>) {
         let ok = self.photos_sent;
+        match &result {
+            Ok(()) => log::info!("send: uploaded {ok} photos"),
+            Err(e) => log::error!("send failed: {e} (uploaded {ok})"),
+        }
         if let Some(t0) = self.send_started_at.take() {
             log::info!(
                 "[timing] send batch ok={} upload_total {:.2}s",
