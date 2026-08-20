@@ -1,5 +1,4 @@
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
 use std::thread;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
