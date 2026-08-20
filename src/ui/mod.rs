@@ -48,5 +48,19 @@ fn build_window(app: &adw::Application, state: Arc<RwLock<AppState>>) {
         glib::ControlFlow::Break
     });
 
+    // Login screen. `on_event` is a placeholder until Task 21 dispatches AppEvent
+    // through reduce() to the real Telegram channel.
+    let st = Arc::clone(&state);
+    let on_event = Box::new(move |_ev: crate::state::AppEvent| {
+        let _guard = st.write().unwrap();
+        // TODO(Task 21): dispatch AppEvent to reduce + the Telegram channel.
+    }) as Box<dyn Fn(crate::state::AppEvent) + Send + 'static>;
+
+    let login = crate::ui::login::LoginScreen::new(Arc::clone(&state), on_event);
+    stack.add_named(&login.root, Some("login"));
+    // The `login` struct handle drops here; the widget tree (stack → root → children)
+    // keeps the visible UI alive. Task 21 must hold the screen handles to switch
+    // steps from AuthStatus (set_data needs Send + 'static, so Rc<RefCell> won't fit).
+
     window.present();
 }
