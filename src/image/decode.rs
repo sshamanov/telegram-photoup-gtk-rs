@@ -22,7 +22,7 @@ pub fn decode_jpeg(data: &[u8]) -> Result<(Size, Vec<u8>)> {
 /// Mirrors photoup `decodeRaw` options exactly. `half_size` keeps interactive
 /// decodes small; exports pass `false` and get full resolution.
 pub fn decode_raw(data: &[u8], opts: &RawDecodeOpts) -> Result<DecodedRaw> {
-    let raw = Raw::new()?;
+    let mut raw = Raw::new()?;
     {
         let p = raw.params();
         // A custom WB (user_mul) overrides camera WB and is applied pre-matrix.
@@ -64,7 +64,10 @@ mod raw_tests {
             if let Ok(rd) = std::fs::read_dir(d) {
                 for e in rd.flatten() {
                     let p = e.path();
-                    if matches!(p.extension().and_then(|s| s.to_str()), Some("NEF") | Some("nef") | Some("CR2") | Some("cr2")) {
+                    if matches!(
+                        p.extension().and_then(|s| s.to_str()),
+                        Some("NEF") | Some("nef") | Some("CR2") | Some("cr2")
+                    ) {
                         return Some(p);
                     }
                 }
@@ -80,10 +83,26 @@ mod raw_tests {
             return;
         };
         let data = std::fs::read(&path).expect("read sample");
-        let decoded = decode_raw(&data, &RawDecodeOpts { full_size: false, user_mul: None }).expect("decode raw");
+        let decoded = decode_raw(
+            &data,
+            &RawDecodeOpts {
+                full_size: false,
+                user_mul: None,
+            },
+        )
+        .expect("decode raw");
         assert!(decoded.width > 0 && decoded.height > 0);
         assert_eq!(decoded.r.len(), (decoded.width * decoded.height) as usize);
-        eprintln!("decoded {}x{} from {}", decoded.width, decoded.height, path.display());
+        assert!(decoded.r.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
+        assert!(decoded.g.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
+        assert!(decoded.b.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
+        assert!(decoded.cam_mul.is_some() && decoded.cam_matrix.is_some());
+        eprintln!(
+            "decoded {}x{} from {}",
+            decoded.width,
+            decoded.height,
+            path.display()
+        );
     }
 }
 
