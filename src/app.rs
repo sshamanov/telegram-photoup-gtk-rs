@@ -100,6 +100,13 @@ pub struct AppController {
     send_peer: Option<DialogInfo>,
     pending_exports: HashMap<u64, Vec<u8>>,
 
+    // Temp export files handed to the telegram worker for the in-flight send;
+    // removed best-effort once the send finishes or fails (Task 23).
+    send_temp_paths: Vec<PathBuf>,
+    // Pending 2s re-enable of the Send button after a failed send (Task 23);
+    // cancelled on success so it can't fight the immediate re-enable.
+    send_backoff: Option<glib::SourceId>,
+
     // Debounced preview re-render bookkeeping.
     render_debounce: Option<glib::SourceId>,
     render_gen: u64,
@@ -191,6 +198,8 @@ impl AppController {
             send_failed: Vec::new(),
             send_peer: None,
             pending_exports: HashMap::new(),
+            send_temp_paths: Vec::new(),
+            send_backoff: None,
             render_debounce: None,
             render_gen: 0,
             ctl: None,
@@ -335,6 +344,10 @@ impl AppController {
                     &mut *self.state.write().unwrap(),
                     AppEvent::Usage(UsageStats { sent, ..Default::default() }),
                 );
+                // The send is over: the temp files are no longer needed, and the
+                // Send button comes back immediately (cancelling any backoff timer).
+                self.cleanup_send_temp_files();
+                self.send_reenable();
                 if failed.is_empty() {
                     self.toast.show(&format!("Sent {ok} photos"));
                 } else {
@@ -343,7 +356,8 @@ impl AppController {
             }
             TEvent::Error(msg) => {
                 // If the worker errored mid-send (connect lost, upload failed), reset
-                // `sending` so the Send button is usable again. Harmless otherwise.
+                // `sending` so the Send button is usable again, park it briefly (2s
+                // backoff), and drop the temp files. Harmless otherwise.
                 let was_sending = {
                     let st = self.state.read().unwrap();
                     st.sending
@@ -353,7 +367,9 @@ impl AppController {
                         &mut *self.state.write().unwrap(),
                         AppEvent::SendFinished(Err(msg.clone())),
                     );
+                    self.send_failed_backoff();
                 }
+                self.cleanup_send_temp_files();
                 self.toast.show(&msg);
             }
         }
@@ -377,6 +393,9 @@ impl AppController {
                         size.0 as i32,
                         size.1 as i32,
                     ));
+                    // A successful render clears any prior error badge so a re-render
+                    // can recover a previously-failed photo.
+                    row.set_error(false);
                 }
             }
             UiEvent::PreviewReady { id, rgba, size, auto_ev, histogram, cam_mul, preview_gen } => {
@@ -413,6 +432,8 @@ impl AppController {
                         size.0 as i32,
                         size.1 as i32,
                     ));
+                    // Same as ThumbReady: a successful render clears the error badge.
+                    row.set_error(false);
                 }
             }
             UiEvent::ExportReady { id, jpeg, .. } => {
@@ -425,6 +446,11 @@ impl AppController {
                     AppEvent::PhotoFailed { id, msg: msg.clone() },
                 );
                 self.cam_mul.remove(&id);
+                // Mark the grid cell with the error badge (red outline + disabled
+                // checkbox). A later successful ThumbReady/PreviewReady clears it.
+                if let Some(row) = self.row_map.get(&id) {
+                    row.set_error(true);
+                }
                 // If this photo was part of an in-flight send, account for the
                 // failure so the send can proceed with the remaining photos.
                 if self.send_pending.contains(&id) && !self.send_failed.contains(&id) {
@@ -759,15 +785,55 @@ impl AppController {
                 &mut *self.state.write().unwrap(),
                 AppEvent::SendFinished(Err("no export written".into())),
             );
+            self.send_failed_backoff();
             self.toast.show("Send failed: no photo was exported");
             return;
         }
+        // Remember the temp files so the worker's send can be followed up with a
+        // best-effort cleanup once it finishes or fails (Task 23).
+        self.send_temp_paths = paths.clone();
         let _ = self.telegram_cmd.send(TCommand::SendAlbum {
             peer_id: peer.id,
             access_hash: peer.access_hash,
             paths,
             caption: None,
         });
+    }
+
+    /// Remove the temp export files for the in-flight send (best-effort, ignore
+    /// errors). Called when the send finishes or fails.
+    fn cleanup_send_temp_files(&mut self) {
+        for path in std::mem::take(&mut self.send_temp_paths) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// A send failed: park the Send button for 2s so the user can't hammer a
+    /// broken connection, then re-enable it (Task 23).
+    fn send_failed_backoff(&mut self) {
+        self.main_screen.send_button.set_sensitive(false);
+        if let Some(src) = self.send_backoff.take() {
+            src.remove();
+        }
+        let Some(w) = self.ctl.as_ref().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        let src = glib::timeout_add_local_once(
+            std::time::Duration::from_secs(2),
+            move || {
+                w.borrow_mut().main_screen.send_button.set_sensitive(true);
+            },
+        );
+        self.send_backoff = Some(src);
+    }
+
+    /// A send succeeded: re-enable the Send button right away and cancel any
+    /// pending backoff timer so it can't re-enable at a bad time (Task 23).
+    fn send_reenable(&mut self) {
+        self.main_screen.send_button.set_sensitive(true);
+        if let Some(src) = self.send_backoff.take() {
+            src.remove();
+        }
     }
 
     // ---- Helpers ----------------------------------------------------------
