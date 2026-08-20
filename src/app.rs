@@ -20,7 +20,7 @@ use crate::image::math::fit_within;
 use crate::image::pool::ImagePool;
 use crate::image::process::{compute_histogram, export_dimensions, Base, JpegBase, RawBase};
 use crate::image::srgb::export_wb_mul;
-use crate::image::types::{Adjustments, Size, SourceType};
+use crate::image::types::{Adjustments, ExposureMode, Size, SourceType};
 use crate::state::{
     reduce, AppEvent, AppState, AuthEvent, AuthStatus, PhotoState, PhotoStatus, UsageStats,
 };
@@ -44,6 +44,7 @@ pub enum UiEvent {
         id: u64,
         rgba: Vec<u8>,
         size: (u32, u32),
+        full: (u32, u32),
         auto_ev: f32,
         histogram: Vec<u32>,
         cam_mul: Option<[f32; 4]>,
@@ -52,6 +53,7 @@ pub enum UiEvent {
         id: u64,
         rgba: Vec<u8>,
         size: (u32, u32),
+        full: (u32, u32),
         auto_ev: f32,
         histogram: Vec<u32>,
         cam_mul: Option<[f32; 4]>,
@@ -104,6 +106,13 @@ pub struct AppController {
     // removed best-effort once the send finishes or fails (Task 23).
     send_temp_paths: Vec<PathBuf>,
     send_started_at: Option<std::time::Instant>,
+    // Send-footer bookkeeping: export order+names for "Preparing {i}/{n}", the
+    // count of completed exports, album-chunk progress, and photos sent so far.
+    send_jobs: Vec<(u64, String)>,
+    send_jobs_done: usize,
+    albums_remaining: usize,
+    batch_total: usize,
+    photos_sent: usize,
     // Pending 2s re-enable of the Send button after a failed send (Task 23);
     // cancelled on success so it can't fight the immediate re-enable.
     send_backoff: Option<glib::SourceId>,
@@ -201,6 +210,11 @@ impl AppController {
             pending_exports: HashMap::new(),
             send_temp_paths: Vec::new(),
             send_started_at: None,
+            send_jobs: Vec::new(),
+            send_jobs_done: 0,
+            albums_remaining: 0,
+            batch_total: 0,
+            photos_sent: 0,
             send_backoff: None,
             render_debounce: None,
             render_gen: 0,
@@ -237,11 +251,21 @@ impl AppController {
             });
         }
 
-        // Load / Send buttons.
-        let load_ctl = Rc::clone(&ctl);
+        // Upload zone (opens the file picker) / Reset / Logout / Send buttons.
+        let upload_ctl = Rc::clone(&ctl);
         self.main_screen
-            .load_button
-            .connect_clicked(move |_| load_ctl.borrow_mut().on_load());
+            .upload_zone
+            .connect_clicked(move |_| upload_ctl.borrow_mut().on_load());
+
+        let reset_ctl = Rc::clone(&ctl);
+        self.main_screen
+            .reset_button
+            .connect_clicked(move |_| reset_ctl.borrow_mut().on_reset());
+
+        let logout_ctl = Rc::clone(&ctl);
+        self.main_screen
+            .logout_button
+            .connect_clicked(move |_| logout_ctl.borrow_mut().on_logout());
 
         let send_ctl = Rc::clone(&ctl);
         self.main_screen
@@ -306,7 +330,26 @@ impl AppController {
             AppEvent::Auth(AuthEvent::PasswordEntered { password }) => {
                 let _ = self.telegram_cmd.send(TCommand::SubmitPassword { password: password.clone() });
             }
-            AppEvent::PhotoEdit { id, .. } => self.schedule_preview(*id),
+            AppEvent::PhotoEdit { id, adjustments } => {
+                self.schedule_preview(*id);
+                // Keep the grid's EV badge in sync (auto → autoEV, else manual EV).
+                if let Some(row) = self.row_map.get(id) {
+                    let ev = match adjustments.exposure_mode {
+                        ExposureMode::Manual => adjustments.exposure_ev,
+                        _ => {
+                            let st = self.state.read().unwrap();
+                            st.photos
+                                .iter()
+                                .find(|p| p.id == *id)
+                                .map(|p| p.auto_ev)
+                                .unwrap_or(0.0)
+                        }
+                    };
+                    row.set_ev(ev);
+                }
+            }
+            AppEvent::Nav { delta } => return self.handle_nav(*delta),
+            AppEvent::RejectActive => return self.handle_reject(),
             AppEvent::ActivePhoto { index: None } => {
                 // Deselect the grid row so clicking the same photo again re-opens
                 // the editor (SingleSelection won't re-emit if already selected).
@@ -361,64 +404,42 @@ impl AppController {
             }
             TEvent::Dialogs(dialogs) => self.populate_group_picker(dialogs),
             TEvent::Sent { ok, failed } => {
-                if let Some(t0) = self.send_started_at.take() {
-                    log::info!(
-                        "[timing] send album ok={ok} failed={} upload_total {:.2}s",
-                        failed.len(),
-                        t0.elapsed().as_secs_f64()
-                    );
+                self.photos_sent += ok;
+                if self.albums_remaining > 0 {
+                    self.albums_remaining -= 1;
                 }
-                reduce(
-                    &mut *self.state.write().unwrap(),
-                    AppEvent::SendFinished(Ok(())),
-                );
-                let sent = {
-                    let st = self.state.read().unwrap();
-                    st.usage.sent + ok
-                };
-                reduce(
-                    &mut *self.state.write().unwrap(),
-                    AppEvent::Usage(UsageStats { sent, ..Default::default() }),
-                );
-                // The send is over: the temp files are no longer needed, and the
-                // Send button comes back immediately (cancelling any backoff timer).
-                self.cleanup_send_temp_files();
-                self.send_reenable();
-                if failed.is_empty() {
-                    self.toast.show(&format!("Sent {ok} photos"));
-                } else {
-                    self.toast.show(&format!("Sent {ok} photos, {} failed", failed.len()));
+                if self.albums_remaining > 0 {
+                    return; // more album chunks still in flight
                 }
+                self.finish_send(Ok(()), failed);
             }
             TEvent::Error(msg) => {
-                // If the worker errored mid-send (connect lost, upload failed), reset
-                // `sending` so the Send button is usable again, park it briefly (2s
-                // backoff), and drop the temp files. Harmless otherwise.
+                // If the worker errored mid-send (connect lost, upload failed),
+                // finalize the batch as a failure — sent photos are removed, the
+                // rest stay with their edits. Outside a send, just surface it.
                 let was_sending = {
                     let st = self.state.read().unwrap();
                     st.sending
                 };
                 if was_sending {
-                    reduce(
-                        &mut *self.state.write().unwrap(),
-                        AppEvent::SendFinished(Err(msg.clone())),
-                    );
-                    self.send_failed_backoff();
+                    self.finish_send(Err(msg.clone()), Vec::new());
+                } else {
+                    self.cleanup_send_temp_files();
+                    self.toast.show(&msg);
                 }
-                self.cleanup_send_temp_files();
-                self.toast.show(&msg);
             }
         }
     }
 
     fn handle_ui_event(&mut self, ev: UiEvent) {
         match ev {
-            UiEvent::ThumbReady { id, rgba, size, auto_ev, histogram, cam_mul } => {
+            UiEvent::ThumbReady { id, rgba, size, full, auto_ev, histogram, cam_mul } => {
                 self.cam_mul.insert(id, cam_mul);
                 let e = AppEvent::PhotoThumbReady {
                     id,
                     rgba: rgba.clone(),
                     size,
+                    full,
                     auto_ev,
                     histogram: histogram.clone(),
                 };
@@ -430,11 +451,14 @@ impl AppController {
                         size.1 as i32,
                     ));
                     // A successful render clears any prior error badge so a re-render
-                    // can recover a previously-failed photo.
+                    // can recover a previously-failed photo. The EV badge turns on
+                    // when the thumb is ready and |autoEV| > 0.05 (photoup).
                     row.set_error(false);
+                    row.set_ev(auto_ev);
+                    row.set_ready(true);
                 }
             }
-            UiEvent::PreviewReady { id, rgba, size, auto_ev, histogram, cam_mul, preview_gen } => {
+            UiEvent::PreviewReady { id, rgba, size, full, auto_ev, histogram, cam_mul, preview_gen } => {
                 if preview_gen != self.render_gen {
                     return; // superseded by a newer edit — drop the stale render
                 }
@@ -443,6 +467,7 @@ impl AppController {
                     id,
                     rgba: rgba.clone(),
                     size,
+                    full,
                     auto_ev,
                     histogram: histogram.clone(),
                 };
@@ -468,11 +493,15 @@ impl AppController {
                         size.0 as i32,
                         size.1 as i32,
                     ));
-                    // Same as ThumbReady: a successful render clears the error badge.
+                    // Same as ThumbReady: a successful render clears the error badge
+                    // and refreshes the EV badge with the re-rendered autoEV.
                     row.set_error(false);
+                    row.set_ev(auto_ev);
+                    row.set_ready(true);
                 }
             }
             UiEvent::ExportReady { id, jpeg, .. } => {
+                self.note_export_done(id);
                 self.pending_exports.insert(id, jpeg);
                 self.maybe_send();
             }
@@ -491,6 +520,7 @@ impl AppController {
                 // failure so the send can proceed with the remaining photos.
                 if self.send_pending.contains(&id) && !self.send_failed.contains(&id) {
                     self.send_failed.push(id);
+                    self.note_export_done(id);
                     self.maybe_send();
                 }
                 self.toast.show(&format!("Photo {id} failed: {msg}"));
@@ -498,7 +528,7 @@ impl AppController {
         }
     }
 
-    /// Set stack visibility + login step + usage label from state.
+    /// Set stack visibility + login step + usage indicator + footer + nav from state.
     fn refresh_screens(&mut self) {
         let st = self.state.read().unwrap();
         match &st.telegram.status {
@@ -514,32 +544,88 @@ impl AppController {
                 self.stack.set_visible_child_name("login");
             }
         }
+        let photos_len = st.photos.len();
+        let selected_ready = st
+            .photos
+            .iter()
+            .filter(|p| p.selected && matches!(p.status, PhotoStatus::Ready))
+            .count();
+        let sending = st.sending;
         drop(st);
-        self.update_usage_label();
+        self.update_usage_indicator();
+        self.main_screen.reset_button.set_sensitive(photos_len > 0);
+        self.update_send_footer(selected_ready, sending);
+        self.update_editor_nav();
     }
 
-    fn update_usage_label(&mut self) {
-        let st = self.state.read().unwrap();
-        // "queued" here means a job is submitted but its status hasn't been flipped
-        // to Processing yet (there's no job-started event), so count it as in-flight
-        // work together with Processing/Exporting — otherwise a batch of large photos
-        // looks stuck at "queued 17 · processing 0" while their thumbnails render.
-        let mut queued = 0usize;
-        let mut processing = 0usize;
-        let mut ready = 0usize;
-        for p in &st.photos {
-            match p.status {
-                PhotoStatus::Queued => processing += 1,
-                PhotoStatus::Processing | PhotoStatus::Exporting => processing += 1,
-                PhotoStatus::Ready => ready += 1,
-                PhotoStatus::Error(_) => {}
-            }
+    /// photoup `UsageIndicator`: a "● Processing {name} ({n} queued)" line shown
+    /// only while photos are being decoded/processed.
+    fn update_usage_indicator(&mut self) {
+        let pending: Vec<String> = {
+            let st = self.state.read().unwrap();
+            st.photos
+                .iter()
+                .filter(|p| matches!(p.status, PhotoStatus::Queued | PhotoStatus::Processing))
+                .map(|p| crate::ui::util::file_name(&p.path))
+                .collect()
+        };
+        if pending.is_empty() {
+            self.main_screen.usage_label.set_text("");
+            self.main_screen.usage_label.set_visible(false);
+        } else {
+            let extra = if pending.len() > 1 {
+                format!(" ({} queued)", pending.len() - 1)
+            } else {
+                String::new()
+            };
+            self.main_screen
+                .usage_label
+                .set_text(&format!("● Processing {}{extra}", pending[0]));
+            self.main_screen.usage_label.set_visible(true);
         }
-        let sent = st.usage.sent;
-        drop(st);
-        self.main_screen.usage_label.set_text(&format!(
-            "working {processing} · ready {ready} · sent {sent}"
-        ));
+    }
+
+    /// photoup footer: "Send {n} selected" → "Preparing {i}/{n} {name}" → a
+    /// progress bar + "Sending {p}%". The bar only shows during the transfer phase.
+    fn update_send_footer(&mut self, selected_ready: usize, sending: bool) {
+        let send = &self.main_screen.send_button;
+        let bar = &self.main_screen.send_progress;
+        if sending {
+            if self.send_jobs_done < self.send_jobs.len() {
+                let done = self.send_jobs_done;
+                let total = self.send_jobs.len();
+                let name = self
+                    .send_jobs
+                    .get(done)
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_default();
+                send.set_label(&format!("Preparing {done}/{total} · {name}"));
+                send.set_sensitive(false);
+                bar.set_visible(false);
+            } else {
+                let frac = if self.batch_total > 0 {
+                    (self.photos_sent as f64 / self.batch_total as f64).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                send.set_label(&format!("Sending {:.0}%", frac * 100.0));
+                send.set_sensitive(false);
+                bar.set_visible(true);
+                bar.set_fraction(frac);
+            }
+        } else {
+            let backoff = self.send_backoff.is_some();
+            send.set_label(&format!("Send {selected_ready} selected"));
+            send.set_sensitive(selected_ready > 0 && !backoff);
+            bar.set_visible(false);
+        }
+    }
+
+    fn update_editor_nav(&mut self) {
+        let st = self.state.read().unwrap();
+        let has_prev = st.active_photo.map_or(false, |i| i > 0);
+        let has_next = st.active_photo.map_or(false, |i| i + 1 < st.photos.len());
+        self.editor.set_nav(has_prev, has_next);
     }
 
     fn populate_group_picker(&mut self, dialogs: Vec<DialogInfo>) {
@@ -616,6 +702,7 @@ impl AppController {
             source_type,
             adjustments: Adjustments::default(),
             auto_ev: 0.0,
+            full_size: None,
             thumb: None,
             thumb_size: None,
             histogram: None,
@@ -624,6 +711,10 @@ impl AppController {
         };
         reduce(&mut *self.state.write().unwrap(), AppEvent::PhotosAdded(vec![photo]));
         let row = PhotoRow::new(id);
+        row.set_name(crate::ui::util::file_name(&path));
+        row.set_is_raw(source_type == SourceType::Raw);
+        row.set_ev(0.0);
+        row.set_ready(false);
         self.main_screen.grid_store.append(&row);
         self.row_map.insert(id, row);
         self.submit_decode_thumb(id, source_type, path);
@@ -641,10 +732,11 @@ impl AppController {
             }))
             .unwrap_or_else(|_| Err("thumbnail job panicked".to_string()));
             let _ = tx.send(match result {
-                Ok((rgba, size, auto_ev, hist, cam)) => UiEvent::ThumbReady {
+                Ok((rgba, size, full, auto_ev, hist, cam)) => UiEvent::ThumbReady {
                     id,
                     rgba,
                     size,
+                    full,
                     auto_ev,
                     histogram: hist,
                     cam_mul: cam,
@@ -697,10 +789,11 @@ impl AppController {
             }))
             .unwrap_or_else(|_| Err("preview job panicked".to_string()));
             let _ = tx.send(match result {
-                Ok((rgba, size, auto_ev, hist, cam)) => UiEvent::PreviewReady {
+                Ok((rgba, size, full, auto_ev, hist, cam)) => UiEvent::PreviewReady {
                     id,
                     rgba,
                     size,
+                    full,
                     auto_ev,
                     histogram: hist,
                     cam_mul: cam,
@@ -743,7 +836,11 @@ impl AppController {
             (
                 st.telegram.status == AuthStatus::Authenticated,
                 st.sending,
-                st.photos.iter().filter(|p| p.selected).map(|p| p.id).collect::<Vec<_>>(),
+                st.photos
+                    .iter()
+                    .filter(|p| p.selected && matches!(p.status, PhotoStatus::Ready))
+                    .map(|p| p.id)
+                    .collect::<Vec<_>>(),
             )
         };
         if !auth_ok {
@@ -754,7 +851,7 @@ impl AppController {
             return;
         }
         if selected.is_empty() {
-            self.toast.show("Select at least one photo to send");
+            self.toast.show("No ready photos selected");
             return;
         }
         let idx = self.main_screen.group_dropdown.selected() as usize;
@@ -770,7 +867,7 @@ impl AppController {
             let st = self.state.read().unwrap();
             st.photos
                 .iter()
-                .filter(|p| p.selected && !matches!(p.status, PhotoStatus::Error(_)))
+                .filter(|p| p.selected && matches!(p.status, PhotoStatus::Ready))
                 .map(|p| {
                     (
                         p.id,
@@ -786,6 +883,16 @@ impl AppController {
             self.toast.show("No exportable photos selected");
             return;
         }
+
+        // Reset the footer bookkeeping for the new batch.
+        self.send_jobs = jobs
+            .iter()
+            .map(|(id, .., path)| (*id, crate::ui::util::file_name(path)))
+            .collect();
+        self.send_jobs_done = 0;
+        self.batch_total = jobs.len();
+        self.photos_sent = 0;
+        self.albums_remaining = 0;
 
         reduce(&mut *self.state.write().unwrap(), AppEvent::SendStarted);
         self.send_pending = jobs.iter().map(|(id, ..)| *id).collect();
@@ -823,24 +930,98 @@ impl AppController {
         }
         self.pending_exports.clear();
         if paths.is_empty() {
-            reduce(
-                &mut *self.state.write().unwrap(),
-                AppEvent::SendFinished(Err("no export written".into())),
-            );
-            self.send_failed_backoff();
-            self.toast.show("Send failed: no photo was exported");
+            self.finish_send(Err("no export written".into()), Vec::new());
             return;
         }
         // Remember the temp files so the worker's send can be followed up with a
         // best-effort cleanup once it finishes or fails (Task 23).
         self.send_temp_paths = paths.clone();
         self.send_started_at = Some(std::time::Instant::now());
-        let _ = self.telegram_cmd.send(TCommand::SendAlbum {
-            peer_id: peer.id,
-            access_hash: peer.access_hash,
-            paths,
-            caption: None,
-        });
+        // Albums are chunked to ≤10 photos (Telegram's MULTI_MEDIA_TOO_LONG limit).
+        // The worker processes the chunks in order, emitting one Sent per album.
+        let chunks: Vec<Vec<PathBuf>> = paths.chunks(10).map(|c| c.to_vec()).collect();
+        self.albums_remaining = chunks.len();
+        for chunk in chunks {
+            let _ = self.telegram_cmd.send(TCommand::SendAlbum {
+                peer_id: peer.id,
+                access_hash: peer.access_hash,
+                paths: chunk,
+                caption: None,
+            });
+        }
+    }
+
+    /// A send batch is fully done (success or failure): reset state, clean up,
+    /// remove the actually-sent photos from the grid, and re-enable the footer.
+    fn finish_send(&mut self, result: Result<(), String>, worker_failed: Vec<PathBuf>) {
+        let ok = self.photos_sent;
+        if let Some(t0) = self.send_started_at.take() {
+            log::info!(
+                "[timing] send batch ok={} upload_total {:.2}s",
+                ok,
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        reduce(
+            &mut *self.state.write().unwrap(),
+            AppEvent::SendFinished(result.clone()),
+        );
+        let sent = {
+            let st = self.state.read().unwrap();
+            st.usage.sent + self.photos_sent
+        };
+        reduce(
+            &mut *self.state.write().unwrap(),
+            AppEvent::Usage(UsageStats { sent, ..Default::default() }),
+        );
+        // The send is over: the temp files are no longer needed.
+        self.cleanup_send_temp_files();
+
+        // Remove only the photos that were actually sent (photoup keeps the rest
+        // with their edits); worker-level failures stay.
+        let failed_ids: Vec<u64> = {
+            let st = self.state.read().unwrap();
+            st.photos
+                .iter()
+                .filter(|p| worker_failed.contains(&p.path))
+                .map(|p| p.id)
+                .collect()
+        };
+        let sent_ids: Vec<u64> = self
+            .send_jobs
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| !failed_ids.contains(id))
+            .collect();
+        self.remove_photos_from_ui(sent_ids);
+
+        // Reset the batch bookkeeping.
+        self.send_jobs.clear();
+        self.send_jobs_done = 0;
+        self.albums_remaining = 0;
+        self.batch_total = 0;
+        self.photos_sent = 0;
+        self.send_pending.clear();
+        self.send_failed.clear();
+        self.pending_exports.clear();
+
+        if result.is_ok() {
+            self.send_reenable();
+            self.toast.show(&format!("Sent {ok} photos"));
+        } else {
+            self.send_failed_backoff();
+            self.toast.show(&format!("Send failed: {}", result.unwrap_err()));
+        }
+        self.refresh_screens();
+    }
+
+    /// Count a finished export job toward the "Preparing {i}/{n}" footer label.
+    fn note_export_done(&mut self, id: u64) {
+        if self.send_jobs_done < self.send_jobs.len()
+            && self.send_jobs.iter().any(|(jid, _)| *jid == id)
+        {
+            self.send_jobs_done += 1;
+        }
     }
 
     /// Remove the temp export files for the in-flight send (best-effort, ignore
@@ -864,7 +1045,9 @@ impl AppController {
         let src = glib::timeout_add_local_once(
             std::time::Duration::from_secs(2),
             move || {
-                w.borrow_mut().main_screen.send_button.set_sensitive(true);
+                let mut ctl = w.borrow_mut();
+                ctl.send_backoff = None;
+                ctl.main_screen.send_button.set_sensitive(true);
             },
         );
         self.send_backoff = Some(src);
@@ -896,19 +1079,139 @@ impl AppController {
             return;
         };
         let id = row.id();
-        let (index, is_raw, adjustments) = {
+        let index = {
             let st = self.state.read().unwrap();
-            let Some(i) = st.photos.iter().position(|p| p.id == id) else { return };
-            let p = &st.photos[i];
-            (i, p.source_type == SourceType::Raw, p.adjustments)
+            st.photos.iter().position(|p| p.id == id)
         };
+        let Some(index) = index else { return };
         reduce(
             &mut *self.state.write().unwrap(),
             AppEvent::ActivePhoto { index: Some(index) },
         );
-        self.editor.set_photo(id, &adjustments, is_raw);
-        self.schedule_preview(id);
+        self.open_editor_for_active();
         self.refresh_screens();
+    }
+
+    /// Clear the grid's selection (deferred to idle: we may be inside `poll()`'s
+    /// RefMut borrow, and `set_selected` fires `selected_notify` synchronously).
+    fn deselect_grid(&mut self) {
+        if let Some(sel) = self
+            .main_screen
+            .grid
+            .model()
+            .and_then(|m| m.downcast::<gtk4::SingleSelection>().ok())
+        {
+            glib::idle_add_local_once(move || {
+                sel.set_selected(gtk4::INVALID_LIST_POSITION);
+            });
+        }
+    }
+
+    /// Reset → drop all loaded photos (photoup `clearPhotos`).
+    fn on_reset(&mut self) {
+        self.main_screen.grid_store.remove_all();
+        self.row_map.clear();
+        reduce(&mut *self.state.write().unwrap(), AppEvent::PhotosCleared);
+        self.deselect_grid();
+        self.refresh_screens();
+    }
+
+    /// Logout → drop all photos + dialogs and return to the login screen.
+    /// The telegram worker has no logout command, so the session itself stays
+    /// authorized (the next launch will skip login); see the report.
+    fn on_logout(&mut self) {
+        self.main_screen.grid_store.remove_all();
+        self.row_map.clear();
+        self.dialogs.clear();
+        self.main_screen
+            .group_dropdown
+            .set_model(Some(&gtk4::StringList::new(&[])));
+        reduce(&mut *self.state.write().unwrap(), AppEvent::Logout);
+        self.deselect_grid();
+        self.refresh_screens();
+    }
+
+    /// Remove the given photo ids from both the grid store and AppState.
+    fn remove_photos_from_ui(&mut self, ids: Vec<u64>) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut idx = self.main_screen.grid_store.n_items();
+        while idx > 0 {
+            idx -= 1;
+            if let Some(obj) = self.main_screen.grid_store.item(idx) {
+                if let Some(row) = obj.downcast_ref::<PhotoRow>() {
+                    if ids.contains(&row.id()) {
+                        self.row_map.remove(&row.id());
+                        self.main_screen.grid_store.remove(idx);
+                    }
+                }
+            }
+        }
+        reduce(&mut *self.state.write().unwrap(), AppEvent::PhotosRemoved(ids));
+    }
+
+    /// Editor Prev/Next: move the active photo by `delta`, then reload the editor.
+    fn handle_nav(&mut self, delta: i8) {
+        let target = {
+            let st = self.state.read().unwrap();
+            if st.photos.is_empty() {
+                return;
+            }
+            let n = st.photos.len() as i64;
+            let cur = st.active_photo.unwrap_or(0) as i64;
+            (cur + delta as i64).clamp(0, n - 1) as usize
+        };
+        reduce(
+            &mut *self.state.write().unwrap(),
+            AppEvent::ActivePhoto { index: Some(target) },
+        );
+        self.open_editor_for_active();
+        self.refresh_screens();
+    }
+
+    /// Editor Reject: remove the active photo and close the editor (photoup
+    /// `rejectCurrent`).
+    fn handle_reject(&mut self) {
+        let active_id = {
+            let st = self.state.read().unwrap();
+            st.active_photo.and_then(|i| st.photos.get(i)).map(|p| p.id)
+        };
+        if let Some(id) = active_id {
+            self.remove_photos_from_ui(vec![id]);
+            self.deselect_grid();
+        }
+        self.refresh_screens();
+    }
+
+    /// Load the currently-active photo (state.active_photo) into the editor and
+    /// schedule a preview render for it.
+    fn open_editor_for_active(&mut self) {
+        let active = {
+            let st = self.state.read().unwrap();
+            let Some(i) = st.active_photo else { return };
+            let Some(p) = st.photos.get(i) else { return };
+            (
+                p.id,
+                crate::ui::util::file_name(&p.path),
+                p.adjustments,
+                shown_ev(p),
+                p.source_type == SourceType::Raw,
+                p.full_size,
+            )
+        };
+        self.editor
+            .set_photo(active.0, &active.1, &active.2, active.3, active.4, active.5);
+        self.schedule_preview(active.0);
+    }
+}
+
+/// Effective exposure correction for a photo (photoup `shownEV`): autoEV while in
+/// auto/aggressive mode, the manual EV otherwise.
+fn shown_ev(p: &PhotoState) -> f32 {
+    match p.adjustments.exposure_mode {
+        ExposureMode::Manual => p.adjustments.exposure_ev,
+        _ => p.auto_ev,
     }
 }
 
@@ -934,16 +1237,18 @@ fn decode_base(
     }
 }
 
-/// Decode + render a ≤512 thumbnail. Runs on a pool worker.
+/// Decode + render a ≤512 thumbnail. Runs on a pool worker. The returned `full`
+/// is the decoded source size (JPEG: native; RAW: half-resolution decode).
 fn run_thumb_job(
     path: &Path,
     source_type: SourceType,
-) -> Result<(Vec<u8>, (u32, u32), f32, Vec<u32>, Option<[f32; 4]>), String> {
+) -> Result<(Vec<u8>, (u32, u32), (u32, u32), f32, Vec<u32>, Option<[f32; 4]>), String> {
     let t0 = std::time::Instant::now();
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     let t_read = t0.elapsed();
     let (base, cam) = decode_base(&data, source_type, false, None)?;
     let t_decode = t0.elapsed();
+    let full = (base.width(), base.height());
     let (w, h) = fit_within(base.width(), base.height(), 512);
     let r = base.render(None, Size { width: w, height: h }, &Adjustments::default());
     let t_render = t0.elapsed();
@@ -953,7 +1258,7 @@ fn run_thumb_job(
         "[timing] thumb {name} {source_type:?} read {:.3}s decode {:.3}s render {:.3}s total {:.3}s",
         t_read.as_secs_f64(), t_decode.as_secs_f64(), t_render.as_secs_f64(), t_render.as_secs_f64()
     );
-    Ok((r.rgba, (w, h), r.auto_ev, hist, cam))
+    Ok((r.rgba, (w, h), full, r.auto_ev, hist, cam))
 }
 
 /// Decode + render a ≤1024 preview with the photo's current adjustments.
@@ -961,11 +1266,12 @@ fn run_preview_job(
     path: &Path,
     source_type: SourceType,
     adjustments: &Adjustments,
-) -> Result<(Vec<u8>, (u32, u32), f32, Vec<u32>, Option<[f32; 4]>), String> {
+) -> Result<(Vec<u8>, (u32, u32), (u32, u32), f32, Vec<u32>, Option<[f32; 4]>), String> {
     let t0 = std::time::Instant::now();
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     let (base, cam) = decode_base(&data, source_type, false, None)?;
     let t_decode = t0.elapsed();
+    let full = (base.width(), base.height());
     let (w, h) = fit_within(base.width(), base.height(), PREVIEW_EDGE);
     let r = base.render(adjustments.crop.as_ref(), Size { width: w, height: h }, adjustments);
     let t_render = t0.elapsed();
@@ -975,7 +1281,7 @@ fn run_preview_job(
         "[timing] preview {name} {source_type:?} read+decode {:.3}s render {:.3}s total {:.3}s",
         t_decode.as_secs_f64(), t_render.as_secs_f64(), t_render.as_secs_f64()
     );
-    Ok((r.rgba, (w, h), r.auto_ev, hist, cam))
+    Ok((r.rgba, (w, h), full, r.auto_ev, hist, cam))
 }
 
 /// For RAW exports the effective WB is baked into libraw's `user_mul`
@@ -1070,11 +1376,12 @@ mod tests {
     #[test]
     fn thumb_job_renders_small_preview() {
         let path = make_jpeg_file(2048, 1024);
-        let (rgba, size, _ev, hist, cam) = run_thumb_job(&path, SourceType::Jpeg).unwrap();
+        let (rgba, size, full, _ev, hist, cam) = run_thumb_job(&path, SourceType::Jpeg).unwrap();
         assert!(size.0 <= 512 && size.1 <= 512, "size {size:?}");
         assert_eq!(rgba.len(), (size.0 * size.1 * 4) as usize);
         assert_eq!(hist.iter().sum::<u32>(), size.0 * size.1);
         assert_eq!(cam, None);
+        assert_eq!(full, (2048, 1024), "JPEG reports native dims");
     }
 
     #[test]
@@ -1083,9 +1390,11 @@ mod tests {
         let mut adj = Adjustments::default();
         adj.exposure_mode = ExposureMode::Manual;
         adj.exposure_ev = -2.0;
-        let (rgba, size, _ev, _hist, _cam) = run_preview_job(&path, SourceType::Jpeg, &adj).unwrap();
+        let (rgba, size, full, _ev, _hist, _cam) =
+            run_preview_job(&path, SourceType::Jpeg, &adj).unwrap();
         assert!(size.0 <= PREVIEW_EDGE && size.1 <= PREVIEW_EDGE);
         assert_eq!(rgba.len(), (size.0 * size.1 * 4) as usize);
+        assert_eq!(full, (800, 600));
     }
 
     #[test]
