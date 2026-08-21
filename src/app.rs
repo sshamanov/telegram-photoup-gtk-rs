@@ -39,11 +39,6 @@ const FINAL_EDGE: u32 = 1024;
 const EXPORT_EDGE: u32 = 2560;
 /// Debounce window for slider-drag preview re-renders.
 const PREVIEW_DEBOUNCE_MS: u64 = 150;
-/// Keyboard fine-tune steps (match the sliders' steps): Q/W → EV, A/S → warmth,
-/// Z/X → tint. Each keypress nudges the slider by its step.
-const EV_FINE_STEP: f64 = 0.05;
-const WB_FINE_STEP: f64 = 0.05;
-const TINT_FINE_STEP: f64 = 0.01;
 /// Image extensions the upload zone accepts (drag-drop, Ctrl+V paste, and the
 /// file picker filter all funnel through this). photoup's `UploadZone` accepts
 /// `image/*` plus NEF/CR2; we pin the five the picker advertises.
@@ -507,18 +502,18 @@ impl AppController {
             return false; // editor not open
         }
         let (dir, which) = match keyval {
-            Key::q | Key::Q => (-1.0, 0),
-            Key::w | Key::W => (1.0, 0),
-            Key::a | Key::A => (-1.0, 1),
-            Key::s | Key::S => (1.0, 1),
-            Key::z | Key::Z => (-1.0, 2),
-            Key::x | Key::X => (1.0, 2),
+            Key::q | Key::Q => (-1i8, 0),
+            Key::w | Key::W => (1i8, 0),
+            Key::a | Key::A => (-1i8, 1),
+            Key::s | Key::S => (1i8, 1),
+            Key::z | Key::Z => (-1i8, 2),
+            Key::x | Key::X => (1i8, 2),
             _ => return false,
         };
         match which {
-            0 => self.editor.fine_tune_ev(dir * EV_FINE_STEP),
-            1 => self.editor.fine_tune_wb(dir * WB_FINE_STEP),
-            _ => self.editor.fine_tune_tint(dir * TINT_FINE_STEP),
+            0 => self.editor.fine_tune_ev(dir),
+            1 => self.editor.fine_tune_wb(dir),
+            _ => self.editor.fine_tune_tint(dir),
         }
         true
     }

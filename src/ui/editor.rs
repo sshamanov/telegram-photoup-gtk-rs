@@ -33,6 +33,26 @@ fn current_adjustments(state: &AppState, id: u64) -> Adjustments {
         .unwrap_or_default()
 }
 
+/// Keyboard fine-tune stepping with grid snapping. EV/warmth step 0.05: an auto
+/// value like +1.93 snaps to the nearest grid on the first press (+1.90 / +1.95),
+/// then steps by 0.05. Tint always steps 0.01 (its grid is 0.01, so every value is
+/// already on it). Integer hundredths avoid float drift.
+fn fine_step(current: f64, dir: i8, step: f64) -> f64 {
+    let unit = (step * 100.0).round() as i64; // 5 (0.05) or 1 (0.01)
+    let cur = (current * 100.0).round() as i64; // current in hundredths
+    // div_euclid/rem_euclid = floor division + non-negative remainder (Rust's `/`
+    // truncates toward zero, which breaks snapping for negative values).
+    let idx = cur.div_euclid(unit);
+    let rem = cur.rem_euclid(unit);
+    if rem == 0 {
+        ((idx + dir as i64) * unit) as f64 / 100.0
+    } else if dir < 0 {
+        (idx * unit) as f64 / 100.0 // snap down to the grid
+    } else {
+        ((idx + 1) * unit) as f64 / 100.0 // snap up to the grid
+    }
+}
+
 /// "output 2560 × 1709 px" from the full dimensions + active crop.
 fn output_line(full: (u32, u32), crop: Option<NormalizedCrop>) -> String {
     let out = export_dimensions(full.0, full.1, crop.as_ref(), EXPORT_EDGE);
@@ -792,24 +812,24 @@ impl EditorScreen {
         self.preview.set_paintable(texture);
     }
 
-    /// Fine-tune the exposure EV slider by `delta` steps (keyboard Q/W). Moving the
-    /// slider fires its value_changed → PhotoEdit (switches to Manual EV, like
-    /// dragging it by hand).
-    pub fn fine_tune_ev(&self, delta: f64) {
+    /// Fine-tune the exposure EV slider (keyboard Q/W). Moving the slider fires its
+    /// value_changed → PhotoEdit (switches to Manual EV, like dragging it by hand).
+    /// Steps snap to the 0.05 grid: an auto value like +1.93 → +1.90 (Q) / +1.95 (W).
+    pub fn fine_tune_ev(&self, dir: i8) {
         let v = self.exposure_scale.value();
-        self.exposure_scale.set_value(v + delta);
+        self.exposure_scale.set_value(fine_step(v, dir, 0.05));
     }
 
-    /// Fine-tune the warmth (temperature) slider by `delta` (keyboard A/S).
-    pub fn fine_tune_wb(&self, delta: f64) {
+    /// Fine-tune the warmth (temperature) slider (keyboard A/S), 0.05 grid.
+    pub fn fine_tune_wb(&self, dir: i8) {
         let v = self.temp_scale.value();
-        self.temp_scale.set_value(v + delta);
+        self.temp_scale.set_value(fine_step(v, dir, 0.05));
     }
 
-    /// Fine-tune the tint (hue) slider by `delta` (keyboard Z/X).
-    pub fn fine_tune_tint(&self, delta: f64) {
+    /// Fine-tune the tint (hue) slider (keyboard Z/X) — always fine 0.01 steps.
+    pub fn fine_tune_tint(&self, dir: i8) {
         let v = self.hue_scale.value();
-        self.hue_scale.set_value(v + delta);
+        self.hue_scale.set_value(fine_step(v, dir, 0.01));
     }
 
     /// Set the EV indicator ("+0.35 EV"); `{:+.2}` keeps the width fixed so the
@@ -1465,5 +1485,27 @@ mod tests {
             AppEvent::PhotoEdit { id: i, adjustments } if *i == id => Some(*adjustments),
             _ => None,
         })
+    }
+
+    #[test]
+    fn fine_step_snaps_auto_ev_to_grid() {
+        // Auto EV +1.93: first press snaps to the 0.05 grid, not relative −0.05.
+        assert!((fine_step(1.93, -1, 0.05) - 1.90).abs() < 1e-9);
+        assert!((fine_step(1.93, 1, 0.05) - 1.95).abs() < 1e-9);
+        // Once on the grid, step by 0.05.
+        assert!((fine_step(1.90, -1, 0.05) - 1.85).abs() < 1e-9);
+        assert!((fine_step(1.90, 1, 0.05) - 1.95).abs() < 1e-9);
+        // Negative values snap correctly (floor/ceil, not truncate-toward-zero).
+        assert!((fine_step(-1.93, 1, 0.05) - (-1.90)).abs() < 1e-9);
+        assert!((fine_step(-1.93, -1, 0.05) - (-1.95)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fine_step_tint_always_fine() {
+        // Tint grid is 0.01, so every value is on-grid → plain 0.01 steps.
+        assert!((fine_step(0.50, -1, 0.01) - 0.49).abs() < 1e-9);
+        assert!((fine_step(0.50, 1, 0.01) - 0.51).abs() < 1e-9);
+        assert!((fine_step(-0.05, 1, 0.01) - (-0.04)).abs() < 1e-9);
+        assert!((fine_step(-0.05, -1, 0.01) - (-0.06)).abs() < 1e-9);
     }
 }
