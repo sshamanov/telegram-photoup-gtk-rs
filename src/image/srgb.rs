@@ -205,21 +205,24 @@ pub fn wb_from_pick(r: f32, g: f32, b: f32, cam_matrix: Option<[[f32; 3]; 3]>) -
             let gr = gray * s0 / q0.max(1e-6);
             let gg = gray * s1 / q1.max(1e-6);
             let _gb = gray * s2 / q2.max(1e-6);
-            let hue = clamp(-2.0 * gg.max(1e-6).log2(), -2.0, 2.0);
+            // Clamp to the UI slider ranges: warmth ±4, tint ±1. photoup used ±2/±2
+            // but that's not enough for photos with an extreme cast (the pick then
+            // "does nothing useful" while the slider can go further).
+            let hue = clamp(-2.0 * gg.max(1e-6).log2(), -1.0, 1.0);
             let hue_rb = 2.0f32.powf(hue * 0.25);
             let temp_r = gr / hue_rb.max(1e-6);
-            let offset = clamp(2.0 * temp_r.max(1e-6).log2(), -2.0, 2.0);
+            let offset = clamp(2.0 * temp_r.max(1e-6).log2(), -4.0, 4.0);
             return (offset, hue);
         }
     }
     // Grey-world fallback (JPEG / no matrix).
     let gray = (r + g + b) / 3.0;
     let hue_g = gray / g.max(1.0);
-    let hue = clamp(-2.0 * hue_g.log2(), -2.0, 2.0);
+    let hue = clamp(-2.0 * hue_g.log2(), -1.0, 1.0);
     let hue_rb = 2.0f32.powf(hue * 0.25);
     let temp_r = gray / (r.max(1.0) * hue_rb);
     // tempR = 2^(offset*0.5) → offset = 2*log2(tempR)
-    (clamp(2.0 * temp_r.log2(), -2.0, 2.0), hue)
+    (clamp(2.0 * temp_r.log2(), -4.0, 4.0), hue)
 }
 
 /// Auto WB ("happy day" look, port of photoup `autoWb`): grey-world on a neutral
@@ -231,8 +234,8 @@ pub fn auto_wb(r: f32, g: f32, b: f32, cam_matrix: Option<[[f32; 3]; 3]>) -> (f3
     const WARM_BIAS: f32 = 0.15;
     let (offset, hue) = wb_from_pick(r, g, b, cam_matrix);
     (
-        clamp(offset * OFFSET_STRENGTH + WARM_BIAS, -2.0, 2.0),
-        clamp(hue * HUE_STRENGTH, -2.0, 2.0),
+        clamp(offset * OFFSET_STRENGTH + WARM_BIAS, -4.0, 4.0),
+        clamp(hue * HUE_STRENGTH, -1.0, 1.0),
     )
 }
 
@@ -388,12 +391,13 @@ mod tests {
 
     #[test]
     fn wb_from_pick_clamps_to_slider_range() {
-        // Extreme values must stay within the ±2 slider range instead of NaN/inf.
+        // Extreme values must stay within the slider ranges (warmth ±4, tint ±1)
+        // instead of NaN/inf — and wide enough to fix extreme casts.
         let (offset, hue) = wb_from_pick(0.0, 0.0, 255.0, None);
-        assert!(offset.is_finite() && (-2.0..=2.0).contains(&offset), "offset {offset}");
-        assert!(hue.is_finite() && (-2.0..=2.0).contains(&hue), "hue {hue}");
+        assert!(offset.is_finite() && (-4.0..=4.0).contains(&offset), "offset {offset}");
+        assert!(hue.is_finite() && (-1.0..=1.0).contains(&hue), "hue {hue}");
         let (offset, hue) = wb_from_pick(255.0, 255.0, 255.0, Some([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]));
-        assert!(offset.is_finite() && (-2.0..=2.0).contains(&offset), "offset {offset}");
-        assert!(hue.is_finite() && (-2.0..=2.0).contains(&hue), "hue {hue}");
+        assert!(offset.is_finite() && (-4.0..=4.0).contains(&offset), "offset {offset}");
+        assert!(hue.is_finite() && (-1.0..=1.0).contains(&hue), "hue {hue}");
     }
 }
