@@ -15,7 +15,6 @@ use gtk4::{Box as GBox, Button, DrawingArea, Label, Orientation, Picture};
 use crate::image::math::crop_to_pixels;
 use crate::ui::slider::FineSlider;
 use crate::image::process::export_dimensions;
-use crate::image::resize::downscale_rgba;
 use crate::image::srgb::{auto_wb, wb_from_pick};
 use crate::image::types::{Adjustments, ExposureMode, NormalizedCrop};
 use crate::state::{AppEvent, AppState};
@@ -70,37 +69,37 @@ fn cam_matrix3x3(m: Option<[[f32; 4]; 3]>) -> Option<[[f32; 3]; 3]> {
     ])
 }
 
-/// Grey-world reference for auto-WB (photoup `autoWhiteBalance`): downscale the
-/// preview to ≤64×64, average only near-neutral bright pixels, and fall back to
-/// the whole-image mean when too few qualify. Returns the channel means (0..255).
-fn auto_wb_mean(rgba: &[u8], w: u32, h: u32, crop: Option<&NormalizedCrop>) -> Option<(f32, f32, f32)> {
+/// Grey-world reference for auto-WB (photoup `autoWhiteBalance`) over the LINEAR
+/// pre-tone sample: restrict to the crop region, average only near-neutral bright
+/// pixels (linear thresholds — max-min < 0.2, luminance > 0.1), and fall back to
+/// the whole-region mean when too few qualify. Returns the channel means (0..1).
+/// The sample is already downscaled to ≤96px, so no further downscale is needed.
+fn auto_wb_mean_linear(rgb: &[f32], w: u32, h: u32, crop: Option<&NormalizedCrop>) -> Option<(f32, f32, f32)> {
     // Restrict to the crop region when one is set: WB auto must react to what's
     // actually in the frame after cropping, not the out-of-crop area.
-    let (cw, ch, cropped) = match crop {
+    let (_, _, cropped) = match crop {
         Some(c) => {
             let rect = crop_to_pixels(c, w, h);
-            let mut buf = Vec::with_capacity((rect.width * rect.height * 4) as usize);
+            let mut buf = Vec::with_capacity((rect.width * rect.height * 3) as usize);
             for y in 0..rect.height as usize {
-                let src_off = ((rect.y as usize + y) * w as usize + rect.x as usize) * 4;
-                buf.extend_from_slice(&rgba[src_off..src_off + rect.width as usize * 4]);
+                let src_off = ((rect.y as usize + y) * w as usize + rect.x as usize) * 3;
+                buf.extend_from_slice(&rgb[src_off..src_off + rect.width as usize * 3]);
             }
             (rect.width, rect.height, buf)
         }
-        None => (w, h, rgba.to_vec()),
+        None => (w, h, rgb.to_vec()),
     };
-    let (dw, dh) = (cw.min(64), ch.min(64));
-    let down = downscale_rgba(&cropped, cw, ch, dw, dh);
     let mut sr = 0.0f64;
     let mut sg = 0.0f64;
     let mut sb = 0.0f64;
     let mut n = 0usize;
-    for px in down.chunks_exact(4) {
-        let (r, g, b) = (px[0] as f32, px[1] as f32, px[2] as f32);
+    for px in cropped.chunks_exact(3) {
+        let (r, g, b) = (px[0], px[1], px[2]);
         let max = r.max(g).max(b);
         let min = r.min(g).min(b);
         // Near-neutral, reasonably bright → neutral reference. Saturated scene
         // colours (grass, sky, walls) mustn't pull the WB into green/magenta.
-        if max - min < 60.0 && 0.2126 * r + 0.7152 * g + 0.0722 * b > 60.0 {
+        if max - min < 0.2 && 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.1 {
             sr += r as f64;
             sg += g as f64;
             sb += b as f64;
@@ -108,12 +107,12 @@ fn auto_wb_mean(rgba: &[u8], w: u32, h: u32, crop: Option<&NormalizedCrop>) -> O
         }
     }
     if n < 16 {
-        // Too few neutral pixels: use the whole-image mean.
+        // Too few neutral pixels: use the whole-region mean.
         sr = 0.0;
         sg = 0.0;
         sb = 0.0;
         n = 0;
-        for px in down.chunks_exact(4) {
+        for px in cropped.chunks_exact(3) {
             sr += px[0] as f64;
             sg += px[1] as f64;
             sb += px[2] as f64;
@@ -130,10 +129,10 @@ fn auto_wb_mean(rgba: &[u8], w: u32, h: u32, crop: Option<&NormalizedCrop>) -> O
     ))
 }
 
-/// Average a fixed 7×7 area of the preview around pixel (cx, cy) — the GIMP-style
-/// grey-point picker (photoup `pickNeutral`; larger than one pixel so noise can't
-/// skew the WB). Returns the channel means (0..255), or None if the area is empty.
-fn pick_sample(rgba: &[u8], w: u32, h: u32, cx: f64, cy: f64) -> Option<(f32, f32, f32)> {
+/// Average a fixed 7×7 area of the LINEAR sample around pixel (cx, cy) — the
+/// GIMP-style grey-point picker (photoup `pickNeutral`; larger than one pixel so
+/// noise can't skew the WB). Returns the channel means (0..1), or None if empty.
+fn pick_sample_linear(rgb: &[f32], w: u32, h: u32, cx: f64, cy: f64) -> Option<(f32, f32, f32)> {
     const WIN: isize = 7;
     let cxp = cx.floor() as isize;
     let cyp = cy.floor() as isize;
@@ -151,10 +150,10 @@ fn pick_sample(rgba: &[u8], w: u32, h: u32, cx: f64, cy: f64) -> Option<(f32, f3
             if xx >= w as isize {
                 break;
             }
-            let o = ((yy * w as isize + xx) as usize) * 4;
-            sr += rgba[o] as f64;
-            sg += rgba[o + 1] as f64;
-            sb += rgba[o + 2] as f64;
+            let o = ((yy * w as isize + xx) as usize) * 3;
+            sr += rgb[o] as f64;
+            sg += rgb[o + 1] as f64;
+            sb += rgb[o + 2] as f64;
             n += 1;
         }
     }
@@ -505,9 +504,12 @@ pub struct EditorScreen {
     /// The active crop selection, mirrored from the photo's adjustments and
     /// updated live by presets / drags; the overlay draws from this.
     crop: Rc<RefCell<Option<NormalizedCrop>>>,
-    /// The active photo's preview RGBA (≤1024 edge), pushed on every PreviewReady;
-    /// the WB Auto / neutral-picker sample from it.
-    preview_rgba: Rc<RefCell<Option<(Vec<u8>, u32, u32)>>>,
+    /// The active photo's LINEAR (0..1) pre-tone RGB sample (≤96px edge), pushed
+    /// by the controller on decode; the WB Auto / neutral-picker sample from it.
+    /// Sampling the processed preview would distort the R/B ratio (auto-exposure,
+    /// rolloff, camera S-curve, sRGB), understating a strong cast — hence the
+    /// linear pre-tone base sample.
+    wb_sample: Rc<RefCell<Option<(Vec<f32>, u32, u32)>>>,
     /// The active photo's camera→sRGB color matrix (RAW only; `None` for JPEG /
     /// no matrix), pushed by the controller for WB Auto/Pick.
     cam_matrix: Rc<RefCell<Option<[[f32; 4]; 3]>>>,
@@ -750,7 +752,7 @@ impl EditorScreen {
             active_id: Rc::new(Cell::new(None)),
             full_size: Rc::new(Cell::new(None)),
             crop,
-            preview_rgba: Rc::new(RefCell::new(None)),
+            wb_sample: Rc::new(RefCell::new(None)),
             cam_matrix: Rc::new(RefCell::new(None)),
             picking: Rc::new(Cell::new(false)),
             is_raw: Rc::new(Cell::new(false)),
@@ -784,9 +786,9 @@ impl EditorScreen {
         self.current_mode.set(adjustments.exposure_mode);
         self.full_size.set(full_size);
         self.crop.replace(adjustments.crop);
-        // New photo: drop the previous photo's per-photo data (preview pixels for
-        // WB sampling, camera matrix, pick mode).
-        self.preview_rgba.borrow_mut().take();
+        // New photo: drop the previous photo's per-photo data (linear WB sample,
+        // camera matrix, pick mode).
+        self.wb_sample.borrow_mut().take();
         self.cam_matrix.borrow_mut().take();
         self.picking.set(false);
         self.pick_button.remove_css_class("suggested-action");
@@ -838,10 +840,10 @@ impl EditorScreen {
         }
     }
 
-    /// Cache the active photo's rendered preview pixels (≤1024 edge) so WB Auto
-    /// and the neutral-picker can sample them.
-    pub fn set_preview_rgba(&self, rgba: Vec<u8>, w: u32, h: u32) {
-        *self.preview_rgba.borrow_mut() = Some((rgba, w, h));
+    /// Cache the active photo's LINEAR (0..1) pre-tone RGB sample so WB Auto and
+    /// the neutral-picker can measure the true sensor cast.
+    pub fn set_wb_sample(&self, rgba: Vec<f32>, w: u32, h: u32) {
+        *self.wb_sample.borrow_mut() = Some((rgba, w, h));
     }
 
     /// Push the active photo's camera→sRGB color matrix (RAW) for WB Auto/Pick.
@@ -849,11 +851,11 @@ impl EditorScreen {
         self.cam_matrix.replace(cam_matrix);
     }
 
-    /// Drop the per-photo data the editor holds (preview pixels, camera matrix,
+    /// Drop the per-photo data the editor holds (linear WB sample, camera matrix,
     /// pick mode) — called when the editor closes so a later photo can't read a
-    /// stale previous photo's pixels/matrix.
+    /// stale previous photo's sample/matrix.
     pub fn release_photo_data(&self) {
-        self.preview_rgba.borrow_mut().take();
+        self.wb_sample.borrow_mut().take();
         self.cam_matrix.borrow_mut().take();
         self.picking.set(false);
         self.pick_button.remove_css_class("suggested-action");
@@ -1131,7 +1133,7 @@ impl EditorScreen {
         // the crop overlay draws with.
         let click = gtk4::GestureClick::new();
         let picking_click = Rc::clone(&self.picking);
-        let rgba_click = Rc::clone(&self.preview_rgba);
+        let wb_click = Rc::clone(&self.wb_sample);
         let cam_click = Rc::clone(&self.cam_matrix);
         let full_click = Rc::clone(&self.full_size);
         let id_click = Rc::clone(&self.active_id);
@@ -1148,7 +1150,7 @@ impl EditorScreen {
             }
             let Some(id) = id_click.get() else { return };
             let Some(full) = full_click.get() else { return };
-            let Some((data, pw, ph)) = &*rgba_click.borrow() else { return };
+            let Some((data, pw, ph)) = &*wb_click.borrow() else { return };
             let (aw, ah) = (area_click.width() as f64, area_click.height() as f64);
             let Some(p) = project(aw, ah, full) else { return };
             // Normalized position over the displayed (letterboxed) image.
@@ -1159,9 +1161,9 @@ impl EditorScreen {
             }
             let cx = nx * *pw as f64;
             let cy = ny * *ph as f64;
-            let Some((r, g, b)) = pick_sample(data, *pw, *ph, cx, cy) else { return };
+            let Some((r, g, b)) = pick_sample_linear(data, *pw, *ph, cx, cy) else { return };
             let gray = (r + g + b) / 3.0;
-            if gray < 8.0 || gray > 247.0 {
+            if gray < 0.03 || gray > 0.95 {
                 on_click(AppEvent::Toast(
                     "Pick a neutral area (not black or blown out)".to_string(),
                 ));
@@ -1169,7 +1171,10 @@ impl EditorScreen {
             }
             let (offset, hue) =
                 wb_from_pick(r, g, b, cam_matrix3x3(*cam_click.borrow()));
-            apply_wb(id, offset, hue, &state_click, &on_click, &suppress_click, &temp_click, &hue_click, &wb_lab_click);
+            // The tint (hue) is over-reported on strong casts — it jumps to ±1
+            // when the true tint is ~0 — so halve the pick's hue. The slider stays
+            // fine for real tint, and auto keeps its existing 0.3 strength.
+            apply_wb(id, offset, hue * 0.5, &state_click, &on_click, &suppress_click, &temp_click, &hue_click, &wb_lab_click);
         });
         self.crop_area.add_controller(click);
     }
@@ -1261,14 +1266,14 @@ impl EditorScreen {
             o(AppEvent::PhotoEdit { id, adjustments: adj });
         });
 
-        // WB Auto: grey-world over near-neutral bright pixels of the preview,
-        // biased warm ("happy day"). Falls back to the whole-image mean if too few
-        // neutral pixels (photoup `autoWhiteBalance`).
-        let (a, o, st, prgba, cm, s, temp, hue, lab, croprc) = (
+        // WB Auto: grey-world over near-neutral bright pixels of the LINEAR
+        // pre-tone sample, biased warm ("happy day"). Falls back to the
+        // whole-region mean if too few neutral pixels (photoup `autoWhiteBalance`).
+        let (a, o, st, wbs, cm, s, temp, hue, lab, croprc) = (
             Rc::clone(&active_id),
             Arc::clone(&on_event),
             Arc::clone(&state),
-            Rc::clone(&self.preview_rgba),
+            Rc::clone(&self.wb_sample),
             Rc::clone(&self.cam_matrix),
             Rc::clone(&suppress),
             // WB Reset's `let` shadowed + moved `temp`/`hue`, so clone fresh here.
@@ -1279,9 +1284,9 @@ impl EditorScreen {
         );
         self.wb_auto_button.connect_clicked(move |_| {
             let Some(id) = a.get() else { return };
-            let Some((data, pw, ph)) = &*prgba.borrow() else { return };
+            let Some((data, pw, ph)) = &*wbs.borrow() else { return };
             let crop = *croprc.borrow();
-            let Some((r, g, b)) = auto_wb_mean(data, *pw, *ph, crop.as_ref()) else { return };
+            let Some((r, g, b)) = auto_wb_mean_linear(data, *pw, *ph, crop.as_ref()) else { return };
             let (wb_offset, wb_hue) =
                 auto_wb(r, g, b, cam_matrix3x3(*cm.borrow()));
             apply_wb(id, wb_offset, wb_hue, &st, &o, &s, &temp, &hue, &lab);
@@ -1384,13 +1389,12 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    fn rgba_fill(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
-        let mut v = vec![0u8; (w * h * 4) as usize];
-        for px in v.chunks_exact_mut(4) {
+    fn linear_fill(w: u32, h: u32, rgb: [f32; 3]) -> Vec<f32> {
+        let mut v = vec![0f32; (w * h * 3) as usize];
+        for px in v.chunks_exact_mut(3) {
             px[0] = rgb[0];
             px[1] = rgb[1];
             px[2] = rgb[2];
-            px[3] = 255;
         }
         v
     }
@@ -1409,19 +1413,25 @@ mod tests {
 
     #[test]
     fn wb_mean_helpers_sample() {
-        // Neutral gray: all pixels qualify as near-neutral → mean is exactly gray.
-        let gray = rgba_fill(16, 16, [128, 128, 128]);
-        let (r, g, b) = auto_wb_mean(&gray, 16, 16, None).expect("gray sample");
-        assert!((r - 128.0).abs() < 0.5 && (g - 128.0).abs() < 0.5 && (b - 128.0).abs() < 0.5);
+        // Neutral gray (linear): all pixels qualify as near-neutral → mean exactly gray.
+        let gray = linear_fill(16, 16, [0.2159, 0.2159, 0.2159]);
+        let (r, g, b) = auto_wb_mean_linear(&gray, 16, 16, None).expect("gray sample");
+        assert!(
+            (r - 0.2159).abs() < 1e-4 && (g - 0.2159).abs() < 1e-4 && (b - 0.2159).abs() < 1e-4
+        );
 
-        // Saturated warm: max-min = 120 > 60 → no neutral pixels → whole-image mean.
-        let warm = rgba_fill(16, 16, [200, 128, 80]);
-        let (r, g, b) = auto_wb_mean(&warm, 16, 16, None).expect("warm sample");
-        assert!((r - 200.0).abs() < 0.5 && (g - 128.0).abs() < 0.5 && (b - 80.0).abs() < 0.5);
+        // Saturated warm: max-min = 0.498 > 0.2 → no neutral pixels → whole-region mean.
+        let warm = linear_fill(16, 16, [0.578, 0.216, 0.080]);
+        let (r, g, b) = auto_wb_mean_linear(&warm, 16, 16, None).expect("warm sample");
+        assert!(
+            (r - 0.578).abs() < 1e-4 && (g - 0.216).abs() < 1e-4 && (b - 0.080).abs() < 1e-4
+        );
 
         // Pick: 7×7 window around the center of a uniform warm block.
-        let (r, g, b) = pick_sample(&warm, 16, 16, 8.0, 8.0).expect("pick sample");
-        assert!((r - 200.0).abs() < 0.5 && (g - 128.0).abs() < 0.5 && (b - 80.0).abs() < 0.5);
+        let (r, g, b) = pick_sample_linear(&warm, 16, 16, 8.0, 8.0).expect("pick sample");
+        assert!(
+            (r - 0.578).abs() < 1e-4 && (g - 0.216).abs() < 1e-4 && (b - 0.080).abs() < 1e-4
+        );
     }
 
     #[test]
@@ -1443,10 +1453,10 @@ mod tests {
         editor.set_ev(4.0);
         assert_eq!(editor.ev_value.text(), "+4.00 EV");
 
-        // Auto-WB on a neutral gray image → warm bias (0.15), no tint.
+        // Auto-WB on a neutral gray image (linear 0.2159) → warm bias (0.15), no tint.
         let (mut editor, events) = test_editor();
         editor.set_photo(7, "gray.jpg", &Adjustments::default(), 0.0, false, Some((16, 16)));
-        editor.set_preview_rgba(rgba_fill(16, 16, [128, 128, 128]), 16, 16);
+        editor.set_wb_sample(linear_fill(16, 16, [0.2159, 0.2159, 0.2159]), 16, 16);
         editor.wb_auto_button.emit_clicked();
         let adj = find_photo_edit(&events, 7).expect("neutral PhotoEdit");
         assert!((adj.wb_offset - 0.15).abs() < 1e-4, "offset {}", adj.wb_offset);
@@ -1455,22 +1465,23 @@ mod tests {
         // Auto-WB on a warm image → cools it (negative offset, small negative hue).
         let (mut editor, events) = test_editor();
         editor.set_photo(8, "warm.jpg", &Adjustments::default(), 0.0, false, Some((16, 16)));
-        editor.set_preview_rgba(rgba_fill(16, 16, [200, 128, 80]), 16, 16);
+        editor.set_wb_sample(linear_fill(16, 16, [0.578, 0.216, 0.080]), 16, 16);
         editor.wb_auto_button.emit_clicked();
         let adj = find_photo_edit(&events, 8).expect("warm PhotoEdit");
         assert!(adj.wb_offset < -0.3, "offset {}", adj.wb_offset);
-        // Linearized auto-WB on (200,128,80): offset ≈ −0.776, hue ≈ −0.259
-        // (the raw-sRGB values were ≈ −0.465 / −0.053 — under-corrected).
-        assert!((adj.wb_offset - -0.776).abs() < 1e-3, "offset {}", adj.wb_offset);
-        assert!((adj.hue - -0.259).abs() < 1e-3, "hue {}", adj.hue);
+        // Linear pre-tone auto-WB on (0.578,0.216,0.080): pick ≈ −1.545 → auto
+        // offset ≈ −0.777, hue ≈ −0.259 (sampling the tone-processed preview would
+        // have measured a weaker cast and under-corrected).
+        assert!((adj.wb_offset - -0.7771).abs() < 1e-3, "offset {}", adj.wb_offset);
+        assert!((adj.hue - -0.2590).abs() < 1e-3, "hue {}", adj.hue);
 
-        // No preview pixels → the handler must not emit anything or crash.
+        // No wb sample → the handler must not emit anything or crash.
         let (mut editor, events) = test_editor();
         editor.set_photo(9, "nopreview.jpg", &Adjustments::default(), 0.0, false, Some((16, 16)));
         editor.wb_auto_button.emit_clicked();
         assert!(
             !events.lock().unwrap().iter().any(|e| matches!(e, AppEvent::PhotoEdit { .. })),
-            "must not emit PhotoEdit without preview pixels"
+            "must not emit PhotoEdit without a wb sample"
         );
     }
 

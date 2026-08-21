@@ -190,32 +190,25 @@ pub fn wb_transform3x3(m: &[[f32; 3]; 3], wb: (f32, f32, f32)) -> Option<[f32; 9
 /// `wbFromPick`). With the camera color matrix, invert through T = M·diag(wb)·M⁻¹
 /// so the picked pixel lands exactly neutral; without it, fall back to a simple
 /// grey-world balance. Returns `(offset, hue)`.
-/// sRGB byte (0..255) → linear (0..1) via the shared LUT.
-fn byte_to_linear(v: f32) -> f32 {
-    srgb_to_linear()[v.round().clamp(0.0, 255.0) as usize]
-}
-
-/// Map a picked neutral pixel (as sRGB bytes 0..255 from the preview) onto the
-/// warmth + hue sliders. The WB gains are applied in LINEAR light at decode, but
-/// a gamma-encoded sample understates a cast (e.g. (200,160,120) → ≈ −0.6 raw but
-/// ≈ −1.2 once linearized), so the input is linearized first. Clamped to the UI
-/// slider ranges: warmth ±4, tint ±1 (photoup used ±2/±2, which is not enough for
-/// photos with an extreme cast).
+///
+/// The inputs are LINEAR RGB (0..1) from the pre-tone base sample (see
+/// `Base::linear_sample`) — the WB gains are applied in LINEAR light at decode,
+/// and the tone curves (rolloff, camera S-curve, sRGB) would distort the R/B
+/// ratio and understate a strong cast, so we must NOT feed gamma-encoded bytes.
+/// Clamped to the UI slider ranges: warmth ±4, tint ±1 (photoup used ±2/±2, which
+/// is not enough for photos with an extreme cast).
 pub fn wb_from_pick(r: f32, g: f32, b: f32, cam_matrix: Option<[[f32; 3]; 3]>) -> (f32, f32) {
-    let lr = byte_to_linear(r);
-    let lg = byte_to_linear(g);
-    let lb = byte_to_linear(b);
     if let Some(m) = cam_matrix {
         if let Some(minv) = invert3x3(&m) {
             // q = M⁻¹·pixel (camera-RGB domain), s = M⁻¹·(1,1,1). Gains that
             // neutralize: wb = gray·s / q. (Assumes the current WB is neutral.)
-            let q0 = minv[0][0] * lr + minv[0][1] * lg + minv[0][2] * lb;
-            let q1 = minv[1][0] * lr + minv[1][1] * lg + minv[1][2] * lb;
-            let q2 = minv[2][0] * lr + minv[2][1] * lg + minv[2][2] * lb;
+            let q0 = minv[0][0] * r + minv[0][1] * g + minv[0][2] * b;
+            let q1 = minv[1][0] * r + minv[1][1] * g + minv[1][2] * b;
+            let q2 = minv[2][0] * r + minv[2][1] * g + minv[2][2] * b;
             let s0 = minv[0][0] + minv[0][1] + minv[0][2];
             let s1 = minv[1][0] + minv[1][1] + minv[1][2];
             let s2 = minv[2][0] + minv[2][1] + minv[2][2];
-            let gray = (lr + lg + lb) / 3.0;
+            let gray = (r + g + b) / 3.0;
             let gr = gray * s0 / q0.max(1e-6);
             let gg = gray * s1 / q1.max(1e-6);
             let _gb = gray * s2 / q2.max(1e-6);
@@ -227,11 +220,11 @@ pub fn wb_from_pick(r: f32, g: f32, b: f32, cam_matrix: Option<[[f32; 3]; 3]>) -
         }
     }
     // Grey-world fallback (JPEG / no matrix).
-    let gray = (lr + lg + lb) / 3.0;
-    let hue_g = gray / lg.max(1e-6);
+    let gray = (r + g + b) / 3.0;
+    let hue_g = gray / g.max(1e-6);
     let hue = clamp(-2.0 * hue_g.log2(), -1.0, 1.0);
     let hue_rb = 2.0f32.powf(hue * 0.25);
-    let temp_r = gray / (lr.max(1e-6) * hue_rb);
+    let temp_r = gray / (r.max(1e-6) * hue_rb);
     // tempR = 2^(offset*0.5) → offset = 2*log2(tempR)
     (clamp(2.0 * temp_r.log2(), -4.0, 4.0), hue)
 }
@@ -239,6 +232,7 @@ pub fn wb_from_pick(r: f32, g: f32, b: f32, cam_matrix: Option<[[f32; 3]; 3]>) -
 /// Auto WB ("happy day" look, port of photoup `autoWb`): grey-world on a neutral
 /// reference, applied gently — a fraction of the warmth, a very conservative tint,
 /// plus a fixed warm bias so neutral scenes don't drift blue.
+/// Inputs are LINEAR RGB (0..1) from the pre-tone base sample (like `wb_from_pick`).
 pub fn auto_wb(r: f32, g: f32, b: f32, cam_matrix: Option<[[f32; 3]; 3]>) -> (f32, f32) {
     const OFFSET_STRENGTH: f32 = 0.6;
     const HUE_STRENGTH: f32 = 0.3;
@@ -355,10 +349,11 @@ mod tests {
 
     #[test]
     fn auto_wb_neutral_gray_is_warm_with_identity_matrix() {
-        // Neutral gray through the identity camera matrix → grey-world is neutral,
-        // so autoWb only adds the fixed "happy day" warm bias (0.15) and no tint.
+        // Neutral gray (linear 0.2159 = sRGB 128) through the identity camera
+        // matrix → grey-world is neutral, so autoWb only adds the fixed "happy
+        // day" warm bias (0.15) and no tint.
         let eye = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        let (offset, hue) = auto_wb(128.0, 128.0, 128.0, Some(eye));
+        let (offset, hue) = auto_wb(0.2159, 0.2159, 0.2159, Some(eye));
         assert!((offset - 0.15).abs() < 1e-4, "offset {offset}");
         assert!((hue - 0.0).abs() < 1e-4, "hue {hue}");
     }
@@ -366,7 +361,7 @@ mod tests {
     #[test]
     fn auto_wb_neutral_gray_is_warm_without_matrix() {
         // Same as above but via the grey-world fallback branch.
-        let (offset, hue) = auto_wb(128.0, 128.0, 128.0, None);
+        let (offset, hue) = auto_wb(0.2159, 0.2159, 0.2159, None);
         assert!((offset - 0.15).abs() < 1e-4, "offset {offset}");
         assert!((hue - 0.0).abs() < 1e-4, "hue {hue}");
     }
@@ -374,12 +369,12 @@ mod tests {
     #[test]
     fn wb_from_pick_cools_a_warm_cast() {
         // A red-heavy (warm) neutral area → negative offset (cool the red channel)
-        // and a magenta-ish tint. The input is linearized first (the WB gains are
-        // applied in linear light): (200,128,80) sRGB → linear (0.578,0.216,0.080)
-        // → offset ≈ −1.54, hue ≈ −0.86 (vs ≈ −1.03/−0.17 from raw sRGB bytes).
-        let (offset, hue) = wb_from_pick(200.0, 128.0, 80.0, None);
-        assert!((offset - -1.5434).abs() < 1e-3, "offset {offset}");
-        assert!((hue - -0.8632).abs() < 1e-3, "hue {hue}");
+        // and a magenta-ish tint. The input is LINEAR (0.578,0.216,0.080) — the
+        // true sensor cast for (200,128,80) sRGB → offset ≈ −1.55, hue ≈ −0.86
+        // (vs ≈ −1.03/−0.17 if the gamma-encoded bytes were fed in directly).
+        let (offset, hue) = wb_from_pick(0.578, 0.216, 0.080, None);
+        assert!((offset - -1.5452).abs() < 1e-3, "offset {offset}");
+        assert!((hue - -0.8633).abs() < 1e-3, "hue {hue}");
     }
 
     #[test]
@@ -387,16 +382,16 @@ mod tests {
         // With the identity camera matrix the matrix branch reduces to the same
         // grey-world balance as the no-matrix fallback (M·diag(wb)·M⁻¹ = diag(wb)).
         let eye = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        let (o1, h1) = wb_from_pick(200.0, 128.0, 80.0, None);
-        let (o2, h2) = wb_from_pick(200.0, 128.0, 80.0, Some(eye));
+        let (o1, h1) = wb_from_pick(0.578, 0.216, 0.080, None);
+        let (o2, h2) = wb_from_pick(0.578, 0.216, 0.080, Some(eye));
         assert!((o1 - o2).abs() < 1e-4 && (h1 - h2).abs() < 1e-4, "({o1},{h1}) vs ({o2},{h2})");
     }
 
     #[test]
     fn auto_wb_softens_the_cast_and_warms() {
         // autoWb = 60% of the pick warmth + 0.15 bias, 30% of the hue.
-        let (pick_o, pick_h) = wb_from_pick(200.0, 128.0, 80.0, None);
-        let (offset, hue) = auto_wb(200.0, 128.0, 80.0, None);
+        let (pick_o, pick_h) = wb_from_pick(0.578, 0.216, 0.080, None);
+        let (offset, hue) = auto_wb(0.578, 0.216, 0.080, None);
         assert!((offset - (pick_o * 0.6 + 0.15)).abs() < 1e-4, "offset {offset}");
         assert!((hue - pick_h * 0.3).abs() < 1e-4, "hue {hue}");
     }
@@ -405,10 +400,10 @@ mod tests {
     fn wb_from_pick_clamps_to_slider_range() {
         // Extreme values must stay within the slider ranges (warmth ±4, tint ±1)
         // instead of NaN/inf — and wide enough to fix extreme casts.
-        let (offset, hue) = wb_from_pick(0.0, 0.0, 255.0, None);
+        let (offset, hue) = wb_from_pick(0.0, 0.0, 1.0, None);
         assert!(offset.is_finite() && (-4.0..=4.0).contains(&offset), "offset {offset}");
         assert!(hue.is_finite() && (-1.0..=1.0).contains(&hue), "hue {hue}");
-        let (offset, hue) = wb_from_pick(255.0, 255.0, 255.0, Some([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]));
+        let (offset, hue) = wb_from_pick(1.0, 1.0, 1.0, Some([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]));
         assert!(offset.is_finite() && (-4.0..=4.0).contains(&offset), "offset {offset}");
         assert!(hue.is_finite() && (-1.0..=1.0).contains(&hue), "hue {hue}");
     }

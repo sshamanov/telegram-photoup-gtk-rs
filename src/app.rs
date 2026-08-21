@@ -37,6 +37,9 @@ const LIVE_EDGE: u32 = 512;
 const FINAL_EDGE: u32 = 1024;
 /// Longest edge of an export render (Telegram photo size cap).
 const EXPORT_EDGE: u32 = 2560;
+/// Longest edge of the LINEAR WB sample pushed to the editor (the WB pick/auto
+/// measure the cast from a small linear pre-tone downscale — see `linear_sample`).
+const WB_SAMPLE_EDGE: u32 = 96;
 /// Debounce window for slider-drag preview re-renders.
 const PREVIEW_DEBOUNCE_MS: u64 = 150;
 /// Image extensions the upload zone accepts (drag-drop, Ctrl+V paste, and the
@@ -84,6 +87,15 @@ pub enum UiEvent {
         /// render-only jobs (the base was already cached).
         base: Option<Box<dyn Base>>,
         preview_gen: u64,
+    },
+    /// A downscaled LINEAR (0..1) RGB sample of the active photo's decoded base —
+    /// before exposure/WB/tone — for the editor's WB Auto/Pick. Interleaved RGB,
+    /// `w*h*3` length.
+    WbSample {
+        id: u64,
+        rgba: Vec<f32>,
+        w: u32,
+        h: u32,
     },
     ExportReady {
         id: u64,
@@ -737,11 +749,22 @@ impl AppController {
                     st.active_photo == idx
                 };
                 let decoded = base.is_some();
-                // Cache the freshly-decoded base so slider edits render from memory.
-                if let Some(b) = base {
-                    if is_active {
-                        self.active_base = Some((id, Arc::from(b)));
-                    }
+                // Cache the freshly-decoded base so slider edits render from memory,
+                // and kick a LINEAR WB sample (the pick/auto measure the cast from
+                // the pre-tone base, not the tone-processed preview). Re-submitted
+                // only on a decode/re-cache — a re-cache happens on photo switch,
+                // so this never spams during slider drags.
+                if is_active
+                    && let Some(b) = base
+                {
+                    let arc = Arc::from(b);
+                    let arc_job = Arc::clone(&arc);
+                    let tx = self.ui_events_sender.clone();
+                    self.pool.submit(move || {
+                        let (rgba, w, h) = run_wb_sample_job(arc_job);
+                        let _ = tx.send(UiEvent::WbSample { id, rgba, w, h });
+                    });
+                    self.active_base = Some((id, arc));
                 }
                 if is_active {
                     self.editor.set_preview(Some(&crate::ui::util::rgba_to_texture(
@@ -750,7 +773,6 @@ impl AppController {
                         size.1 as i32,
                     )));
                     self.editor.set_histogram(&histogram);
-                    self.editor.set_preview_rgba(rgba.clone(), size.0, size.1);
                     self.editor.set_ev(self.effective_ev_for(id, auto_ev));
                     // The decode path carries the camera matrix the editor's WB
                     // Auto/Pick need; render-only jobs keep the previously-set one.
@@ -771,6 +793,17 @@ impl AppController {
                     row.set_error(false);
                     row.set_ev(auto_ev);
                     row.set_ready(true);
+                }
+            }
+            UiEvent::WbSample { id, rgba, w, h } => {
+                // Only the active photo's sample is useful; a stale one from a
+                // photo the user already navigated away from must not clobber it.
+                let is_active = {
+                    let st = self.state.read().unwrap();
+                    st.active_photo == self.index_of(id)
+                };
+                if is_active {
+                    self.editor.set_wb_sample(rgba, w, h);
                 }
             }
             UiEvent::ExportReady { id, jpeg, .. } => {
@@ -1834,18 +1867,6 @@ impl AppController {
                 self.editor.set_preview(Some(&tex));
             }
         }
-        // Push the thumbnail pixels to the editor too, so WB Auto/Pick can sample
-        // them instantly after a photo switch — the sharper preview rgba arrives a
-        // moment later and replaces them. (Without this, the first Auto-WB click
-        // right after switching finds no pixels and silently does nothing.)
-        {
-            let st = self.state.read().unwrap();
-            if let Some(p) = st.photos.iter().find(|p| p.id == active.0) {
-                if let (Some(rgba), Some(sz)) = (&p.thumb, p.thumb_size) {
-                    self.editor.set_preview_rgba(rgba.clone(), sz.0, sz.1);
-                }
-            }
-        }
         self.schedule_preview(active.0);
     }
 }
@@ -1992,6 +2013,15 @@ fn run_render_job(
         t_render.as_secs_f64(), t_render.as_secs_f64()
     );
     Ok((r.rgba, (w, h), full, r.auto_ev, hist))
+}
+
+/// Downscale the active photo's decoded base to a ≤96px LINEAR (0..1) RGB sample
+/// for the WB pick/auto. Interleaved RGB, `w*h*3` length. Runs on a pool worker;
+/// cheap (a box-filtered downscale), so it can fire alongside the first preview.
+fn run_wb_sample_job(base: Arc<dyn Base>) -> (Vec<f32>, u32, u32) {
+    let (w, h) = fit_within(base.width(), base.height(), WB_SAMPLE_EDGE);
+    let rgba = base.linear_sample(Size { width: w, height: h });
+    (rgba, w, h)
 }
 
 /// For RAW exports the effective WB is baked into libraw's `user_mul`

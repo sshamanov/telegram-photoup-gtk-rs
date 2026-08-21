@@ -1,5 +1,5 @@
 use crate::image::math::{AutoExpOpts, auto_exposure_ev, crop_to_pixels, fit_within};
-use crate::image::resize::{downscale_crop, downscale_rgba};
+use crate::image::resize::{downscale_crop, downscale_plane, downscale_rgba};
 use crate::image::srgb::{
     gain_coefficients, jpeg_tone_lut, linear_to_srgb_byte, raw_tone_lut, srgb_to_linear, tone_index,
     wb_gains, wb_transform3x3,
@@ -29,6 +29,10 @@ pub trait Base: Send + Sync {
         adjustments: &Adjustments,
         ev: Option<f32>,
     ) -> RenderResult;
+    /// Downscaled LINEAR (0..1) RGB of the full frame — before exposure/WB/tone.
+    /// Used by the WB pick/auto so the measured cast is the true sensor cast, not
+    /// the tone-mapped preview's. Interleaved R,G,B, length `size.width*size.height*3`.
+    fn linear_sample(&self, size: Size) -> Vec<f32>;
 }
 
 pub struct RenderResult {
@@ -165,6 +169,23 @@ impl Base for JpegBase {
         }
 
         RenderResult { rgba, auto_ev }
+    }
+
+    fn linear_sample(&self, size: Size) -> Vec<f32> {
+        // The WB pick/auto sample the raw sensor cast: just the decoded sRGB frame
+        // downscaled to linear light, with NO exposure/WB/rolloff/S-curve applied
+        // (those tone ops distort the R/B ratio and understate a strong cast).
+        let dw = size.width.min(self.width).max(1);
+        let dh = size.height.min(self.height).max(1);
+        let down = downscale_rgba(&self.rgba, self.width, self.height, dw, dh);
+        let s2l = srgb_to_linear();
+        let mut out = Vec::with_capacity((dw * dh) as usize * 3);
+        for px in down.chunks_exact(4) {
+            out.push(s2l[px[0] as usize]);
+            out.push(s2l[px[1] as usize]);
+            out.push(s2l[px[2] as usize]);
+        }
+        out
     }
 }
 
@@ -320,6 +341,24 @@ impl Base for RawBase {
 
         RenderResult { rgba, auto_ev }
     }
+
+    fn linear_sample(&self, size: Size) -> Vec<f32> {
+        // Same idea as the JPEG path: the WB pick/auto need the true sensor cast,
+        // so sample the decoded LINEAR planes downscaled — no exposure/WB/tone.
+        let dw = size.width.min(self.width).max(1);
+        let dh = size.height.min(self.height).max(1);
+        let r = downscale_plane(&self.full.r, self.full.width, self.full.height, dw, dh);
+        let g = downscale_plane(&self.full.g, self.full.width, self.full.height, dw, dh);
+        let b = downscale_plane(&self.full.b, self.full.width, self.full.height, dw, dh);
+        let n = (dw * dh) as usize;
+        let mut out = Vec::with_capacity(n * 3);
+        for i in 0..n {
+            out.push(r[i]);
+            out.push(g[i]);
+            out.push(b[i]);
+        }
+        out
+    }
 }
 
 /// 256-bin luminance histogram over the final sRGB pixels (photoup `computeHistogram`).
@@ -364,7 +403,7 @@ pub fn export_dimensions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image::srgb::{highlight_rolloff, linear_to_srgb_byte};
+    use crate::image::srgb::{highlight_rolloff, linear_to_srgb_byte, srgb_to_linear};
 
     fn gray_linear(x: f32) -> u8 {
         linear_to_srgb_byte(x)
@@ -485,6 +524,27 @@ mod tests {
         let hist = compute_histogram(&out.rgba);
         assert_eq!(hist.iter().sum::<u32>(), 16 * 16);
     }
+
+    #[test]
+    fn jpeg_linear_sample_is_linear_pre_tone() {
+        // A uniform warm sRGB (200,128,80) frame → the linear sample must equal
+        // srgb_to_linear(byte) per channel (downscale of a uniform image is uniform),
+        // and carry NO exposure/WB/tone. Downscaling to 8×8 exercises the box filter.
+        let (w, h) = (32u32, 32u32);
+        let rgba = vec![200u8, 128, 80, 255].repeat((w * h) as usize);
+        let base = JpegBase::new(w, h, rgba);
+        let out = base.linear_sample(Size { width: 8, height: 8 });
+        assert_eq!(out.len(), (8 * 8 * 3) as usize);
+        let s2l = srgb_to_linear();
+        for px in out.chunks_exact(3) {
+            assert!((px[0] - s2l[200]).abs() < 1e-6, "r {}", px[0]);
+            assert!((px[1] - s2l[128]).abs() < 1e-6, "g {}", px[1]);
+            assert!((px[2] - s2l[80]).abs() < 1e-6, "b {}", px[2]);
+        }
+        // The sample is < 1 (0..1 linear), unlike the tone-processed preview which
+        // can lift highlights past the sensor values.
+        assert!(out.iter().all(|&v| v >= 0.0 && v <= 1.0));
+    }
 }
 
 #[cfg(test)]
@@ -538,6 +598,32 @@ mod raw_base_tests {
             &Adjustments::default(),
         );
         assert!(out.rgba[0] > 100 && out.rgba[0] < 255);
+    }
+
+    #[test]
+    fn raw_linear_sample_is_raw_plane_values() {
+        // A uniform warm RAW plane (r=0.578, g=0.216, b=0.080 linear) → the linear
+        // sample returns those plane values unchanged (pre-exposure/WB/tone), so the
+        // WB pick/auto measure the true sensor cast.
+        let (w, h) = (32u32, 32u32);
+        let n = (w * h) as usize;
+        let dr = DecodedRaw {
+            width: w,
+            height: h,
+            r: vec![0.578; n],
+            g: vec![0.216; n],
+            b: vec![0.080; n],
+            cam_mul: None,
+            cam_matrix: None,
+        };
+        let base = RawBase::new(dr);
+        let out = base.linear_sample(Size { width: 8, height: 8 });
+        assert_eq!(out.len(), (8 * 8 * 3) as usize);
+        for px in out.chunks_exact(3) {
+            assert!((px[0] - 0.578).abs() < 1e-6, "r {}", px[0]);
+            assert!((px[1] - 0.216).abs() < 1e-6, "g {}", px[1]);
+            assert!((px[2] - 0.080).abs() < 1e-6, "b {}", px[2]);
+        }
     }
 
     fn uniform_dr(w: u32, h: u32, value: f32) -> DecodedRaw {
