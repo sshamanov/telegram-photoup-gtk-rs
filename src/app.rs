@@ -39,6 +39,11 @@ const FINAL_EDGE: u32 = 1024;
 const EXPORT_EDGE: u32 = 2560;
 /// Debounce window for slider-drag preview re-renders.
 const PREVIEW_DEBOUNCE_MS: u64 = 150;
+/// Keyboard fine-tune steps (match the sliders' steps): Q/W → EV, A/S → warmth,
+/// Z/X → tint. Each keypress nudges the slider by its step.
+const EV_FINE_STEP: f64 = 0.05;
+const WB_FINE_STEP: f64 = 0.05;
+const TINT_FINE_STEP: f64 = 0.01;
 /// Image extensions the upload zone accepts (drag-drop, Ctrl+V paste, and the
 /// file picker filter all funnel through this). photoup's `UploadZone` accepts
 /// `image/*` plus NEF/CR2; we pin the five the picker advertises.
@@ -474,8 +479,48 @@ impl AppController {
                     glib::Propagation::Proceed
                 }
             }
+            // Keyboard fine-tune while the editor is open: Q/W EV, A/S warmth,
+            // Z/X tint (Ctrl+A select-all is caught above; plain A is warmth-down).
+            k if matches!(
+                k,
+                Key::q | Key::Q | Key::w | Key::W
+                    | Key::a | Key::A | Key::s | Key::S
+                    | Key::z | Key::Z | Key::x | Key::X
+            ) => {
+                if self.on_fine_tune(keyval) {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
             _ => glib::Propagation::Proceed,
         }
+    }
+
+    /// Keyboard fine-tune (editor open): each keypress nudges the corresponding
+    /// slider by its step, which fires the slider's existing `PhotoEdit` — the EV
+    /// keys switch exposure to Manual (like dragging the slider), warmth/tint just
+    /// adjust their value. Returns true if a key was handled.
+    fn on_fine_tune(&mut self, keyval: gtk4::gdk::Key) -> bool {
+        use gtk4::gdk::Key;
+        if self.state.read().unwrap().active_photo.is_none() {
+            return false; // editor not open
+        }
+        let (dir, which) = match keyval {
+            Key::q | Key::Q => (-1.0, 0),
+            Key::w | Key::W => (1.0, 0),
+            Key::a | Key::A => (-1.0, 1),
+            Key::s | Key::S => (1.0, 1),
+            Key::z | Key::Z => (-1.0, 2),
+            Key::x | Key::X => (1.0, 2),
+            _ => return false,
+        };
+        match which {
+            0 => self.editor.fine_tune_ev(dir * EV_FINE_STEP),
+            1 => self.editor.fine_tune_wb(dir * WB_FINE_STEP),
+            _ => self.editor.fine_tune_tint(dir * TINT_FINE_STEP),
+        }
+        true
     }
 
     /// True when the focused widget is a text entry / text view / other editable,

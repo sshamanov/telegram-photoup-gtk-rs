@@ -676,6 +676,13 @@ impl EditorScreen {
         hint.set_wrap(true);
         panel.append(&hint);
 
+        // Keyboard fine-tune hint.
+        let kb_hint = Label::new(Some("Fine-tune: Q/W exposure · A/S warmth · Z/X tint"));
+        kb_hint.add_css_class("dim-label");
+        kb_hint.set_halign(gtk4::Align::Start);
+        kb_hint.set_wrap(true);
+        panel.append(&kb_hint);
+
         // Nav: ‹ Prev | Next ›.
         let nav_row = GBox::new(Orientation::Horizontal, 6);
         let nav_prev = Button::with_label("‹ Prev");
@@ -783,6 +790,26 @@ impl EditorScreen {
 
     pub fn set_preview(&self, texture: Option<&gdk4::Texture>) {
         self.preview.set_paintable(texture);
+    }
+
+    /// Fine-tune the exposure EV slider by `delta` steps (keyboard Q/W). Moving the
+    /// slider fires its value_changed → PhotoEdit (switches to Manual EV, like
+    /// dragging it by hand).
+    pub fn fine_tune_ev(&self, delta: f64) {
+        let v = self.exposure_scale.value();
+        self.exposure_scale.set_value(v + delta);
+    }
+
+    /// Fine-tune the warmth (temperature) slider by `delta` (keyboard A/S).
+    pub fn fine_tune_wb(&self, delta: f64) {
+        let v = self.temp_scale.value();
+        self.temp_scale.set_value(v + delta);
+    }
+
+    /// Fine-tune the tint (hue) slider by `delta` (keyboard Z/X).
+    pub fn fine_tune_tint(&self, delta: f64) {
+        let v = self.hue_scale.value();
+        self.hue_scale.set_value(v + delta);
     }
 
     /// Set the EV indicator ("+0.35 EV"); `{:+.2}` keeps the width fixed so the
