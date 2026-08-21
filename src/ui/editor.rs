@@ -163,7 +163,7 @@ fn apply_wb(
     wb_lab: &Label,
 ) {
     let offset = offset.clamp(-2.0, 2.0);
-    let hue = hue.clamp(-2.0, 2.0);
+    let hue = hue.clamp(-1.0, 1.0); // tint range is ±1 (slider is −1..+1)
     suppress.set(true);
     temp.set_value(offset as f64);
     hue_scale.set_value(hue as f64);
@@ -615,7 +615,9 @@ impl EditorScreen {
         temp_scale.add_mark(0.0, gtk4::PositionType::Bottom, None);
         panel.append(&temp_scale);
 
-        let hue_adj = gtk4::Adjustment::new(0.0, -2.0, 2.0, 0.05, 0.5, 0.0);
+        // Tint (hue) is fine-grained: −1..+1 at 0.01 steps (the old −2..+2 was too
+        // wide — tinting is a subtle correction). Temperature stays −2..+2.
+        let hue_adj = gtk4::Adjustment::new(0.0, -1.0, 1.0, 0.01, 0.1, 0.0);
         let hue_scale = Scale::new(gtk4::Orientation::Horizontal, Some(&hue_adj));
         hue_scale.set_value(0.0);
         hue_scale.set_draw_value(false);

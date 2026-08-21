@@ -311,8 +311,20 @@ progressbar.send-progress progress {
 .editor-value { font-family: monospace; font-size: 12px; color: #ffc9a8; }
 .editor-file { font-family: monospace; font-size: 13px; font-weight: 500; color: #ece4d8; }
 
-/* Slider fill / marks get the amber accent. */
-scale highlight { background-color: #ff7a45; }
+/* Slider fill / marks get the amber accent. Thin, clean track. */
+scale trough {
+    min-height: 4px;
+    min-width: 4px;
+}
+scale highlight {
+    background-color: #ff7a45;
+    border-radius: 2px;
+}
+scale slider {
+    min-width: 14px;
+    min-height: 14px;
+    border-radius: 50%;
+}
 scale mark label { color: #8a7f72; }
 
 /* ---- Toast: dark pill, amber accent, gentle slide-in + fade ---- */
