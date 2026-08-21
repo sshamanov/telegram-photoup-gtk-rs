@@ -129,28 +129,56 @@ fn auto_wb_mean_linear(rgb: &[f32], w: u32, h: u32, crop: Option<&NormalizedCrop
     ))
 }
 
+/// WB Auto reference: crop-aware mean of the LINEAR sample, logging the region
+/// stats. Returns the channel means that feed `wb_from_pick` (clinical Auto) and
+/// `auto_wb` (warm Auto2).
+fn auto_wb_feed(
+    data: &[f32],
+    pw: u32,
+    ph: u32,
+    crop: Option<&NormalizedCrop>,
+) -> Option<(f32, f32, f32)> {
+    let (rx0, ry0, rx1, ry1) = match crop {
+        Some(c) => {
+            let rect = crop_to_pixels(c, pw, ph);
+            (
+                rect.x as usize,
+                rect.y as usize,
+                (rect.x + rect.width) as usize,
+                (rect.y + rect.height) as usize,
+            )
+        }
+        None => (0, 0, pw as usize, ph as usize),
+    };
+    log_wb_sample_stats("auto", data, pw, ph, rx0, ry0, rx1, ry1);
+    auto_wb_mean_linear(data, pw, ph, crop)
+}
+
+/// The 7×7 sample window around (cx, cy), clamped to the sample bounds — shared
+/// by `pick_sample_linear` and the `[wb]` debug log.
+fn pick_window(w: u32, h: u32, cx: f64, cy: f64) -> (usize, usize, usize, usize) {
+    const WIN: isize = 7;
+    let sx0 = ((cx.floor() as isize) - WIN / 2).max(0).min((w as isize - WIN).max(0));
+    let sy0 = ((cy.floor() as isize) - WIN / 2).max(0).min((h as isize - WIN).max(0));
+    (
+        sx0 as usize,
+        sy0 as usize,
+        (sx0 + WIN) as usize,
+        (sy0 + WIN) as usize,
+    )
+}
+
 /// Average a fixed 7×7 area of the LINEAR sample around pixel (cx, cy) — the
 /// GIMP-style grey-point picker (photoup `pickNeutral`; larger than one pixel so
 /// noise can't skew the WB). Returns the channel means (0..1), or None if empty.
 fn pick_sample_linear(rgb: &[f32], w: u32, h: u32, cx: f64, cy: f64) -> Option<(f32, f32, f32)> {
-    const WIN: isize = 7;
-    let cxp = cx.floor() as isize;
-    let cyp = cy.floor() as isize;
-    let sx0 = (cxp - WIN / 2).max(0).min((w as isize - WIN).max(0));
-    let sy0 = (cyp - WIN / 2).max(0).min((h as isize - WIN).max(0));
+    let (x0, y0, x1, y1) = pick_window(w, h, cx, cy);
     let (mut sr, mut sg, mut sb) = (0.0f64, 0.0f64, 0.0f64);
     let mut n = 0usize;
-    for dy in 0..WIN {
-        let yy = sy0 + dy;
-        if yy >= h as isize {
-            break;
-        }
-        for dx in 0..WIN {
-            let xx = sx0 + dx;
-            if xx >= w as isize {
-                break;
-            }
-            let o = ((yy * w as isize + xx) as usize) * 3;
+    for yy in y0..y1.min(h as usize) {
+        let row = yy * w as usize;
+        for xx in x0..x1.min(w as usize) {
+            let o = (row + xx) * 3;
             sr += rgb[o] as f64;
             sg += rgb[o + 1] as f64;
             sb += rgb[o + 2] as f64;
@@ -165,6 +193,49 @@ fn pick_sample_linear(rgb: &[f32], w: u32, h: u32, cx: f64, cy: f64) -> Option<(
         (sg / n as f64) as f32,
         (sb / n as f64) as f32,
     ))
+}
+
+/// Per-channel min/max/mean of an interleaved LINEAR RGB sample region — the
+/// `[wb]` debug aid, so the actual cast feeding the pick/auto math is visible.
+fn log_wb_sample_stats(
+    tag: &str,
+    rgb: &[f32],
+    w: u32,
+    h: u32,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+) {
+    let (mut mn, mut mx, mut sm) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3], [0.0f64; 3]);
+    let mut n = 0usize;
+    for yy in y0..y1.min(h as usize) {
+        let row = yy * w as usize;
+        for xx in x0..x1.min(w as usize) {
+            let o = (row + xx) * 3;
+            for c in 0..3 {
+                mn[c] = mn[c].min(rgb[o + c]);
+                mx[c] = mx[c].max(rgb[o + c]);
+                sm[c] += rgb[o + c] as f64;
+            }
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return;
+    }
+    log::info!(
+        "[wb] {tag} region {x0}..{x1},{y0}..{y1} (n={n}): mean r={:.4} g={:.4} b={:.4} | min r={:.4} g={:.4} b={:.4} | max r={:.4} g={:.4} b={:.4}",
+        sm[0] / n as f64,
+        sm[1] / n as f64,
+        sm[2] / n as f64,
+        mn[0],
+        mn[1],
+        mn[2],
+        mx[0],
+        mx[1],
+        mx[2]
+    );
 }
 
 /// A WB correction is clamped to the ±2 slider range; reflect it on the warmth +
@@ -489,7 +560,7 @@ pub struct EditorScreen {
     slide_exposure_btn: Button,
     rest_exposure_btn: Button,
     wb_auto_button: Button,
-    pick_button: Button,
+    wb_auto2_button: Button,
     reset_wb_btn: Button,
     crop_11: Button,
     crop_23: Button,
@@ -513,9 +584,6 @@ pub struct EditorScreen {
     /// The active photo's camera→sRGB color matrix (RAW only; `None` for JPEG /
     /// no matrix), pushed by the controller for WB Auto/Pick.
     cam_matrix: Rc<RefCell<Option<[[f32; 4]; 3]>>>,
-    /// Pick mode (photoup `pickingNeutral`): clicking the preview samples a
-    /// neutral point. Toggled by the Pick button.
-    picking: Rc<Cell<bool>>,
     is_raw: Rc<Cell<bool>>,
     /// The active exposure mode — `set_ev` only moves the EV slider in auto
     /// modes (in Manual the slider IS the user's manual value and must not jump).
@@ -640,8 +708,14 @@ impl EditorScreen {
         panel.append(&hue_slider.area());
 
         let wb_row = GBox::new(Orientation::Horizontal, 6);
+        // Auto = clinical neutralization of the frame's neutral reference; Auto2 =
+        // the same but keeping the warm ambience (Nikon AUTO2 "keep warm lighting").
+        // The neutral-pick needs no button — clicking the preview samples a neutral
+        // point directly (except on crop handles).
         let wb_auto_button = Button::with_label("Auto");
-        let pick_button = Button::with_label("Pick");
+        wb_auto_button.set_tooltip_text(Some("Neutralize the warm/cool cast (clinical)"));
+        let wb_auto2_button = Button::with_label("Auto2");
+        wb_auto2_button.set_tooltip_text(Some("Neutralize but keep the warm ambience (Nikon AUTO2)"));
         let reset_wb_btn = Button::with_label("Reset");
         let wb_value = Label::new(Some("+0.00 · +0.00"));
         wb_value.add_css_class("editor-value");
@@ -649,11 +723,11 @@ impl EditorScreen {
         wb_value.set_halign(gtk4::Align::End);
         wb_value.set_width_chars(13);
         wb_row.append(&wb_auto_button);
-        wb_row.append(&pick_button);
+        wb_row.append(&wb_auto2_button);
         wb_row.append(&reset_wb_btn);
         wb_row.append(&wb_value);
-        // Auto-WB + neutral-picker now have the preview pixels + camera matrix
-        // wired (see wire_buttons / wire_pick) — enabled.
+        // Auto-WB + neutral-pick now have the preview pixels + camera matrix
+        // wired (see wire_buttons) — enabled.
         panel.append(&wb_row);
 
         // ---- Crop ----
@@ -741,7 +815,7 @@ impl EditorScreen {
             slide_exposure_btn,
             rest_exposure_btn,
             wb_auto_button,
-            pick_button,
+            wb_auto2_button,
             reset_wb_btn,
             crop_11,
             crop_23,
@@ -754,7 +828,6 @@ impl EditorScreen {
             crop,
             wb_sample: Rc::new(RefCell::new(None)),
             cam_matrix: Rc::new(RefCell::new(None)),
-            picking: Rc::new(Cell::new(false)),
             is_raw: Rc::new(Cell::new(false)),
             current_mode: Rc::new(Cell::new(ExposureMode::Auto)),
             suppress: Rc::new(Cell::new(false)),
@@ -787,11 +860,9 @@ impl EditorScreen {
         self.full_size.set(full_size);
         self.crop.replace(adjustments.crop);
         // New photo: drop the previous photo's per-photo data (linear WB sample,
-        // camera matrix, pick mode).
+        // camera matrix).
         self.wb_sample.borrow_mut().take();
         self.cam_matrix.borrow_mut().take();
-        self.picking.set(false);
-        self.pick_button.remove_css_class("suggested-action");
         self.crop_area.queue_draw();
         self.file_label.set_text(name);
         self.file_label.set_tooltip_text(Some(name));
@@ -851,14 +922,12 @@ impl EditorScreen {
         self.cam_matrix.replace(cam_matrix);
     }
 
-    /// Drop the per-photo data the editor holds (linear WB sample, camera matrix,
-    /// pick mode) — called when the editor closes so a later photo can't read a
-    /// stale previous photo's sample/matrix.
+    /// Drop the per-photo data the editor holds (linear WB sample, camera matrix)
+    /// — called when the editor closes so a later photo can't read a stale
+    /// previous photo's sample/matrix.
     pub fn release_photo_data(&self) {
         self.wb_sample.borrow_mut().take();
         self.cam_matrix.borrow_mut().take();
-        self.picking.set(false);
-        self.pick_button.remove_css_class("suggested-action");
         // Clear the preview so closing the editor never leaves the previous
         // photo's image visible while the next one renders.
         self.preview.set_paintable(None::<&gdk4::Texture>);
@@ -1010,14 +1079,8 @@ impl EditorScreen {
     fn wire_crop_overlay(&self) {
         let crop_draw = Rc::clone(&self.crop);
         let full_draw = Rc::clone(&self.full_size);
-        let picking_draw = Rc::clone(&self.picking);
         let area = self.crop_area.clone();
         area.set_draw_func(move |_a, cr, width, height| {
-            // While picking a neutral point the crop box is hidden (photoup's
-            // `.left.picking` state) so the preview is uncluttered.
-            if picking_draw.get() {
-                return;
-            }
             // Crop box is visible from the start: with no crop set it spans the
             // whole image (photoup shows the full-frame selection immediately, so
             // you can drag/resize without clicking a preset first).
@@ -1032,17 +1095,12 @@ impl EditorScreen {
         let gesture = gtk4::GestureDrag::new();
         let drag: Rc<RefCell<Option<DragState>>> = Rc::new(RefCell::new(None));
 
-        // Press: pick a handle (resize) or the rect interior (move). In pick mode
-        // the crop is inert — the GestureClick handles the press instead.
+        // Press: pick a handle (resize) or the rect interior (move).
         let crop_begin = Rc::clone(&self.crop);
         let full_begin = Rc::clone(&self.full_size);
         let area_begin = self.crop_area.clone();
         let drag_begin = Rc::clone(&drag);
-        let picking_begin = Rc::clone(&self.picking);
         gesture.connect_drag_begin(move |_g, x, y| {
-            if picking_begin.get() {
-                return;
-            }
             // The box is interactive from the start: with no crop set it's the full
             // frame ({0,0,1,1}) — press/drag/resize works without pressing a preset.
             let c = match *crop_begin.borrow() {
@@ -1126,13 +1184,17 @@ impl EditorScreen {
 
         self.crop_area.add_controller(gesture);
 
-        // Neutral-pick: while Pick mode is on, clicking the preview samples a 7×7
-        // area under the cursor and maps it to warmth + hue (photoup `pickNeutral`).
+        // Neutral-pick on click (photoup `pickNeutral`): clicking the preview
+        // samples a 7×7 area under the cursor and maps it to warmth + hue. This is
+        // the DEFAULT click action — no Pick button/mode. Clicks on the crop box's
+        // 8 handles stay crop grabs (the drag gesture resizes them), and any
+        // press-drag (crop move/resize) suppresses the click: we listen on
+        // `released`, which GTK cancels once the drag gesture claims the sequence.
         // The click lands on the crop overlay (it fills the preview area), whose
         // coordinates map to the letterboxed image via `project` — the same rect
         // the crop overlay draws with.
         let click = gtk4::GestureClick::new();
-        let picking_click = Rc::clone(&self.picking);
+        let crop_click = Rc::clone(&self.crop);
         let wb_click = Rc::clone(&self.wb_sample);
         let cam_click = Rc::clone(&self.cam_matrix);
         let full_click = Rc::clone(&self.full_size);
@@ -1144,15 +1206,26 @@ impl EditorScreen {
         let hue_click = self.hue_slider.clone();
         let suppress_click = Rc::clone(&self.suppress);
         let wb_lab_click = self.wb_value.clone();
-        click.connect_pressed(move |_g, _count, x, y| {
-            if !picking_click.get() {
-                return; // normal mode: the editor has no other click action
-            }
+        click.connect_released(move |_g, _n_press, x, y| {
             let Some(id) = id_click.get() else { return };
             let Some(full) = full_click.get() else { return };
             let Some((data, pw, ph)) = &*wb_click.borrow() else { return };
             let (aw, ah) = (area_click.width() as f64, area_click.height() as f64);
             let Some(p) = project(aw, ah, full) else { return };
+            // A click on a crop handle is a resize grab, not a pick — the drag
+            // gesture owns the handles (26px hit radius, same as drag-begin).
+            let c = match *crop_click.borrow() {
+                Some(c) => c,
+                None => NormalizedCrop { x: 0.0, y: 0.0, width: 1.0, height: 1.0 },
+            };
+            let (rx, ry, rw, rh) = crop_rect(&p, &c);
+            let hit2 = HANDLE_HIT * HANDLE_HIT;
+            if handle_anchors(rx, ry, rw, rh)
+                .iter()
+                .any(|(_h, hx, hy)| (x - hx) * (x - hx) + (y - hy) * (y - hy) <= hit2)
+            {
+                return;
+            }
             // Normalized position over the displayed (letterboxed) image.
             let nx = (x - p.ox) / p.disp_w;
             let ny = (y - p.oy) / p.disp_h;
@@ -1169,12 +1242,15 @@ impl EditorScreen {
                 ));
                 return;
             }
-            let (offset, hue) =
-                wb_from_pick(r, g, b, cam_matrix3x3(*cam_click.borrow()));
-            // The tint (hue) is over-reported on strong casts — it jumps to ±1
-            // when the true tint is ~0 — so halve the pick's hue. The slider stays
-            // fine for real tint, and auto keeps its existing 0.3 strength.
-            apply_wb(id, offset, hue * 0.5, &state_click, &on_click, &suppress_click, &temp_click, &hue_click, &wb_lab_click);
+            let cam = cam_matrix3x3(*cam_click.borrow());
+            let (x0, y0, x1, y1) = pick_window(*pw, *ph, cx, cy);
+            log_wb_sample_stats("pick", data, *pw, *ph, x0, y0, x1, y1);
+            let (offset, hue) = wb_from_pick(r, g, b, cam);
+            log::info!(
+                "[wb] pick feed r={r:.4} g={g:.4} b={b:.4} → offset={offset:.3} hue={hue:.3} cam={}",
+                if cam.is_some() { "matrix" } else { "grey-world" }
+            );
+            apply_wb(id, offset, hue, &state_click, &on_click, &suppress_click, &temp_click, &hue_click, &wb_lab_click);
         });
         self.crop_area.add_controller(click);
     }
@@ -1266,9 +1342,12 @@ impl EditorScreen {
             o(AppEvent::PhotoEdit { id, adjustments: adj });
         });
 
-        // WB Auto: grey-world over near-neutral bright pixels of the LINEAR
-        // pre-tone sample, biased warm ("happy day"). Falls back to the
-        // whole-region mean if too few neutral pixels (photoup `autoWhiteBalance`).
+        // WB Auto (photoup `autoWhiteBalance`): the reference is a grey-world mean
+        // over near-neutral bright pixels of the LINEAR pre-tone sample, falling
+        // back to the whole-region mean if too few neutral pixels. Two flavours:
+        //   Auto  → clinical neutralization (the full `wb_from_pick` fit).
+        //   Auto2 → warm: the same reference, but only ~60% corrected + a warm bias,
+        //            keeping the ambience (Nikon AUTO2 "keep warm lighting colors").
         let (a, o, st, wbs, cm, s, temp, hue, lab, croprc) = (
             Rc::clone(&active_id),
             Arc::clone(&on_event),
@@ -1282,29 +1361,43 @@ impl EditorScreen {
             wb_lab.clone(),
             Rc::clone(&self.crop),
         );
+        let (a2, o2, st2, wbs2, cm2, s2, temp2, hue2, lab2, croprc2) = (
+            Rc::clone(&active_id),
+            Arc::clone(&on_event),
+            Arc::clone(&state),
+            Rc::clone(&self.wb_sample),
+            Rc::clone(&self.cam_matrix),
+            Rc::clone(&suppress),
+            self.temp_slider.clone(),
+            self.hue_slider.clone(),
+            wb_lab.clone(),
+            Rc::clone(&self.crop),
+        );
         self.wb_auto_button.connect_clicked(move |_| {
             let Some(id) = a.get() else { return };
             let Some((data, pw, ph)) = &*wbs.borrow() else { return };
             let crop = *croprc.borrow();
-            let Some((r, g, b)) = auto_wb_mean_linear(data, *pw, *ph, crop.as_ref()) else { return };
-            let (wb_offset, wb_hue) =
-                auto_wb(r, g, b, cam_matrix3x3(*cm.borrow()));
+            let Some((r, g, b)) = auto_wb_feed(data, *pw, *ph, crop.as_ref()) else { return };
+            let cam = cam_matrix3x3(*cm.borrow());
+            let (wb_offset, wb_hue) = wb_from_pick(r, g, b, cam); // clinical
+            log::info!(
+                "[wb] auto (clinical) feed r={r:.4} g={g:.4} b={b:.4} → offset={wb_offset:.3} hue={wb_hue:.3} cam={}",
+                if cam.is_some() { "matrix" } else { "grey-world" }
+            );
             apply_wb(id, wb_offset, wb_hue, &st, &o, &s, &temp, &hue, &lab);
         });
-
-        // Pick: toggle neutral-pick mode. While active, clicking the preview
-        // samples a neutral point (see wire_pick); the button lights up so the
-        // mode is obvious (photoup `pickingNeutral` highlight).
-        let (p, area) = (Rc::clone(&self.picking), self.crop_area.clone());
-        self.pick_button.connect_clicked(move |btn| {
-            let next = !p.get();
-            p.set(next);
-            if next {
-                btn.add_css_class("suggested-action");
-            } else {
-                btn.remove_css_class("suggested-action");
-            }
-            area.queue_draw(); // hide the crop box while picking
+        self.wb_auto2_button.connect_clicked(move |_| {
+            let Some(id) = a2.get() else { return };
+            let Some((data, pw, ph)) = &*wbs2.borrow() else { return };
+            let crop = *croprc2.borrow();
+            let Some((r, g, b)) = auto_wb_feed(data, *pw, *ph, crop.as_ref()) else { return };
+            let cam = cam_matrix3x3(*cm2.borrow());
+            let (wb_offset, wb_hue) = auto_wb(r, g, b, cam); // warm (Nikon AUTO2)
+            log::info!(
+                "[wb] auto2 (warm) feed r={r:.4} g={g:.4} b={b:.4} → offset={wb_offset:.3} hue={wb_hue:.3} cam={}",
+                if cam.is_some() { "matrix" } else { "grey-world" }
+            );
+            apply_wb(id, wb_offset, wb_hue, &st2, &o2, &s2, &temp2, &hue2, &lab2);
         });
 
         // Crop presets (each also mirrors the selection into the overlay).
@@ -1453,27 +1546,36 @@ mod tests {
         editor.set_ev(4.0);
         assert_eq!(editor.ev_value.text(), "+4.00 EV");
 
-        // Auto-WB on a neutral gray image (linear 0.2159) → warm bias (0.15), no tint.
+        // AUTO (clinical) on a neutral gray image (linear 0.2159) → no change;
+        // AUTO2 (warm) → the fixed +0.15 warm bias, no tint.
         let (mut editor, events) = test_editor();
         editor.set_photo(7, "gray.jpg", &Adjustments::default(), 0.0, false, Some((16, 16)));
         editor.set_wb_sample(linear_fill(16, 16, [0.2159, 0.2159, 0.2159]), 16, 16);
         editor.wb_auto_button.emit_clicked();
-        let adj = find_photo_edit(&events, 7).expect("neutral PhotoEdit");
+        let adj = find_photo_edit(&events, 7).expect("neutral PhotoEdit (Auto)");
+        assert!((adj.wb_offset - 0.0).abs() < 1e-4, "offset {}", adj.wb_offset);
+        assert!((adj.hue - 0.0).abs() < 1e-4, "hue {}", adj.hue);
+        editor.wb_auto2_button.emit_clicked();
+        let adj = find_photo_edit(&events, 7).expect("neutral PhotoEdit (Auto2)");
         assert!((adj.wb_offset - 0.15).abs() < 1e-4, "offset {}", adj.wb_offset);
         assert!((adj.hue - 0.0).abs() < 1e-4, "hue {}", adj.hue);
 
-        // Auto-WB on a warm image → cools it (negative offset, small negative hue).
+        // AUTO (clinical) on a warm image → full neutralization: the exact pick fit
+        // on (0.578,0.216,0.080) is offset ≈ −2.853, hue ≈ +0.009.
         let (mut editor, events) = test_editor();
         editor.set_photo(8, "warm.jpg", &Adjustments::default(), 0.0, false, Some((16, 16)));
         editor.set_wb_sample(linear_fill(16, 16, [0.578, 0.216, 0.080]), 16, 16);
         editor.wb_auto_button.emit_clicked();
-        let adj = find_photo_edit(&events, 8).expect("warm PhotoEdit");
+        let adj = find_photo_edit(&events, 8).expect("warm PhotoEdit (Auto)");
         assert!(adj.wb_offset < -0.3, "offset {}", adj.wb_offset);
-        // Linear pre-tone auto-WB on (0.578,0.216,0.080): pick ≈ −1.545 → auto
-        // offset ≈ −0.777, hue ≈ −0.259 (sampling the tone-processed preview would
-        // have measured a weaker cast and under-corrected).
-        assert!((adj.wb_offset - -0.7771).abs() < 1e-3, "offset {}", adj.wb_offset);
-        assert!((adj.hue - -0.2590).abs() < 1e-3, "hue {}", adj.hue);
+        assert!((adj.wb_offset - -2.852998).abs() < 1e-3, "offset {}", adj.wb_offset);
+        assert!((adj.hue - 0.008614).abs() < 1e-3, "hue {}", adj.hue);
+        // AUTO2 (warm) → 60% of the correction + 0.15 warm bias (offset ≈ −1.562),
+        // keeping the ambience like Nikon AUTO2 "keep warm lighting colors".
+        editor.wb_auto2_button.emit_clicked();
+        let adj = find_photo_edit(&events, 8).expect("warm PhotoEdit (Auto2)");
+        assert!((adj.wb_offset - -1.561799).abs() < 1e-3, "offset {}", adj.wb_offset);
+        assert!((adj.hue - 0.002584).abs() < 1e-3, "hue {}", adj.hue);
 
         // No wb sample → the handler must not emit anything or crash.
         let (mut editor, events) = test_editor();

@@ -186,47 +186,50 @@ pub fn wb_transform3x3(m: &[[f32; 3]; 3], wb: (f32, f32, f32)) -> Option<[f32; 9
     Some(t)
 }
 
-/// Map a picked grey pixel onto the warmth + hue sliders (port of photoup
-/// `wbFromPick`). With the camera color matrix, invert through T = M·diag(wb)·M⁻¹
-/// so the picked pixel lands exactly neutral; without it, fall back to a simple
-/// grey-world balance. Returns `(offset, hue)`.
+/// Map a picked grey pixel onto the warmth + hue sliders. Compute the three gains
+/// that make the pixel neutral — through the camera matrix when available, else
+/// grey-world — then fit them EXACTLY onto the two-parameter warmth/tint model:
 ///
-/// The inputs are LINEAR RGB (0..1) from the pre-tone base sample (see
-/// `Base::linear_sample`) — the WB gains are applied in LINEAR light at decode,
-/// and the tone curves (rolloff, camera S-curve, sRGB) would distort the R/B
-/// ratio and understate a strong cast, so we must NOT feed gamma-encoded bytes.
-/// Clamped to the UI slider ranges: warmth ±4, tint ±1 (photoup used ±2/±2, which
-/// is not enough for photos with an extreme cast).
+/// - `offset = log2(gr/gb)` — warmth, the R gain vs the B gain
+/// - `hue = (2/3)*log2(gr*gb/gg^2)` — tint, the G gain vs the geometric mean of R,B
+///
+/// so the applied gains are proportional to (gr, gg, gb) and the picked pixel
+/// lands neutral. The previous port dropped the blue gain (`_gb`) and read the
+/// cast only through green, which under-stated warmth ~2× on strong casts and
+/// over-stated tint (the ±1 clamp and the editor's hue-halving were band-aids).
+///
+/// Inputs are LINEAR RGB (0..1) from the pre-tone base sample (see
+/// `Base::linear_sample`) — WB is applied in linear light at render/export, and
+/// gamma/tone would distort the R/B ratio. Clamped to the UI slider ranges:
+/// warmth ±4, tint ±1 (photoup used ±2/±2, which is not enough for extreme casts).
 pub fn wb_from_pick(r: f32, g: f32, b: f32, cam_matrix: Option<[[f32; 3]; 3]>) -> (f32, f32) {
-    if let Some(m) = cam_matrix {
-        if let Some(minv) = invert3x3(&m) {
-            // q = M⁻¹·pixel (camera-RGB domain), s = M⁻¹·(1,1,1). Gains that
-            // neutralize: wb = gray·s / q. (Assumes the current WB is neutral.)
+    let gray = (r + g + b) / 3.0;
+    let (gr, gg, gb) = match cam_matrix.and_then(|m| invert3x3(&m)) {
+        // q = M⁻¹·pixel (camera-RGB domain), s = M⁻¹·(1,1,1). Gains that
+        // neutralize: wb = gray·s / q. (Assumes the current WB is neutral.)
+        Some(minv) => {
             let q0 = minv[0][0] * r + minv[0][1] * g + minv[0][2] * b;
             let q1 = minv[1][0] * r + minv[1][1] * g + minv[1][2] * b;
             let q2 = minv[2][0] * r + minv[2][1] * g + minv[2][2] * b;
             let s0 = minv[0][0] + minv[0][1] + minv[0][2];
             let s1 = minv[1][0] + minv[1][1] + minv[1][2];
             let s2 = minv[2][0] + minv[2][1] + minv[2][2];
-            let gray = (r + g + b) / 3.0;
-            let gr = gray * s0 / q0.max(1e-6);
-            let gg = gray * s1 / q1.max(1e-6);
-            let _gb = gray * s2 / q2.max(1e-6);
-            let hue = clamp(-2.0 * gg.max(1e-6).log2(), -1.0, 1.0);
-            let hue_rb = 2.0f32.powf(hue * 0.25);
-            let temp_r = gr / hue_rb.max(1e-6);
-            let offset = clamp(2.0 * temp_r.max(1e-6).log2(), -4.0, 4.0);
-            return (offset, hue);
+            (
+                gray * s0 / q0.max(1e-6),
+                gray * s1 / q1.max(1e-6),
+                gray * s2 / q2.max(1e-6),
+            )
         }
-    }
-    // Grey-world fallback (JPEG / no matrix).
-    let gray = (r + g + b) / 3.0;
-    let hue_g = gray / g.max(1e-6);
-    let hue = clamp(-2.0 * hue_g.log2(), -1.0, 1.0);
-    let hue_rb = 2.0f32.powf(hue * 0.25);
-    let temp_r = gray / (r.max(1e-6) * hue_rb);
-    // tempR = 2^(offset*0.5) → offset = 2*log2(tempR)
-    (clamp(2.0 * temp_r.log2(), -4.0, 4.0), hue)
+        // Grey-world (JPEG / no matrix).
+        None => (
+            gray / r.max(1e-6),
+            gray / g.max(1e-6),
+            gray / b.max(1e-6),
+        ),
+    };
+    let offset = clamp((gr / gb.max(1e-6)).log2(), -4.0, 4.0);
+    let hue = clamp((2.0 / 3.0) * (gr * gb / gg.max(1e-6).powi(2)).log2(), -1.0, 1.0);
+    (offset, hue)
 }
 
 /// Auto WB ("happy day" look, port of photoup `autoWb`): grey-world on a neutral
@@ -368,13 +371,16 @@ mod tests {
 
     #[test]
     fn wb_from_pick_cools_a_warm_cast() {
-        // A red-heavy (warm) neutral area → negative offset (cool the red channel)
-        // and a magenta-ish tint. The input is LINEAR (0.578,0.216,0.080) — the
-        // true sensor cast for (200,128,80) sRGB → offset ≈ −1.55, hue ≈ −0.86
-        // (vs ≈ −1.03/−0.17 if the gamma-encoded bytes were fed in directly).
+        // A red-heavy (warm) neutral area → negative offset (cool the red channel).
+        // The input is LINEAR (0.578,0.216,0.080) — the true sensor cast for
+        // (200,128,80) sRGB. The exact warmth/tint fit is offset = log₂(b/r) ≈ −2.853,
+        // hue = (2/3)·log₂(g²/(r·b)) ≈ +0.009 (this cast is pure warmth — green sits
+        // at the geometric mean of red and blue, so there is no green tint). The old
+        // port read the cast only through green and under-stated warmth ~2× (−1.55)
+        // while over-stating tint (−0.86).
         let (offset, hue) = wb_from_pick(0.578, 0.216, 0.080, None);
-        assert!((offset - -1.5452).abs() < 1e-3, "offset {offset}");
-        assert!((hue - -0.8633).abs() < 1e-3, "hue {hue}");
+        assert!((offset - -2.852998).abs() < 1e-3, "offset {offset}");
+        assert!((hue - 0.008614).abs() < 1e-3, "hue {hue}");
     }
 
     #[test]
