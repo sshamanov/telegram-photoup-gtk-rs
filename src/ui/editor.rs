@@ -10,9 +10,10 @@ use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 
 use gtk4::prelude::*;
-use gtk4::{Box as GBox, Button, DrawingArea, Label, Orientation, Picture, Scale};
+use gtk4::{Box as GBox, Button, DrawingArea, Label, Orientation, Picture};
 
 use crate::image::math::crop_to_pixels;
+use crate::ui::slider::FineSlider;
 use crate::image::process::export_dimensions;
 use crate::image::resize::downscale_rgba;
 use crate::image::srgb::{auto_wb, wb_from_pick};
@@ -178,8 +179,8 @@ fn apply_wb(
     state: &std::sync::Arc<std::sync::RwLock<AppState>>,
     on_event: &std::sync::Arc<dyn Fn(AppEvent) + Send + Sync + 'static>,
     suppress: &Rc<Cell<bool>>,
-    temp: &Scale,
-    hue_scale: &Scale,
+    temp: &FineSlider,
+    hue_scale: &FineSlider,
     wb_lab: &Label,
 ) {
     let offset = offset.clamp(-4.0, 4.0); // warmth range is ±4
@@ -478,9 +479,9 @@ pub struct EditorScreen {
     pub nav_next: Button,
     file_label: Label,
     histogram_area: DrawingArea,
-    exposure_scale: Scale,
-    temp_scale: Scale,
-    hue_scale: Scale,
+    exposure_slider: FineSlider,
+    temp_slider: FineSlider,
+    hue_slider: FineSlider,
     ev_value: Label,
     wb_value: Label,
     info1: Label,
@@ -601,13 +602,11 @@ impl EditorScreen {
 
         // ---- Exposure ----
         panel.append(&section_label("Exposure"));
-        let ev_adj = gtk4::Adjustment::new(0.0, -3.0, 5.0, 0.05, 0.05, 0.0);
-        let exposure_scale = Scale::new(gtk4::Orientation::Horizontal, Some(&ev_adj));
-        exposure_scale.set_value(0.0);
-        exposure_scale.set_draw_value(false);
-        // Mark the zero-correction position (photoup's `zero` center).
-        exposure_scale.add_mark(0.0, gtk4::PositionType::Bottom, None);
-        panel.append(&exposure_scale);
+        // Custom fine slider: drags snap to the 0.05 grid (no GTK Scale
+        // precision-mode / 0-stickiness). The zero-correction position is drawn
+        // as a subtle tick on the track — a reference, not a snap point.
+        let exposure_slider = FineSlider::new(-3.0, 5.0, 0.05);
+        panel.append(&exposure_slider.area());
 
         let ev_row = GBox::new(Orientation::Horizontal, 6);
         let auto_exposure_btn = Button::with_label("Auto");
@@ -630,21 +629,13 @@ impl EditorScreen {
         panel.append(&section_label("White balance"));
         // Warmth range −4..+4: some images need a stronger cool shift than ±2
         // (−2 was still reddish). At −4 red is quartered / blue quadrupled.
-        let temp_adj = gtk4::Adjustment::new(0.0, -4.0, 4.0, 0.05, 0.05, 0.0);
-        let temp_scale = Scale::new(gtk4::Orientation::Horizontal, Some(&temp_adj));
-        temp_scale.set_value(0.0);
-        temp_scale.set_draw_value(false);
-        temp_scale.add_mark(0.0, gtk4::PositionType::Bottom, None);
-        panel.append(&temp_scale);
+        let temp_slider = FineSlider::new(-4.0, 4.0, 0.05);
+        panel.append(&temp_slider.area());
 
         // Tint (hue) is fine-grained: −1..+1 at 0.01 steps (the old −2..+2 was too
         // wide — tinting is a subtle correction).
-        let hue_adj = gtk4::Adjustment::new(0.0, -1.0, 1.0, 0.01, 0.01, 0.0);
-        let hue_scale = Scale::new(gtk4::Orientation::Horizontal, Some(&hue_adj));
-        hue_scale.set_value(0.0);
-        hue_scale.set_draw_value(false);
-        hue_scale.add_mark(0.0, gtk4::PositionType::Bottom, None);
-        panel.append(&hue_scale);
+        let hue_slider = FineSlider::new(-1.0, 1.0, 0.01);
+        panel.append(&hue_slider.area());
 
         let wb_row = GBox::new(Orientation::Horizontal, 6);
         let wb_auto_button = Button::with_label("Auto");
@@ -737,9 +728,9 @@ impl EditorScreen {
             nav_next,
             file_label,
             histogram_area,
-            exposure_scale,
-            temp_scale,
-            hue_scale,
+            exposure_slider,
+            temp_slider,
+            hue_slider,
             ev_value,
             wb_value,
             info1,
@@ -802,9 +793,9 @@ impl EditorScreen {
         self.crop_area.queue_draw();
         self.file_label.set_text(name);
         self.file_label.set_tooltip_text(Some(name));
-        self.exposure_scale.set_value(shown_ev as f64);
-        self.temp_scale.set_value(adjustments.wb_offset as f64);
-        self.hue_scale.set_value(adjustments.hue as f64);
+        self.exposure_slider.set_value(shown_ev as f64);
+        self.temp_slider.set_value(adjustments.wb_offset as f64);
+        self.hue_slider.set_value(adjustments.hue as f64);
         self.suppress.set(false);
         self.refresh_value_labels();
         self.refresh_image_info();
@@ -818,20 +809,20 @@ impl EditorScreen {
     /// value_changed → PhotoEdit (switches to Manual EV, like dragging it by hand).
     /// Steps snap to the 0.05 grid: an auto value like +1.93 → +1.90 (Q) / +1.95 (W).
     pub fn fine_tune_ev(&self, dir: i8) {
-        let v = self.exposure_scale.value();
-        self.exposure_scale.set_value(fine_step(v, dir, 0.05));
+        let v = self.exposure_slider.value();
+        self.exposure_slider.set_value(fine_step(v, dir, 0.05));
     }
 
     /// Fine-tune the warmth (temperature) slider (keyboard A/S), 0.05 grid.
     pub fn fine_tune_wb(&self, dir: i8) {
-        let v = self.temp_scale.value();
-        self.temp_scale.set_value(fine_step(v, dir, 0.05));
+        let v = self.temp_slider.value();
+        self.temp_slider.set_value(fine_step(v, dir, 0.05));
     }
 
     /// Fine-tune the tint (hue) slider (keyboard Z/X) — always fine 0.01 steps.
     pub fn fine_tune_tint(&self, dir: i8) {
-        let v = self.hue_scale.value();
-        self.hue_scale.set_value(fine_step(v, dir, 0.01));
+        let v = self.hue_slider.value();
+        self.hue_slider.set_value(fine_step(v, dir, 0.01));
     }
 
     /// Set the EV indicator ("+0.35 EV"); `{:+.2}` keeps the width fixed so the
@@ -842,7 +833,7 @@ impl EditorScreen {
         self.ev_value.set_text(&format!("{ev:+.2} EV"));
         if self.current_mode.get() != ExposureMode::Manual {
             self.suppress.set(true);
-            self.exposure_scale.set_value(ev as f64);
+            self.exposure_slider.set_value(ev as f64);
             self.suppress.set(false);
         }
     }
@@ -913,11 +904,11 @@ impl EditorScreen {
 
     fn refresh_value_labels(&self) {
         self.ev_value
-            .set_text(&format!("{:+.2} EV", self.exposure_scale.value()));
+            .set_text(&format!("{:+.2} EV", self.exposure_slider.value()));
         self.wb_value.set_text(&format!(
             "{:+.2} · {:+.2}",
-            self.temp_scale.value(),
-            self.hue_scale.value()
+            self.temp_slider.value(),
+            self.hue_slider.value()
         ));
     }
 
@@ -942,9 +933,9 @@ impl EditorScreen {
         let active_id = Rc::clone(&self.active_id);
         let state = Arc::clone(&self.state);
         let suppress = Rc::clone(&self.suppress);
-        let ev = self.exposure_scale.clone();
-        let temp = self.temp_scale.clone();
-        let hue = self.hue_scale.clone();
+        let ev = self.exposure_slider.clone();
+        let temp = self.temp_slider.clone();
+        let hue = self.hue_slider.clone();
         let ev_lab = self.ev_value.clone();
         let wb_lab = self.wb_value.clone();
 
@@ -956,14 +947,14 @@ impl EditorScreen {
             Arc::clone(&state),
             ev_lab.clone(),
         );
-        ev.connect_value_changed(move |sc| {
+        ev.connect_change(move |v| {
             if s.get() {
                 return;
             }
             let Some(id) = a.get() else { return };
             let mut adj = current_adjustments(&st.read().unwrap(), id);
             adj.exposure_mode = ExposureMode::Manual;
-            adj.exposure_ev = sc.value() as f32;
+            adj.exposure_ev = v as f32;
             lab.set_text(&format!("{:+.2} EV", adj.exposure_ev));
             o(AppEvent::PhotoEdit { id, adjustments: adj });
         });
@@ -977,13 +968,13 @@ impl EditorScreen {
             hue.clone(),
             wb_lab.clone(),
         );
-        temp.connect_value_changed(move |sc| {
+        temp.connect_change(move |v| {
             if s.get() {
                 return;
             }
             let Some(id) = a.get() else { return };
             let mut adj = current_adjustments(&st.read().unwrap(), id);
-            adj.wb_offset = sc.value() as f32;
+            adj.wb_offset = v as f32;
             lab.set_text(&format!("{:+.2} · {:+.2}", adj.wb_offset, hue2.value()));
             o(AppEvent::PhotoEdit { id, adjustments: adj });
         });
@@ -997,13 +988,13 @@ impl EditorScreen {
             temp.clone(),
             wb_lab,
         );
-        hue.connect_value_changed(move |sc| {
+        hue.connect_change(move |v| {
             if s.get() {
                 return;
             }
             let Some(id) = a.get() else { return };
             let mut adj = current_adjustments(&st.read().unwrap(), id);
-            adj.hue = sc.value() as f32;
+            adj.hue = v as f32;
             lab.set_text(&format!("{:+.2} · {:+.2}", temp2.value(), adj.hue));
             o(AppEvent::PhotoEdit { id, adjustments: adj });
         });
@@ -1147,8 +1138,8 @@ impl EditorScreen {
         let state_click = Arc::clone(&self.state);
         let on_click = Arc::clone(&self.on_event);
         let area_click = self.crop_area.clone();
-        let temp_click = self.temp_scale.clone();
-        let hue_click = self.hue_scale.clone();
+        let temp_click = self.temp_slider.clone();
+        let hue_click = self.hue_slider.clone();
         let suppress_click = Rc::clone(&self.suppress);
         let wb_lab_click = self.wb_value.clone();
         click.connect_pressed(move |_g, _count, x, y| {
@@ -1188,9 +1179,9 @@ impl EditorScreen {
         let active_id = Rc::clone(&self.active_id);
         let state = Arc::clone(&self.state);
         let suppress = Rc::clone(&self.suppress);
-        let ev = self.exposure_scale.clone();
-        let temp = self.temp_scale.clone();
-        let hue = self.hue_scale.clone();
+        let ev = self.exposure_slider.clone();
+        let temp = self.temp_slider.clone();
+        let hue = self.hue_slider.clone();
         let full_size = Rc::clone(&self.full_size);
         let ev_lab = self.ev_value.clone();
         let wb_lab = self.wb_value.clone();
@@ -1281,8 +1272,8 @@ impl EditorScreen {
             Rc::clone(&self.cam_matrix),
             Rc::clone(&suppress),
             // WB Reset's `let` shadowed + moved `temp`/`hue`, so clone fresh here.
-            self.temp_scale.clone(),
-            self.hue_scale.clone(),
+            self.temp_slider.clone(),
+            self.hue_slider.clone(),
             wb_lab.clone(),
             Rc::clone(&self.crop),
         );

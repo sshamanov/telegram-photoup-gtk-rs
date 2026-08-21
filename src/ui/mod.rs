@@ -12,6 +12,7 @@ pub mod editor;
 pub mod grid;
 pub mod login;
 pub mod main_screen;
+pub mod slider;
 pub mod toast;
 pub mod util;
 
