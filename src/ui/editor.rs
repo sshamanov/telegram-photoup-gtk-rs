@@ -154,45 +154,85 @@ fn auto_wb_feed(
     auto_wb_mean_linear(data, pw, ph, crop)
 }
 
-/// The 7×7 sample window around (cx, cy), clamped to the sample bounds — shared
-/// by `pick_sample_linear` and the `[wb]` debug log.
-fn pick_window(w: u32, h: u32, cx: f64, cy: f64) -> (usize, usize, usize, usize) {
-    const WIN: isize = 7;
-    let sx0 = ((cx.floor() as isize) - WIN / 2).max(0).min((w as isize - WIN).max(0));
-    let sy0 = ((cy.floor() as isize) - WIN / 2).max(0).min((h as isize - WIN).max(0));
+/// A square `win×win` sample window around (cx, cy), clamped to the sample bounds
+/// — shared by `pick_sample_linear` and the `[wb]` debug log.
+fn pick_window_sized(w: u32, h: u32, cx: f64, cy: f64, win: isize) -> (usize, usize, usize, usize) {
+    let sx0 = ((cx.floor() as isize) - win / 2).max(0).min((w as isize - win).max(0));
+    let sy0 = ((cy.floor() as isize) - win / 2).max(0).min((h as isize - win).max(0));
     (
         sx0 as usize,
         sy0 as usize,
-        (sx0 + WIN) as usize,
-        (sy0 + WIN) as usize,
+        (sx0 + win) as usize,
+        (sy0 + win) as usize,
     )
 }
 
-/// Average a fixed 7×7 area of the LINEAR sample around pixel (cx, cy) — the
-/// GIMP-style grey-point picker (photoup `pickNeutral`; larger than one pixel so
-/// noise can't skew the WB). Returns the channel means (0..1), or None if empty.
-fn pick_sample_linear(rgb: &[f32], w: u32, h: u32, cx: f64, cy: f64) -> Option<(f32, f32, f32)> {
-    let (x0, y0, x1, y1) = pick_window(w, h, cx, cy);
-    let (mut sr, mut sg, mut sb) = (0.0f64, 0.0f64, 0.0f64);
+/// Mean of an RGB region plus the largest per-channel standard error of the mean
+/// (std/√N) — the noise proxy the pick grows its window against.
+fn region_mean_stderr(
+    rgb: &[f32],
+    w: u32,
+    h: u32,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+) -> Option<((f32, f32, f32), f32)> {
+    let (mut s, mut s2) = ([0.0f64; 3], [0.0f64; 3]);
     let mut n = 0usize;
     for yy in y0..y1.min(h as usize) {
         let row = yy * w as usize;
         for xx in x0..x1.min(w as usize) {
             let o = (row + xx) * 3;
-            sr += rgb[o] as f64;
-            sg += rgb[o + 1] as f64;
-            sb += rgb[o + 2] as f64;
+            for c in 0..3 {
+                let v = rgb[o + c] as f64;
+                s[c] += v;
+                s2[c] += v * v;
+            }
             n += 1;
         }
     }
     if n == 0 {
         return None;
     }
-    Some((
-        (sr / n as f64) as f32,
-        (sg / n as f64) as f32,
-        (sb / n as f64) as f32,
-    ))
+    let nn = n as f64;
+    let mean = [s[0] / nn, s[1] / nn, s[2] / nn];
+    let sem = (0..3)
+        .map(|c| ((s2[c] / nn - mean[c] * mean[c]).max(0.0)).sqrt() / nn.sqrt())
+        .fold(0.0f64, f64::max) as f32;
+    Some(((mean[0] as f32, mean[1] as f32, mean[2] as f32), sem))
+}
+
+/// Average a square area of the LINEAR sample around pixel (cx, cy) — the
+/// GIMP-style grey-point picker (photoup `pickNeutral`). Starts at 7×7 and grows
+/// while the region looks noisy (its relative standard error of the mean is too
+/// large), so a high-ISO / dark pick stays stable: noise cancels as 1/√N and the
+/// mean converges to the true surface cast instead of jittering. Returns the
+/// channel means (0..1) and the window size used, or None if the region is empty.
+fn pick_sample_linear(
+    rgb: &[f32],
+    w: u32,
+    h: u32,
+    cx: f64,
+    cy: f64,
+) -> Option<((f32, f32, f32), isize)> {
+    const MIN_WIN: isize = 7;
+    const MAX_WIN: isize = 31;
+    const STEP: isize = 6;
+    // Relative standard error of the mean low enough to trust the average.
+    const NOISE_TOL: f32 = 0.01;
+    let mut win = MIN_WIN;
+    loop {
+        let (x0, y0, x1, y1) = pick_window_sized(w, h, cx, cy, win);
+        let Some(((r, g, b), sem)) = region_mean_stderr(rgb, w, h, x0, y0, x1, y1) else {
+            return None;
+        };
+        let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        if sem / lum.max(1e-3) <= NOISE_TOL || win >= MAX_WIN {
+            return Some(((r, g, b), win));
+        }
+        win += STEP;
+    }
 }
 
 /// Per-channel min/max/mean of an interleaved LINEAR RGB sample region — the
@@ -1234,7 +1274,7 @@ impl EditorScreen {
             }
             let cx = nx * *pw as f64;
             let cy = ny * *ph as f64;
-            let Some((r, g, b)) = pick_sample_linear(data, *pw, *ph, cx, cy) else { return };
+            let Some(((r, g, b), win)) = pick_sample_linear(data, *pw, *ph, cx, cy) else { return };
             let gray = (r + g + b) / 3.0;
             if gray < 0.03 || gray > 0.95 {
                 on_click(AppEvent::Toast(
@@ -1243,7 +1283,7 @@ impl EditorScreen {
                 return;
             }
             let cam = cam_matrix3x3(*cam_click.borrow());
-            let (x0, y0, x1, y1) = pick_window(*pw, *ph, cx, cy);
+            let (x0, y0, x1, y1) = pick_window_sized(*pw, *ph, cx, cy, win);
             log_wb_sample_stats("pick", data, *pw, *ph, x0, y0, x1, y1);
             let (offset, hue) = wb_from_pick(r, g, b, cam);
             log::info!(
@@ -1520,10 +1560,36 @@ mod tests {
             (r - 0.578).abs() < 1e-4 && (g - 0.216).abs() < 1e-4 && (b - 0.080).abs() < 1e-4
         );
 
-        // Pick: 7×7 window around the center of a uniform warm block.
-        let (r, g, b) = pick_sample_linear(&warm, 16, 16, 8.0, 8.0).expect("pick sample");
+        // Pick: window around the center of a uniform warm block — no noise, so
+        // the 7×7 window is kept and the mean is the fill colour exactly.
+        let ((r, g, b), win) = pick_sample_linear(&warm, 16, 16, 8.0, 8.0).expect("pick sample");
         assert!(
             (r - 0.578).abs() < 1e-4 && (g - 0.216).abs() < 1e-4 && (b - 0.080).abs() < 1e-4
+        );
+        assert_eq!(win, 7, "uniform fill -> no noise growth");
+    }
+
+    #[test]
+    fn pick_grows_window_on_noisy_region() {
+        // A noisy (high-variance) neutral block: the pick must widen its window
+        // past 7×7 so the mean converges (noise cancels as 1/sqrt(N)) and the WB
+        // doesn't jitter between clicks. Base neutral 0.2159 linear, ±0.1 noise.
+        let mut buf = vec![0f32; 16 * 16 * 3];
+        let mut x = 123u32; // simple LCG for deterministic pseudo-noise
+        for px in buf.chunks_exact_mut(3) {
+            for c in 0..3 {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let n = ((x >> 16) % 20_001) as f32 / 100_000.0 - 0.1; // ±0.1
+                px[c] = (0.2159 + n).clamp(0.0, 1.0);
+            }
+        }
+        let ((r, g, b), win) = pick_sample_linear(&buf, 16, 16, 8.0, 8.0).expect("noisy pick");
+        // Window grew well past 7×7…
+        assert!(win >= 19, "noisy region should grow the window, got {win}");
+        // …and the mean stays close to the true neutral (noise averaged out).
+        assert!(
+            (r - 0.2159).abs() < 0.02 && (g - 0.2159).abs() < 0.02 && (b - 0.2159).abs() < 0.02,
+            "mean ({r:.4},{g:.4},{b:.4}) drifted from 0.2159"
         );
     }
 
