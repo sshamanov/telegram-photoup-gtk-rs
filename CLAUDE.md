@@ -103,12 +103,23 @@ below passes.
 ## Verification rule
 
 **Claude verifies visually with VLM.** When a change could visibly differ, take
-real screenshots or render before/after images and inspect them yourself (the
-`Read` tool displays images) before calling the change done — do not assert
-visual correctness without looking. App screenshots: `PHOTOUP2_DEV=1 cargo run`
-on the Xvfb display, then capture with `import -window root out/x.png`. The
-user's real NEF/CR2/JPEG samples stay local in `./samples/` (gitignored) and
-are the source of truth for RAW parity with photoup.
+real screenshots or render before/after images and inspect them via the VLM
+before calling the change done — do not assert visual correctness without
+looking. (The `Read` tool may not display images on some model backends; the VLM
+endpoint always works.)
+
+- **VLM** (dev-time only, from ../photoup): OpenAI-compatible vision API
+  `https://<vlm-endpoint>/api/chat/completions`, `model: "vision"`,
+  `Authorization: Bearer sk-REDACTED`. Send the image as
+  `{"type":"image_url","image_url":{"url":"data:image/png;base64,<b64>"}}` in a
+  message, ask for per-image severity/neutrality ratings.
+- App screenshots: `PHOTOUP2_DEV=1 cargo run` on the Xvfb display, capture with
+  `import -window root out/x.png`. Renders of a sample photo with different WB
+  settings: `cargo test --lib wb_debug_render_before_after -- --nocapture` →
+  `out/wb_before_after/`.
+
+The user's real NEF/CR2/JPEG samples stay local in `./samples/` (gitignored)
+and are the source of truth for RAW parity with photoup.
 
 ## Commit discipline
 

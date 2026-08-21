@@ -301,6 +301,8 @@ mod tests {
                 ("as-shot", 0.0, 0.0),
                 ("old-pick", old_off, old_hue),
                 ("new-pick", new_off, new_hue),
+                // Auto2 (warm, Nikon AUTO2 style): 60% of the pick + 0.15 warm bias.
+                ("auto2-warm", 0.6 * new_off + 0.15, 0.3 * new_hue),
             ] {
                 let adj = Adjustments {
                     exposure_mode: crate::image::types::ExposureMode::Manual,
