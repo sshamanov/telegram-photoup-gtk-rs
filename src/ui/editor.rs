@@ -182,7 +182,7 @@ fn apply_wb(
     hue_scale: &Scale,
     wb_lab: &Label,
 ) {
-    let offset = offset.clamp(-2.0, 2.0);
+    let offset = offset.clamp(-4.0, 4.0); // warmth range is ±4
     let hue = hue.clamp(-1.0, 1.0); // tint range is ±1 (slider is −1..+1)
     suppress.set(true);
     temp.set_value(offset as f64);
@@ -601,7 +601,7 @@ impl EditorScreen {
 
         // ---- Exposure ----
         panel.append(&section_label("Exposure"));
-        let ev_adj = gtk4::Adjustment::new(0.0, -3.0, 5.0, 0.05, 0.5, 0.0);
+        let ev_adj = gtk4::Adjustment::new(0.0, -3.0, 5.0, 0.05, 0.05, 0.0);
         let exposure_scale = Scale::new(gtk4::Orientation::Horizontal, Some(&ev_adj));
         exposure_scale.set_value(0.0);
         exposure_scale.set_draw_value(false);
@@ -628,7 +628,9 @@ impl EditorScreen {
 
         // ---- White balance ----
         panel.append(&section_label("White balance"));
-        let temp_adj = gtk4::Adjustment::new(0.0, -2.0, 2.0, 0.05, 0.5, 0.0);
+        // Warmth range −4..+4: some images need a stronger cool shift than ±2
+        // (−2 was still reddish). At −4 red is quartered / blue quadrupled.
+        let temp_adj = gtk4::Adjustment::new(0.0, -4.0, 4.0, 0.05, 0.05, 0.0);
         let temp_scale = Scale::new(gtk4::Orientation::Horizontal, Some(&temp_adj));
         temp_scale.set_value(0.0);
         temp_scale.set_draw_value(false);
@@ -636,8 +638,8 @@ impl EditorScreen {
         panel.append(&temp_scale);
 
         // Tint (hue) is fine-grained: −1..+1 at 0.01 steps (the old −2..+2 was too
-        // wide — tinting is a subtle correction). Temperature stays −2..+2.
-        let hue_adj = gtk4::Adjustment::new(0.0, -1.0, 1.0, 0.01, 0.1, 0.0);
+        // wide — tinting is a subtle correction).
+        let hue_adj = gtk4::Adjustment::new(0.0, -1.0, 1.0, 0.01, 0.01, 0.0);
         let hue_scale = Scale::new(gtk4::Orientation::Horizontal, Some(&hue_adj));
         hue_scale.set_value(0.0);
         hue_scale.set_draw_value(false);

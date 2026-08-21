@@ -75,8 +75,9 @@ point.
    - Row: **Auto** (active when mode=auto) | **Slide** (aggressive) | **Rest**
      (photoup's label — reset exposure) | the current EV value (e.g. `+2.7`).
 4. Section "**White balance**":
-   - Temperature slider, −2..+2, step 0.05, zero-centered.
-   - Hue slider, −2..+2, step 0.05, zero-centered.
+   - Temperature (warmth) slider, **−4..+4**, step 0.05, zero-centered (wider than
+     photoup's ±2 — some images need a stronger cool shift).
+   - Hue (tint) slider, **−1..+1**, step 0.01, zero-centered (fine-grained).
    - Row: **Auto** (auto-WB) | **Pick** (neutral picker mode) | **Reset** | the
      current WB display.
 5. Section "**Crop**":
