@@ -111,6 +111,217 @@ mod tests {
     use super::*;
     use image::ImageEncoder;
 
+    /// TEMPORARY debug aid: reproduce the editor's WB pick/auto on every real RAW
+    /// sample and print the linear-sample stats that feed the math, so we can see
+    /// the actual cast the picker measures (issue: pick/auto under-report warm casts).
+    #[test]
+    fn wb_debug_print_sample_casts() {
+        use crate::image::math::fit_within;
+        use crate::image::process::{Base, RawBase};
+        use crate::image::srgb::{auto_wb, wb_from_pick};
+
+        let mut files = Vec::new();
+        for dir in ["samples", "../photoup/samples"] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if matches!(
+                        p.extension().and_then(|s| s.to_str()),
+                        Some("NEF") | Some("nef") | Some("CR2") | Some("cr2")
+                    ) {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+        files.sort();
+        println!("[wb-debug] {} RAW sample(s)", files.len());
+        for path in &files {
+            let Ok(data) = std::fs::read(path) else { continue };
+            let Ok(decoded) =
+                decode_raw(&data, &RawDecodeOpts { full_size: false, user_mul: None })
+            else {
+                println!("=== {} decode failed", path.display());
+                continue;
+            };
+            let cam3 = decoded.cam_matrix.map(|m| [
+                [m[0][0] as f32, m[0][1] as f32, m[0][2] as f32],
+                [m[1][0] as f32, m[1][1] as f32, m[1][2] as f32],
+                [m[2][0] as f32, m[2][1] as f32, m[2][2] as f32],
+            ]);
+            let base = RawBase::new(decoded);
+            let (w, h) = fit_within(base.width(), base.height(), 96);
+            let sample = base.linear_sample(Size { width: w, height: h });
+            let np = ((w * h) as usize).max(1);
+
+            // Full-sample min/max/mean per channel.
+            let (mut mn, mut mx, mut sm) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3], [0.0f64; 3]);
+            // Neutral-filtered mean (the auto path's reference) + per-pixel pick sweep.
+            let (mut fsr, mut fsg, mut fsb) = (0.0f64, 0.0f64, 0.0f64);
+            let mut fnn = 0u32;
+            let (mut p_off, mut p_hue) = (Vec::with_capacity(np), Vec::with_capacity(np));
+            let (mut nc, mut c_lo, mut c_hi, mut hc) = (0u32, 0u32, 0u32, 0u32);
+            for px in sample.chunks_exact(3) {
+                let (r, g, b) = (px[0], px[1], px[2]);
+                for c in 0..3 {
+                    mn[c] = mn[c].min(px[c]);
+                    mx[c] = mx[c].max(px[c]);
+                    sm[c] += px[c] as f64;
+                }
+                if r.max(g).max(b) - r.min(g).min(b) < 0.2 && 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.1 {
+                    fsr += r as f64;
+                    fsg += g as f64;
+                    fsb += b as f64;
+                    fnn += 1;
+                }
+                let (o, hh) = wb_from_pick(r, g, b, cam3);
+                if o <= -3.99 { c_lo += 1; }
+                if o >= 3.99 { c_hi += 1; }
+                if hh.abs() >= 0.99 { hc += 1; }
+                nc += 1;
+                p_off.push(o);
+                p_hue.push(hh);
+            }
+            let m = |c: usize| sm[c] / np as f64;
+            println!("=== {}", path.display());
+            println!(
+                "  linear sample {}x{}: mean r={:.4} g={:.4} b={:.4} | min r={:.4} g={:.4} b={:.4} | max r={:.4} g={:.4} b={:.4}",
+                w, h, m(0), m(1), m(2), mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]
+            );
+            println!(
+                "  ratios: mean r/g={:.3} b/g={:.3} | neutral-ish pixels {} of {} ({:.1}%)",
+                m(0) / m(1).max(1e-6), m(2) / m(1).max(1e-6), fnn, np, 100.0 * fnn as f64 / np as f64
+            );
+            let (fdr, fdg, fdb) = (fsr / fnn.max(1) as f64, fsg / fnn.max(1) as f64, fsb / fnn.max(1) as f64);
+            let (fmr, fmg, fmb) = (sm[0] / np as f64, sm[1] / np as f64, sm[2] / np as f64);
+            let (a1, b1) = wb_from_pick(fmr as f32, fmg as f32, fmb as f32, cam3);
+            let (a2, b2) = wb_from_pick(fdr as f32, fdg as f32, fdb as f32, cam3);
+            let (a1g, b1g) = wb_from_pick(fmr as f32, fmg as f32, fmb as f32, None);
+            let (a2g, b2g) = wb_from_pick(fdr as f32, fdg as f32, fdb as f32, None);
+            let (aa1, ab1) = auto_wb(fmr as f32, fmg as f32, fmb as f32, cam3);
+            let (aa2, ab2) = auto_wb(fdr as f32, fdg as f32, fdb as f32, cam3);
+            println!(
+                "  pick full mean: matrix={:.3}/{:.3} grey-world={:.3}/{:.3} | neutral mean(n={}): matrix={:.3}/{:.3} grey-world={:.3}/{:.3}",
+                a1, b1, a1g, b1g, fnn, a2, b2, a2g, b2g
+            );
+            println!(
+                "  auto_wb(full mean)={:.3}/{:.3} | auto_wb(neutral mean)={:.3}/{:.3}",
+                aa1, ab1, aa2, ab2
+            );
+            if let Some(c) = cam3 {
+                println!("  cam_matrix: {:?}", c);
+            }
+            p_off.sort_by(|a, b| a.total_cmp(b));
+            p_hue.sort_by(|a, b| a.total_cmp(b));
+            let q = |v: &[f32], t: f32| v[((v.len() - 1) as f32 * t) as usize];
+            println!(
+                "  per-pixel pick offset: p10={:.3} p50={:.3} p90={:.3} | clamps off<-4:{} off>+4:{} hue±1:{} ({} px)",
+                q(&p_off, 0.10), q(&p_off, 0.50), q(&p_off, 0.90), c_lo, c_hi, hc, nc
+            );
+        }
+        assert!(files.len() >= 0); // informational only
+    }
+
+    /// TEMPORARY: render every RAW sample as-shot vs old-pick vs new-pick WB to
+    /// PNGs the user can visually verify (the pick's warmth was under-stated ~2×).
+    #[test]
+    fn wb_debug_render_before_after() {
+        use crate::image::math::{clamp, fit_within};
+        use crate::image::process::{Base, RawBase};
+        use crate::image::srgb::wb_from_pick;
+        use crate::image::types::Adjustments;
+
+        let mut files = Vec::new();
+        for dir in ["samples", "../photoup/samples"] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if matches!(
+                        p.extension().and_then(|s| s.to_str()),
+                        Some("NEF") | Some("nef") | Some("CR2") | Some("cr2")
+                    ) {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+        files.sort();
+        let outdir = std::path::Path::new("out").join("wb_before_after");
+        std::fs::create_dir_all(&outdir).ok();
+        for path in files {
+            let Ok(data) = std::fs::read(&path) else { continue };
+            let Ok(decoded) =
+                decode_raw(&data, &RawDecodeOpts { full_size: false, user_mul: None })
+            else {
+                continue;
+            };
+            let cam3 = decoded.cam_matrix.map(|m| [
+                [m[0][0] as f32, m[0][1] as f32, m[0][2] as f32],
+                [m[1][0] as f32, m[1][1] as f32, m[1][2] as f32],
+                [m[2][0] as f32, m[2][1] as f32, m[2][2] as f32],
+            ]);
+            let base = RawBase::new(decoded);
+            let (w, h) = fit_within(base.width(), base.height(), 48);
+            let sample = base.linear_sample(Size { width: w, height: h });
+            let n = ((w * h) as usize).max(1);
+            let mut sm = [0.0f64; 3];
+            for px in sample.chunks_exact(3) {
+                for c in 0..3 {
+                    sm[c] += px[c] as f64;
+                }
+            }
+            let (mr, mg, mb) = (sm[0] / n as f64, sm[1] / n as f64, sm[2] / n as f64);
+
+            // New pick (the fix) vs the previous mapping (which dropped gb).
+            let (new_off, new_hue) = wb_from_pick(mr as f32, mg as f32, mb as f32, cam3);
+            let (gr, gg, gb) = match cam3.and_then(|m| crate::image::srgb::invert3x3(&m)) {
+                Some(minv) => {
+                    let q0 = minv[0][0] * mr as f32 + minv[0][1] * mg as f32 + minv[0][2] * mb as f32;
+                    let q1 = minv[1][0] * mr as f32 + minv[1][1] * mg as f32 + minv[1][2] * mb as f32;
+                    let q2 = minv[2][0] * mr as f32 + minv[2][1] * mg as f32 + minv[2][2] * mb as f32;
+                    let s0 = minv[0][0] + minv[0][1] + minv[0][2];
+                    let s1 = minv[1][0] + minv[1][1] + minv[1][2];
+                    let s2 = minv[2][0] + minv[2][1] + minv[2][2];
+                    let gray = (mr as f32 + mg as f32 + mb as f32) / 3.0;
+                    (gray * s0 / q0.max(1e-6), gray * s1 / q1.max(1e-6), gray * s2 / q2.max(1e-6))
+                }
+                None => {
+                    let gray = (mr as f32 + mg as f32 + mb as f32) / 3.0;
+                    (gray / mr as f32, gray / mg as f32, gray / mb as f32)
+                }
+            };
+            let old_hue = clamp(-2.0 * gg.max(1e-6).log2(), -1.0, 1.0);
+            let old_rb = 2.0f32.powf(old_hue * 0.25);
+            let old_off = clamp(2.0 * (gr / old_rb).log2(), -4.0, 4.0);
+            println!("old={old_off:.3}/{old_hue:.3} new={new_off:.3}/{new_hue:.3} ({})", path.display());
+
+            let (rw, rh) = fit_within(base.width(), base.height(), 480);
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("photo");
+            for (tag, off, hue) in [
+                ("as-shot", 0.0, 0.0),
+                ("old-pick", old_off, old_hue),
+                ("new-pick", new_off, new_hue),
+            ] {
+                let adj = Adjustments {
+                    exposure_mode: crate::image::types::ExposureMode::Manual,
+                    exposure_ev: 0.0,
+                    wb_offset: off,
+                    hue,
+                    crop: None,
+                };
+                let r = base.render_with_ev(None, Size { width: rw, height: rh }, &adj, None);
+                let fname = outdir.join(format!("{stem}-{tag}.png"));
+                if let Ok(f) = std::fs::File::create(&fname) {
+                    let mut w = std::io::BufWriter::new(f);
+                    image::codecs::png::PngEncoder::new(&mut w)
+                        .write_image(&r.rgba, rw, rh, image::ExtendedColorType::Rgba8)
+                        .expect("write png");
+                }
+                println!("  wrote {}", fname.display());
+            }
+        }
+    }
+
     fn make_png_png(w: u32, h: u32) -> Vec<u8> {
         // Build a solid red PNG using the image crate's encoder.
         let mut buf = Vec::new();
