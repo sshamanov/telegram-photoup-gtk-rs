@@ -1459,8 +1459,10 @@ mod tests {
         editor.wb_auto_button.emit_clicked();
         let adj = find_photo_edit(&events, 8).expect("warm PhotoEdit");
         assert!(adj.wb_offset < -0.3, "offset {}", adj.wb_offset);
-        assert!((adj.wb_offset - -0.4652).abs() < 1e-3, "offset {}", adj.wb_offset);
-        assert!((adj.hue - -0.0525).abs() < 1e-3, "hue {}", adj.hue);
+        // Linearized auto-WB on (200,128,80): offset ≈ −0.776, hue ≈ −0.259
+        // (the raw-sRGB values were ≈ −0.465 / −0.053 — under-corrected).
+        assert!((adj.wb_offset - -0.776).abs() < 1e-3, "offset {}", adj.wb_offset);
+        assert!((adj.hue - -0.259).abs() < 1e-3, "hue {}", adj.hue);
 
         // No preview pixels → the handler must not emit anything or crash.
         let (mut editor, events) = test_editor();

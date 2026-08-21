@@ -190,24 +190,35 @@ pub fn wb_transform3x3(m: &[[f32; 3]; 3], wb: (f32, f32, f32)) -> Option<[f32; 9
 /// `wbFromPick`). With the camera color matrix, invert through T = M·diag(wb)·M⁻¹
 /// so the picked pixel lands exactly neutral; without it, fall back to a simple
 /// grey-world balance. Returns `(offset, hue)`.
+/// sRGB byte (0..255) → linear (0..1) via the shared LUT.
+fn byte_to_linear(v: f32) -> f32 {
+    srgb_to_linear()[v.round().clamp(0.0, 255.0) as usize]
+}
+
+/// Map a picked neutral pixel (as sRGB bytes 0..255 from the preview) onto the
+/// warmth + hue sliders. The WB gains are applied in LINEAR light at decode, but
+/// a gamma-encoded sample understates a cast (e.g. (200,160,120) → ≈ −0.6 raw but
+/// ≈ −1.2 once linearized), so the input is linearized first. Clamped to the UI
+/// slider ranges: warmth ±4, tint ±1 (photoup used ±2/±2, which is not enough for
+/// photos with an extreme cast).
 pub fn wb_from_pick(r: f32, g: f32, b: f32, cam_matrix: Option<[[f32; 3]; 3]>) -> (f32, f32) {
+    let lr = byte_to_linear(r);
+    let lg = byte_to_linear(g);
+    let lb = byte_to_linear(b);
     if let Some(m) = cam_matrix {
         if let Some(minv) = invert3x3(&m) {
             // q = M⁻¹·pixel (camera-RGB domain), s = M⁻¹·(1,1,1). Gains that
             // neutralize: wb = gray·s / q. (Assumes the current WB is neutral.)
-            let q0 = minv[0][0] * r + minv[0][1] * g + minv[0][2] * b;
-            let q1 = minv[1][0] * r + minv[1][1] * g + minv[1][2] * b;
-            let q2 = minv[2][0] * r + minv[2][1] * g + minv[2][2] * b;
+            let q0 = minv[0][0] * lr + minv[0][1] * lg + minv[0][2] * lb;
+            let q1 = minv[1][0] * lr + minv[1][1] * lg + minv[1][2] * lb;
+            let q2 = minv[2][0] * lr + minv[2][1] * lg + minv[2][2] * lb;
             let s0 = minv[0][0] + minv[0][1] + minv[0][2];
             let s1 = minv[1][0] + minv[1][1] + minv[1][2];
             let s2 = minv[2][0] + minv[2][1] + minv[2][2];
-            let gray = (r + g + b) / 3.0;
+            let gray = (lr + lg + lb) / 3.0;
             let gr = gray * s0 / q0.max(1e-6);
             let gg = gray * s1 / q1.max(1e-6);
             let _gb = gray * s2 / q2.max(1e-6);
-            // Clamp to the UI slider ranges: warmth ±4, tint ±1. photoup used ±2/±2
-            // but that's not enough for photos with an extreme cast (the pick then
-            // "does nothing useful" while the slider can go further).
             let hue = clamp(-2.0 * gg.max(1e-6).log2(), -1.0, 1.0);
             let hue_rb = 2.0f32.powf(hue * 0.25);
             let temp_r = gr / hue_rb.max(1e-6);
@@ -216,11 +227,11 @@ pub fn wb_from_pick(r: f32, g: f32, b: f32, cam_matrix: Option<[[f32; 3]; 3]>) -
         }
     }
     // Grey-world fallback (JPEG / no matrix).
-    let gray = (r + g + b) / 3.0;
-    let hue_g = gray / g.max(1.0);
+    let gray = (lr + lg + lb) / 3.0;
+    let hue_g = gray / lg.max(1e-6);
     let hue = clamp(-2.0 * hue_g.log2(), -1.0, 1.0);
     let hue_rb = 2.0f32.powf(hue * 0.25);
-    let temp_r = gray / (r.max(1.0) * hue_rb);
+    let temp_r = gray / (lr.max(1e-6) * hue_rb);
     // tempR = 2^(offset*0.5) → offset = 2*log2(tempR)
     (clamp(2.0 * temp_r.log2(), -4.0, 4.0), hue)
 }
@@ -362,12 +373,13 @@ mod tests {
 
     #[test]
     fn wb_from_pick_cools_a_warm_cast() {
-        // A red-heavy (warm) neutral area should map to a negative offset (cool the
-        // red channel) and a small magenta-ish hue correction. Hand-checked against
-        // the photoup formula: gray=136, hueG=136/128, tempR=136/(200*2^(hue/4)).
+        // A red-heavy (warm) neutral area → negative offset (cool the red channel)
+        // and a magenta-ish tint. The input is linearized first (the WB gains are
+        // applied in linear light): (200,128,80) sRGB → linear (0.578,0.216,0.080)
+        // → offset ≈ −1.54, hue ≈ −0.86 (vs ≈ −1.03/−0.17 from raw sRGB bytes).
         let (offset, hue) = wb_from_pick(200.0, 128.0, 80.0, None);
-        assert!((offset - -1.0253).abs() < 1e-3, "offset {offset}");
-        assert!((hue - -0.1749).abs() < 1e-3, "hue {hue}");
+        assert!((offset - -1.5434).abs() < 1e-3, "offset {offset}");
+        assert!((hue - -0.8632).abs() < 1e-3, "hue {hue}");
     }
 
     #[test]
