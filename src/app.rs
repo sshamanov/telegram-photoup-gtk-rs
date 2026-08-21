@@ -18,7 +18,7 @@ use crate::image::decode::{decode_jpeg, decode_raw, RawDecodeOpts};
 use crate::image::encode::{encode_jpeg_444_adaptive, MAX_PHOTO_BYTES};
 use crate::image::math::fit_within;
 use crate::image::pool::ImagePool;
-use crate::image::process::{compute_histogram, export_dimensions, Base, JpegBase, RawBase};
+use crate::image::process::{compute_histogram_rgb, crop_rect, export_dimensions, Base, JpegBase, RawBase};
 use crate::image::srgb::export_wb_mul;
 use crate::image::types::{Adjustments, ExposureMode, Size, SourceType};
 use crate::state::{
@@ -31,7 +31,6 @@ use crate::ui::login::LoginScreen;
 use crate::ui::main_screen::MainScreen;
 use crate::ui::toast::Toast;
 
-/// Longest edge of an interactive preview render.
 // Editor preview: live slider edits render at LIVE_EDGE (512px — snappy), then
 // upgrade to the sharp FINAL_EDGE (1024px) once the edit settles (~400ms idle).
 const LIVE_EDGE: u32 = 512;
@@ -1405,8 +1404,23 @@ impl AppController {
             &mut *self.state.write().unwrap(),
             AppEvent::Usage(UsageStats { sent, ..Default::default() }),
         );
-        // The send is over: the temp files are no longer needed.
-        self.cleanup_send_temp_files();
+        // On success the temp files were uploaded — delete them. On failure, keep
+        // the exported JPEGs so nothing is lost (the user can re-send from the
+        // files), and tell them where they are.
+        if result.is_ok() {
+            self.cleanup_send_temp_files();
+        } else {
+            let kept = std::mem::take(&mut self.send_temp_paths);
+            if !kept.is_empty() {
+                let dir = kept
+                    .first()
+                    .and_then(|p| p.parent())
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_default();
+                log::warn!("send failed — {} exported JPEGs kept in {dir}", kept.len());
+                self.toast.show(&format!("Send failed — {} JPEGs kept in {dir}", kept.len()));
+            }
+        }
 
         // Remove only the photos that were actually sent (photoup keeps the rest
         // with their edits); worker-level failures stay.
@@ -1842,7 +1856,7 @@ fn run_thumb_job(
     let (w, h) = fit_within(base.width(), base.height(), 512);
     let r = base.render(None, Size { width: w, height: h }, &Adjustments::default());
     let t_render = t0.elapsed();
-    let hist = compute_histogram(&r.rgba);
+    let hist = compute_histogram_rgb(&r.rgba);
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
     log::info!(
         "[timing] thumb {name} {source_type:?} read {:.3}s decode {:.3}s render {:.3}s total {:.3}s",
@@ -1883,15 +1897,34 @@ fn run_preview_job(
     let t_decode = t0.elapsed();
     let full = (base.width(), base.height());
     let (w, h) = fit_within(base.width(), base.height(), FINAL_EDGE);
-    let r = base.render(None, Size { width: w, height: h }, adjustments);
+    let ev_override = crop_aware_auto_ev(base.as_ref(), adjustments);
+    let r = base.render_with_ev(None, Size { width: w, height: h }, adjustments, ev_override);
     let t_render = t0.elapsed();
-    let hist = compute_histogram(&r.rgba);
+    let hist = compute_histogram_rgb(&r.rgba);
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
     log::info!(
         "[timing] preview {name} {source_type:?} read+decode {:.3}s render {:.3}s total {:.3}s",
         t_decode.as_secs_f64(), t_render.as_secs_f64(), t_render.as_secs_f64()
     );
     Ok((r.rgba, (w, h), full, r.auto_ev, hist, cam, cam_matrix, base))
+}
+
+/// The auto-exposure EV computed over the CROP region, so the preview's exposure
+/// reacts to what's actually in the frame after cropping. `None` in Manual mode
+/// (the user's EV is theirs) or when no crop is set (auto over the full frame).
+fn crop_aware_auto_ev(base: &dyn Base, adjustments: &Adjustments) -> Option<f32> {
+    if adjustments.exposure_mode == ExposureMode::Manual {
+        return None;
+    }
+    let crop = adjustments.crop?;
+    let rect = crop_rect(base.width(), base.height(), Some(&crop));
+    let tiny = fit_within(rect.width, rect.height, 128);
+    let r = base.render(
+        Some(&crop),
+        Size { width: tiny.0, height: tiny.1 },
+        adjustments,
+    );
+    Some(r.auto_ev)
 }
 
 /// Render a preview from an already-decoded base — no re-decode, so slider edits
@@ -1907,9 +1940,10 @@ fn run_render_job(
     let t0 = std::time::Instant::now();
     let full = (base.width(), base.height());
     let (w, h) = fit_within(base.width(), base.height(), edge);
-    let r = base.render(None, Size { width: w, height: h }, adjustments);
+    let ev_override = crop_aware_auto_ev(base.as_ref(), adjustments);
+    let r = base.render_with_ev(None, Size { width: w, height: h }, adjustments, ev_override);
     let t_render = t0.elapsed();
-    let hist = compute_histogram(&r.rgba);
+    let hist = compute_histogram_rgb(&r.rgba);
     log::info!(
         "[timing] preview (cached base) render {:.3}s total {:.3}s",
         t_render.as_secs_f64(), t_render.as_secs_f64()
@@ -2012,7 +2046,9 @@ mod tests {
         let (rgba, size, full, _ev, hist, cam) = run_thumb_job(&path, SourceType::Jpeg).unwrap();
         assert!(size.0 <= 512 && size.1 <= 512, "size {size:?}");
         assert_eq!(rgba.len(), (size.0 * size.1 * 4) as usize);
-        assert_eq!(hist.iter().sum::<u32>(), size.0 * size.1);
+        // RGB histogram: 768 bins, and every pixel lands in R, G, AND B → 3×.
+        assert_eq!(hist.len(), 768);
+        assert_eq!(hist.iter().sum::<u32>(), size.0 * size.1 * 3);
         assert_eq!(cam, None);
         assert_eq!(full, (2048, 1024), "JPEG reports native dims");
     }

@@ -16,6 +16,18 @@ pub trait Base: Send + Sync {
         crop: Option<&NormalizedCrop>,
         size: Size,
         adjustments: &Adjustments,
+    ) -> RenderResult {
+        self.render_with_ev(crop, size, adjustments, None)
+    }
+    /// Like `render`, but `ev` overrides the effective exposure EV. The editor's
+    /// preview uses this to apply a crop-aware auto-EV (computed over the cropped
+    /// region) while still displaying the full frame under the crop overlay.
+    fn render_with_ev(
+        &self,
+        crop: Option<&NormalizedCrop>,
+        size: Size,
+        adjustments: &Adjustments,
+        ev: Option<f32>,
     ) -> RenderResult;
 }
 
@@ -97,11 +109,12 @@ impl Base for JpegBase {
         self.height
     }
 
-    fn render(
+    fn render_with_ev(
         &self,
         crop: Option<&NormalizedCrop>,
         size: Size,
         adjustments: &Adjustments,
+        ev_override: Option<f32>,
     ) -> RenderResult {
         let rect = crop_rect(self.width, self.height, crop);
         let aggressive = adjustments.exposure_mode == ExposureMode::Aggressive;
@@ -130,6 +143,7 @@ impl Base for JpegBase {
 
         let lums = sample_luminances_rgba(src, rect.width, rect.height);
         let auto_ev = auto_ev_for(&lums, aggressive);
+        let auto_ev = ev_override.unwrap_or(auto_ev);
         let ev = effective_ev(adjustments.exposure_mode, adjustments.exposure_ev, auto_ev);
 
         // Downscale the (cropped) source to the target size in sRGB space.
@@ -223,11 +237,12 @@ impl Base for RawBase {
         self.height
     }
 
-    fn render(
+    fn render_with_ev(
         &self,
         crop: Option<&NormalizedCrop>,
         size: Size,
         adjustments: &Adjustments,
+        ev_override: Option<f32>,
     ) -> RenderResult {
         let rect = crop_rect(self.width, self.height, crop);
         let aggressive = adjustments.exposure_mode == ExposureMode::Aggressive;
@@ -241,6 +256,7 @@ impl Base for RawBase {
             },
         );
         let auto_ev = auto_ev_for(&lums, aggressive);
+        let auto_ev = ev_override.unwrap_or(auto_ev);
         let ev = effective_ev(adjustments.exposure_mode, adjustments.exposure_ev, auto_ev);
 
         let r = downscale_crop(
@@ -307,11 +323,25 @@ impl Base for RawBase {
 }
 
 /// 256-bin luminance histogram over the final sRGB pixels (photoup `computeHistogram`).
+/// 256-bin LUMINANCE histogram (0.2126R + 0.7152G + 0.0722B). Kept for a revert;
+/// the editor now shows the RGB histogram by default.
 pub fn compute_histogram(rgba: &[u8]) -> Vec<u32> {
     let mut bins = vec![0u32; 256];
     for px in rgba.chunks_exact(4) {
         let l = (0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32) as usize;
         bins[l.min(255)] += 1;
+    }
+    bins
+}
+
+/// 3×256 RGB histogram (R then G then B, 768 bins total) over the final sRGB
+/// pixels. The editor draws the three channels overlaid.
+pub fn compute_histogram_rgb(rgba: &[u8]) -> Vec<u32> {
+    let mut bins = vec![0u32; 768];
+    for px in rgba.chunks_exact(4) {
+        bins[px[0] as usize] += 1;
+        bins[256 + px[1] as usize] += 1;
+        bins[512 + px[2] as usize] += 1;
     }
     bins
 }

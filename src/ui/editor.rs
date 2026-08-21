@@ -12,6 +12,7 @@ use std::sync::{Arc, RwLock};
 use gtk4::prelude::*;
 use gtk4::{Box as GBox, Button, DrawingArea, Label, Orientation, Picture, Scale};
 
+use crate::image::math::crop_to_pixels;
 use crate::image::process::export_dimensions;
 use crate::image::resize::downscale_rgba;
 use crate::image::srgb::{auto_wb, wb_from_pick};
@@ -51,10 +52,23 @@ fn cam_matrix3x3(m: Option<[[f32; 4]; 3]>) -> Option<[[f32; 3]; 3]> {
 /// Grey-world reference for auto-WB (photoup `autoWhiteBalance`): downscale the
 /// preview to ≤64×64, average only near-neutral bright pixels, and fall back to
 /// the whole-image mean when too few qualify. Returns the channel means (0..255).
-fn auto_wb_mean(rgba: &[u8], w: u32, h: u32) -> Option<(f32, f32, f32)> {
-    // Downscale to ≤64×64 (photoup draws the preview to a 64×64 canvas).
-    let (dw, dh) = (w.min(64), h.min(64));
-    let down = downscale_rgba(rgba, w, h, dw, dh);
+fn auto_wb_mean(rgba: &[u8], w: u32, h: u32, crop: Option<&NormalizedCrop>) -> Option<(f32, f32, f32)> {
+    // Restrict to the crop region when one is set: WB auto must react to what's
+    // actually in the frame after cropping, not the out-of-crop area.
+    let (cw, ch, cropped) = match crop {
+        Some(c) => {
+            let rect = crop_to_pixels(c, w, h);
+            let mut buf = Vec::with_capacity((rect.width * rect.height * 4) as usize);
+            for y in 0..rect.height as usize {
+                let src_off = ((rect.y as usize + y) * w as usize + rect.x as usize) * 4;
+                buf.extend_from_slice(&rgba[src_off..src_off + rect.width as usize * 4]);
+            }
+            (rect.width, rect.height, buf)
+        }
+        None => (w, h, rgba.to_vec()),
+    };
+    let (dw, dh) = (cw.min(64), ch.min(64));
+    let down = downscale_rgba(&cropped, cw, ch, dw, dh);
     let mut sr = 0.0f64;
     let mut sg = 0.0f64;
     let mut sb = 0.0f64;
@@ -554,7 +568,7 @@ impl EditorScreen {
 
         // ---- Exposure ----
         panel.append(&section_label("Exposure"));
-        let ev_adj = gtk4::Adjustment::new(0.0, -3.0, 5.0, 0.1, 0.5, 0.0);
+        let ev_adj = gtk4::Adjustment::new(0.0, -3.0, 5.0, 0.05, 0.5, 0.0);
         let exposure_scale = Scale::new(gtk4::Orientation::Horizontal, Some(&ev_adj));
         exposure_scale.set_value(0.0);
         exposure_scale.set_draw_value(false);
@@ -793,23 +807,37 @@ impl EditorScreen {
         self.preview.set_paintable(None::<&gdk4::Texture>);
     }
 
+    /// RGB histogram (768 bins: 256 R, 256 G, 256 B) drawn as three translucent
+    /// channels overlaid — the default editor view. The luminance histogram
+    /// (`compute_histogram`, 256 bins) is kept in the pipeline for a revert.
     pub fn set_histogram(&self, bins: &[u32]) {
         let bins: Vec<u32> = bins.to_vec();
         self.histogram_area.set_draw_func(move |_area, cr, width, height| {
             let h = height as f64;
             let w = width as f64;
-            cr.set_source_rgb(0.1, 0.1, 0.1);
+            cr.set_source_rgb(0.08, 0.08, 0.08);
             let _ = cr.paint();
-            let max = bins.iter().copied().max().unwrap_or(1).max(1) as f64;
-            cr.set_source_rgb(0.9, 0.9, 0.9);
-            let n = bins.len().max(1);
-            for (i, &v) in bins.iter().enumerate() {
-                let x0 = (i as f64 / n as f64) * w;
-                let x1 = ((i + 1) as f64 / n as f64) * w;
-                let bh = (v as f64 / max) * h;
-                cr.rectangle(x0, h - bh, (x1 - x0).max(1.0), bh);
+            if bins.len() < 256 * 3 {
+                return; // luminance (256-bin) data or none — nothing to draw
             }
-            let _ = cr.fill();
+            let max = bins.iter().copied().max().unwrap_or(1).max(1) as f64;
+            let n = 256.0;
+            let channels = [
+                ((0.95, 0.30, 0.30), 0usize),   // R
+                ((0.30, 0.90, 0.40), 256),       // G
+                ((0.35, 0.45, 0.95), 512),       // B
+            ];
+            for (rgb, off) in channels {
+                cr.set_source_rgba(rgb.0, rgb.1, rgb.2, 0.5);
+                for i in 0..256usize {
+                    let v = bins[off + i];
+                    let x0 = (i as f64 / n) * w;
+                    let x1 = ((i + 1) as f64 / n) * w;
+                    let bh = (v as f64 / max) * h;
+                    cr.rectangle(x0, h - bh, (x1 - x0).max(1.0), bh);
+                }
+                let _ = cr.fill();
+            }
         });
     }
 
@@ -957,7 +985,12 @@ impl EditorScreen {
             if picking_begin.get() {
                 return;
             }
-            let Some(c) = *crop_begin.borrow() else { return };
+            // The box is interactive from the start: with no crop set it's the full
+            // frame ({0,0,1,1}) — press/drag/resize works without pressing a preset.
+            let c = match *crop_begin.borrow() {
+                Some(c) => c,
+                None => NormalizedCrop { x: 0.0, y: 0.0, width: 1.0, height: 1.0 },
+            };
             let Some(full) = full_begin.get() else { return };
             let (aw, ah) = (area_begin.width() as f64, area_begin.height() as f64);
             let Some(p) = project(aw, ah, full) else { return };
@@ -1175,7 +1208,7 @@ impl EditorScreen {
         // WB Auto: grey-world over near-neutral bright pixels of the preview,
         // biased warm ("happy day"). Falls back to the whole-image mean if too few
         // neutral pixels (photoup `autoWhiteBalance`).
-        let (a, o, st, prgba, cm, s, temp, hue, lab) = (
+        let (a, o, st, prgba, cm, s, temp, hue, lab, croprc) = (
             Rc::clone(&active_id),
             Arc::clone(&on_event),
             Arc::clone(&state),
@@ -1186,11 +1219,13 @@ impl EditorScreen {
             self.temp_scale.clone(),
             self.hue_scale.clone(),
             wb_lab.clone(),
+            Rc::clone(&self.crop),
         );
         self.wb_auto_button.connect_clicked(move |_| {
             let Some(id) = a.get() else { return };
             let Some((data, pw, ph)) = &*prgba.borrow() else { return };
-            let Some((r, g, b)) = auto_wb_mean(data, *pw, *ph) else { return };
+            let crop = *croprc.borrow();
+            let Some((r, g, b)) = auto_wb_mean(data, *pw, *ph, crop.as_ref()) else { return };
             let (wb_offset, wb_hue) =
                 auto_wb(r, g, b, cam_matrix3x3(*cm.borrow()));
             apply_wb(id, wb_offset, wb_hue, &st, &o, &s, &temp, &hue, &lab);
@@ -1320,12 +1355,12 @@ mod tests {
     fn wb_mean_helpers_sample() {
         // Neutral gray: all pixels qualify as near-neutral → mean is exactly gray.
         let gray = rgba_fill(16, 16, [128, 128, 128]);
-        let (r, g, b) = auto_wb_mean(&gray, 16, 16).expect("gray sample");
+        let (r, g, b) = auto_wb_mean(&gray, 16, 16, None).expect("gray sample");
         assert!((r - 128.0).abs() < 0.5 && (g - 128.0).abs() < 0.5 && (b - 128.0).abs() < 0.5);
 
         // Saturated warm: max-min = 120 > 60 → no neutral pixels → whole-image mean.
         let warm = rgba_fill(16, 16, [200, 128, 80]);
-        let (r, g, b) = auto_wb_mean(&warm, 16, 16).expect("warm sample");
+        let (r, g, b) = auto_wb_mean(&warm, 16, 16, None).expect("warm sample");
         assert!((r - 200.0).abs() < 0.5 && (g - 128.0).abs() < 0.5 && (b - 80.0).abs() < 0.5);
 
         // Pick: 7×7 window around the center of a uniform warm block.
