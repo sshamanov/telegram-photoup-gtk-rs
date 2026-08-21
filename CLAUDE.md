@@ -92,13 +92,23 @@ Three Kingdoms threading (borrowed from mpd-client), all in one Rust crate
   (sRGB primaries + gamma), `output_bps=16`, `no_auto_bright=1`, `half_size`
   (interactive only; exports pass `full_size`), `user_qual=3`.
 
+## Dev instance & delivery
+
+This repo is developed on a **headless dev instance** — an Xvfb display, but no
+physical screen/desktop for the user. The user's machine syncs this repo via
+git (`pull` from `origin/main`) and runs the app there. So the delivery loop is
+**commit → push → user pulls → user runs**; only commit once the visual check
+below passes.
+
 ## Verification rule
 
-**No VLM.** The user verifies image output by looking at real renders. When a
-change could visibly differ, produce real before/after images (or an app
-screenshot) for the user to inspect — do not assert visual correctness from a
-model. The user's real NEF/CR2/JPEG samples stay local in `./samples/`
-(gitignored) and are the source of truth for RAW parity with photoup.
+**Claude verifies visually with VLM.** When a change could visibly differ, take
+real screenshots or render before/after images and inspect them yourself (the
+`Read` tool displays images) before calling the change done — do not assert
+visual correctness without looking. App screenshots: `PHOTOUP2_DEV=1 cargo run`
+on the Xvfb display, then capture with `import -window root out/x.png`. The
+user's real NEF/CR2/JPEG samples stay local in `./samples/` (gitignored) and
+are the source of truth for RAW parity with photoup.
 
 ## Commit discipline
 
