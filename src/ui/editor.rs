@@ -516,10 +516,13 @@ impl EditorScreen {
         root.set_margin_bottom(8);
         root.set_margin_start(8);
         root.set_margin_end(8);
+        root.add_css_class("dark-bg");
 
         // Left: live preview (contain, like photoup's object-fit: contain) with a
         // transparent crop-selection overlay on top (photoup's `.stage` + `.crop-box`).
+        // The stage reads as a dark development bed; the photo is the brightest thing.
         let overlay = gtk4::Overlay::new();
+        overlay.add_css_class("editor-stage");
         overlay.set_vexpand(true);
         overlay.set_hexpand(true);
         let preview = Picture::new();
@@ -554,6 +557,7 @@ impl EditorScreen {
         panel_scroll.set_hexpand(false);
         panel_scroll.set_vexpand(true);
         let panel = GBox::new(Orientation::Vertical, 10);
+        panel.add_css_class("editor-panel");
         panel.set_width_request(332);
         panel.set_hexpand(false);
         panel.set_margin_start(4);
@@ -569,7 +573,8 @@ impl EditorScreen {
         let histogram_area = DrawingArea::new();
         histogram_area.set_height_request(120);
         histogram_area.set_draw_func(|_area, cr, _width, _height| {
-            cr.set_source_rgb(0.15, 0.15, 0.15);
+            // Warm near-black bed (Darkroom bg) so the RGB channels glow.
+            cr.set_source_rgb(0.086, 0.075, 0.059);
             let _ = cr.paint();
         });
         panel.append(&histogram_area);
@@ -823,7 +828,8 @@ impl EditorScreen {
         self.histogram_area.set_draw_func(move |_area, cr, width, height| {
             let h = height as f64;
             let w = width as f64;
-            cr.set_source_rgb(0.08, 0.08, 0.08);
+            // Warm near-black bed (Darkroom bg) — the RGB channels glow against it.
+            cr.set_source_rgb(0.086, 0.075, 0.059);
             let _ = cr.paint();
             if bins.len() < 256 * 3 {
                 return; // luminance (256-bin) data or none — nothing to draw
@@ -836,7 +842,7 @@ impl EditorScreen {
                 ((0.35, 0.45, 0.95), 512),       // B
             ];
             for (rgb, off) in channels {
-                cr.set_source_rgba(rgb.0, rgb.1, rgb.2, 0.5);
+                cr.set_source_rgba(rgb.0, rgb.1, rgb.2, 0.62);
                 for i in 0..256usize {
                     let v = bins[off + i];
                     let x0 = (i as f64 / n) * w;

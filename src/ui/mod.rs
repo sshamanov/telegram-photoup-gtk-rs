@@ -19,6 +19,10 @@ const APP_ID: &str = "dev.shamanov.photoup2";
 
 pub fn run() -> glib::ExitCode {
     adw::init().expect("adw init");
+    // Darkroom: force a dark base so every libadwaita widget renders dark
+    // underneath our warm CSS palette (the CSS provider then adds the amber
+    // accent + surfaces).
+    adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(|app| {
         // Single-instance: re-activate (dock click / relaunch) just re-presents.
@@ -45,6 +49,7 @@ fn build_window(app: &adw::Application, state: Arc<RwLock<AppState>>) {
         .default_width(1100)
         .default_height(760)
         .build();
+    window.add_css_class("dark-bg");
 
     let ctl = Rc::new(RefCell::new(AppController::new(state, window.clone())));
     ctl.borrow_mut().setup(Rc::clone(&ctl));

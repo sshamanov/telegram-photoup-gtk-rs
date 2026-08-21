@@ -19,19 +19,10 @@ impl Toast {
         label.set_visible(false);
         overlay.add_overlay(&label);
 
-        // Give the toast a dark rounded pill so it reads over the grid.
-        let css = gtk4::CssProvider::new();
-        css.load_from_string(
-            ".toast { background-color: rgba(20,20,20,0.85); color: white; \
-             border-radius: 14px; padding: 8px 18px; font-weight: 600; }",
-        );
-        if let Some(display) = gtk4::gdk::Display::default() {
-            gtk4::style_context_add_provider_for_display(
-                &display,
-                &css,
-                gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-            );
-        }
+        // The `.toast` pill (dark + amber accent + slide-in/fade) lives in the
+        // shared Darkroom theme in grid::install_css() — install it here so the
+        // style is registered even if the toast is shown before the grid builds.
+        crate::ui::grid::install_css();
 
         Self { overlay, label }
     }

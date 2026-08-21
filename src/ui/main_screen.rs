@@ -12,7 +12,9 @@ pub struct MainScreen {
     pub upload_zone: Button,
     pub reset_button: Button,
     pub logout_button: Button,
-    /// UsageIndicator-equivalent: "● Processing {name} ({n} queued)".
+    /// UsageIndicator row: amber pulsing dot + muted "Processing {name} …" text.
+    pub usage_row: gtk4::Box,
+    pub usage_dot: Label,
     pub usage_label: Label,
     pub send_button: Button,
     /// Progress bar shown next to the Send button while an album is uploading.
@@ -28,12 +30,15 @@ impl MainScreen {
         root.set_margin_bottom(0);
         root.set_margin_start(16);
         root.set_margin_end(16);
+        root.add_css_class("dark-bg");
 
-        // Header: title + actions (group selector / Reset / Logout).
+        // Header: title + actions (group selector / Reset / Logout) on a raised
+        // darkroom control strip.
         let header = GBox::new(Orientation::Horizontal, 10);
+        header.add_css_class("header");
         header.set_margin_bottom(10);
         let title = Label::new(Some("photoup"));
-        title.add_css_class("title-1");
+        title.add_css_class("title-app");
         header.append(&title);
 
         let spacer = GBox::new(Orientation::Horizontal, 0);
@@ -41,6 +46,7 @@ impl MainScreen {
         header.append(&spacer);
 
         let send_to = Label::new(Some("Send to"));
+        send_to.add_css_class("dim-label");
         header.append(&send_to);
         let group_dropdown = gtk4::DropDown::default();
         group_dropdown.set_tooltip_text(Some("Target group…"));
@@ -70,12 +76,22 @@ impl MainScreen {
         upload_zone.set_child(Some(&zone_box));
         root.append(&upload_zone);
 
-        // Usage indicator: hidden while nothing is being processed.
+        // Usage indicator: amber pulsing dot + muted mono text on one row.
+        // Hidden as a whole while nothing is being processed (the controller
+        // toggles `usage_row` visibility).
+        let usage_row = GBox::new(Orientation::Horizontal, 6);
+        usage_row.set_halign(gtk4::Align::Start);
+        let usage_dot = Label::new(Some("●"));
+        usage_dot.add_css_class("usage-dot");
         let usage_label = Label::new(Some(""));
-        usage_label.add_css_class("usage-dot");
+        usage_label.add_css_class("usage-text");
+        usage_label.set_hexpand(true);
         usage_label.set_halign(gtk4::Align::Start);
-        usage_label.set_visible(false);
-        root.append(&usage_label);
+        usage_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        usage_row.append(&usage_dot);
+        usage_row.append(&usage_label);
+        usage_row.set_visible(false);
+        root.append(&usage_row);
 
         // Thumbnail grid (lazy-virtualized).
         let (grid, grid_store) = crate::ui::grid::build_grid(on_toggle);
@@ -93,10 +109,12 @@ impl MainScreen {
         footer.set_margin_top(8);
         footer.set_margin_bottom(12);
         let send_button = Button::with_label("Send 0 selected");
-        send_button.add_css_class("suggested-action");
+        // The amber Send bar (darkroom footer CTA).
+        send_button.add_css_class("btn-send");
         send_button.set_hexpand(true);
         send_button.set_sensitive(false);
         let send_progress = ProgressBar::new();
+        send_progress.add_css_class("send-progress");
         send_progress.set_width_request(150);
         send_progress.set_show_text(false);
         send_progress.set_visible(false);
@@ -110,6 +128,8 @@ impl MainScreen {
             upload_zone,
             reset_button,
             logout_button,
+            usage_row,
+            usage_dot,
             usage_label,
             send_button,
             send_progress,

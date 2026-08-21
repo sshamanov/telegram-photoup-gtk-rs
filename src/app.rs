@@ -814,17 +814,19 @@ impl AppController {
         };
         if pending.is_empty() {
             self.main_screen.usage_label.set_text("");
-            self.main_screen.usage_label.set_visible(false);
+            self.main_screen.usage_row.set_visible(false);
         } else {
             let extra = if pending.len() > 1 {
                 format!(" ({} queued)", pending.len() - 1)
             } else {
                 String::new()
             };
+            // The amber pulsing "●" is a separate widget (`.usage-dot`) in the
+            // row; this label only carries the muted mono text.
             self.main_screen
                 .usage_label
-                .set_text(&format!("● Processing {}{extra}", pending[0]));
-            self.main_screen.usage_label.set_visible(true);
+                .set_text(&format!("Processing {}{extra}", pending[0]));
+            self.main_screen.usage_row.set_visible(true);
         }
     }
 
