@@ -525,6 +525,9 @@ impl EditorScreen {
         let preview = Picture::new();
         preview.set_vexpand(true);
         preview.set_hexpand(true);
+        // Don't let the full-res texture's natural width force the layout — the
+        // preview shrinks to whatever the left side has left over.
+        preview.set_can_shrink(true);
         preview.set_content_fit(gtk4::ContentFit::Contain);
         overlay.set_child(Some(&preview));
         let crop_area = DrawingArea::new();
@@ -545,9 +548,14 @@ impl EditorScreen {
         // window must keep its 332px minimum, or the preview picture (which
         // requests its full texture width) would squeeze the panel away.
         let panel_scroll = gtk4::ScrolledWindow::new();
+        // Fixed-width side panel: non-expanding so it stays 332px and the left
+        // preview takes all remaining space.
         panel_scroll.set_width_request(332);
+        panel_scroll.set_hexpand(false);
+        panel_scroll.set_vexpand(true);
         let panel = GBox::new(Orientation::Vertical, 10);
         panel.set_width_request(332);
+        panel.set_hexpand(false);
         panel.set_margin_start(4);
 
         let file_label = Label::new(Some(""));
