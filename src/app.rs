@@ -717,24 +717,6 @@ impl AppController {
                     if decoded {
                         self.editor.set_cam_matrix(cam_matrix);
                     }
-                    // Live render was 512px (fast). Once the edit settles (~400ms
-                    // of no new input), upgrade to the sharp 1024px preview.
-                    if let Some(src) = self.settle_source.take() {
-                        src.remove();
-                    }
-                    let settle_gen = preview_gen;
-                    let Some(w) = self.ctl.as_ref().and_then(|w| w.upgrade()) else {
-                        return;
-                    };
-                    let src = glib::timeout_add_local_once(
-                        std::time::Duration::from_millis(400),
-                        move || {
-                            let mut ctl = w.borrow_mut();
-                            ctl.settle_source = None;
-                            ctl.submit_settle(settle_gen);
-                        },
-                    );
-                    self.settle_source = Some(src);
                 }
                 // Keep the grid thumbnail in sync with the edited preview; state
                 // now holds the edited render, so the row must show it too.
@@ -1152,6 +1134,25 @@ impl AppController {
                         Err(msg) => UiEvent::JobFailed { id, msg },
                     });
                 });
+                // Live render was 512px — once the edit settles (~400ms of no new
+                // input), upgrade to the sharp 1024px preview. The settle's OWN
+                // PreviewReady does NOT schedule another settle, so this fires once
+                // per live render — not in an endless loop.
+                if let Some(src) = self.settle_source.take() {
+                    src.remove();
+                }
+                let settle_gen = preview_gen;
+                if let Some(w) = self.ctl.as_ref().and_then(|w| w.upgrade()) {
+                    let src = glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(400),
+                        move || {
+                            let mut ctl = w.borrow_mut();
+                            ctl.settle_source = None;
+                            ctl.submit_settle(settle_gen);
+                        },
+                    );
+                    self.settle_source = Some(src);
+                }
                 return;
             }
             // Stale cache (active photo changed) — drop it and decode+render below.
