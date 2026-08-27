@@ -18,7 +18,10 @@ use crate::image::decode::{decode_jpeg, decode_raw, RawDecodeOpts};
 use crate::image::encode::{encode_jpeg_444_adaptive, MAX_PHOTO_BYTES};
 use crate::image::math::fit_within;
 use crate::image::pool::ImagePool;
-use crate::image::process::{compute_histogram_rgb, crop_rect, export_dimensions, Base, JpegBase, RawBase};
+use crate::image::process::{
+    compute_histogram_rgb, crop_rect, export_dimensions, rotate_dims, Base, JpegBase, RawBase,
+    RotatedBase,
+};
 use crate::image::srgb::export_wb_mul;
 use crate::image::types::{Adjustments, ExposureMode, Size, SourceType};
 use crate::state::{
@@ -85,7 +88,7 @@ pub enum UiEvent {
         /// Present only on the decode path; the controller caches it as the active
         /// photo's base so subsequent slider edits render from memory. `None` on
         /// render-only jobs (the base was already cached).
-        base: Option<Box<dyn Base>>,
+        base: Option<Arc<dyn Base>>,
         preview_gen: u64,
     },
     /// A downscaled LINEAR (0..1) RGB sample of the active photo's decoded base —
@@ -172,6 +175,11 @@ pub struct AppController {
     /// from memory instead of re-decoding the source every time. Dropped when the
     /// active photo changes/removes to return the memory.
     active_base: Option<(u64, Arc<dyn Base>)>,
+    /// `(id, rotation)` the active photo's WB sample was last taken at. The WB
+    /// sample is DISPLAY-oriented; a rotate must re-sample it (the controller
+    /// can't re-decode, so it re-runs the cheap box-filter downscale from the
+    /// cached base) or the pick/auto would read a stale orientation.
+    last_wb_rotation: Option<(u64, u8)>,
 
     /// Weak self-handle so async (debounce) callbacks can reach back in.
     ctl: Option<Weak<RefCell<AppController>>>,
@@ -274,6 +282,7 @@ impl AppController {
             render_debounce: None,
             render_gen: 0,
             active_base: None,
+            last_wb_rotation: None,
             ctl: None,
         };
 
@@ -755,16 +764,49 @@ impl AppController {
                 // only on a decode/re-cache — a re-cache happens on photo switch,
                 // so this never spams during slider drags.
                 if is_active
-                    && let Some(b) = base
+                    && let Some(arc) = base
                 {
-                    let arc = Arc::from(b);
+                    // The WB sample must be DISPLAY-oriented (so the editor's
+                    // click→sample mapping stays direct); wrap the raw base with the
+                    // photo's current rotation when sampling.
+                    let rotation = {
+                        let st = self.state.read().unwrap();
+                        idx.and_then(|i| st.photos.get(i)).map_or(0, |p| p.adjustments.rotation)
+                    };
                     let arc_job = Arc::clone(&arc);
                     let tx = self.ui_events_sender.clone();
                     self.pool.submit(move || {
-                        let (rgba, w, h) = run_wb_sample_job(arc_job);
+                        let (rgba, w, h) = run_wb_sample_job(arc_job, rotation);
                         let _ = tx.send(UiEvent::WbSample { id, rgba, w, h });
                     });
                     self.active_base = Some((id, arc));
+                    self.last_wb_rotation = Some((id, rotation));
+                } else if is_active
+                    && let Some((cid, arc)) = self.active_base.take()
+                {
+                    if cid == id {
+                        // Render-only job (no re-decode): re-kick the WB sample only
+                        // if the photo's rotation changed since the last sample — the
+                        // cached base doesn't move, but its DISPLAY orientation does.
+                        let rotation = {
+                            let st = self.state.read().unwrap();
+                            idx.and_then(|i| st.photos.get(i)).map_or(0, |p| p.adjustments.rotation)
+                        };
+                        if self.last_wb_rotation != Some((id, rotation)) {
+                            self.active_base = Some((id, Arc::clone(&arc)));
+                            let arc_job = Arc::clone(&arc);
+                            let tx = self.ui_events_sender.clone();
+                            self.pool.submit(move || {
+                                let (rgba, w, h) = run_wb_sample_job(arc_job, rotation);
+                                let _ = tx.send(UiEvent::WbSample { id, rgba, w, h });
+                            });
+                            self.last_wb_rotation = Some((id, rotation));
+                        } else {
+                            self.active_base = Some((cid, arc));
+                        }
+                    }
+                    // cid != id: stale cache for a photo that's no longer active —
+                    // drop it (active_base stays None, like the submit_preview path).
                 }
                 if is_active {
                     self.editor.set_preview(Some(&crate::ui::util::rgba_to_texture(
@@ -1951,7 +1993,7 @@ fn run_preview_job(
         Vec<u32>,
         Option<[f32; 4]>,
         Option<[[f32; 4]; 3]>,
-        Box<dyn Base>,
+        Arc<dyn Base>,
     ),
     String,
 > {
@@ -1959,10 +2001,15 @@ fn run_preview_job(
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     let (base, cam, cam_matrix) = decode_base(&data, source_type, false, None)?;
     let t_decode = t0.elapsed();
-    let full = (base.width(), base.height());
-    let (w, h) = fit_within(base.width(), base.height(), FINAL_EDGE);
-    let ev_override = crop_aware_auto_ev(base.as_ref(), adjustments);
-    let r = base.render_with_ev(None, Size { width: w, height: h }, adjustments, ev_override);
+    // The preview renders in DISPLAY space: `full` carries the rotated dims and
+    // the target size is aspect-matched to them; the base itself stays unrotated
+    // so it can be cached and re-wrapped as rotation changes.
+    let arc_base: Arc<dyn Base> = Arc::from(base);
+    let full = rotate_dims(arc_base.width(), arc_base.height(), adjustments.rotation);
+    let (w, h) = fit_within(full.0, full.1, FINAL_EDGE);
+    let wrapped = RotatedBase::new(Arc::clone(&arc_base), adjustments.rotation);
+    let ev_override = crop_aware_auto_ev(&wrapped, adjustments);
+    let r = wrapped.render_with_ev(None, Size { width: w, height: h }, adjustments, ev_override);
     let t_render = t0.elapsed();
     let hist = compute_histogram_rgb(&r.rgba);
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
@@ -1970,7 +2017,7 @@ fn run_preview_job(
         "[timing] preview {name} {source_type:?} read+decode {:.3}s render {:.3}s total {:.3}s",
         t_decode.as_secs_f64(), t_render.as_secs_f64(), t_render.as_secs_f64()
     );
-    Ok((r.rgba, (w, h), full, r.auto_ev, hist, cam, cam_matrix, base))
+    Ok((r.rgba, (w, h), full, r.auto_ev, hist, cam, cam_matrix, arc_base))
 }
 
 /// The auto-exposure EV computed over the CROP region, so the preview's exposure
@@ -2002,10 +2049,11 @@ fn run_render_job(
     edge: u32,
 ) -> Result<(Vec<u8>, (u32, u32), (u32, u32), f32, Vec<u32>), String> {
     let t0 = std::time::Instant::now();
-    let full = (base.width(), base.height());
-    let (w, h) = fit_within(base.width(), base.height(), edge);
-    let ev_override = crop_aware_auto_ev(base.as_ref(), adjustments);
-    let r = base.render_with_ev(None, Size { width: w, height: h }, adjustments, ev_override);
+    let full = rotate_dims(base.width(), base.height(), adjustments.rotation);
+    let (w, h) = fit_within(full.0, full.1, edge);
+    let wrapped = RotatedBase::new(base, adjustments.rotation);
+    let ev_override = crop_aware_auto_ev(&wrapped, adjustments);
+    let r = wrapped.render_with_ev(None, Size { width: w, height: h }, adjustments, ev_override);
     let t_render = t0.elapsed();
     let hist = compute_histogram_rgb(&r.rgba);
     log::info!(
@@ -2018,9 +2066,13 @@ fn run_render_job(
 /// Downscale the active photo's decoded base to a ≤96px LINEAR (0..1) RGB sample
 /// for the WB pick/auto. Interleaved RGB, `w*h*3` length. Runs on a pool worker;
 /// cheap (a box-filtered downscale), so it can fire alongside the first preview.
-fn run_wb_sample_job(base: Arc<dyn Base>) -> (Vec<f32>, u32, u32) {
-    let (w, h) = fit_within(base.width(), base.height(), WB_SAMPLE_EDGE);
-    let rgba = base.linear_sample(Size { width: w, height: h });
+/// The sample is DISPLAY-oriented (the base is wrapped with the photo's rotation)
+/// so the editor's click→sample mapping stays direct.
+fn run_wb_sample_job(base: Arc<dyn Base>, rotation: u8) -> (Vec<f32>, u32, u32) {
+    let (dw, dh) = rotate_dims(base.width(), base.height(), rotation);
+    let (w, h) = fit_within(dw, dh, WB_SAMPLE_EDGE);
+    let wrapped = RotatedBase::new(base, rotation);
+    let rgba = wrapped.linear_sample(Size { width: w, height: h });
     (rgba, w, h)
 }
 
@@ -2059,9 +2111,13 @@ fn run_export_job(
     };
     let (base, _, _) = decode_base(&data, source_type, true, user_mul)?;
     let t_decode = t0.elapsed();
-    let size = export_dimensions(base.width(), base.height(), adjustments.crop.as_ref(), EXPORT_EDGE);
+    // Exports render in DISPLAY space too: fit the rotated dims, wrap the base so
+    // the crop (normalized, display-space) and rotation apply together.
+    let full = rotate_dims(base.width(), base.height(), adjustments.rotation);
+    let size = export_dimensions(full.0, full.1, adjustments.crop.as_ref(), EXPORT_EDGE);
     let render_adj = export_render_adjustments(source_type, user_mul, adjustments);
-    let r = base.render(render_adj.crop.as_ref(), size, &render_adj);
+    let wrapped = RotatedBase::new(Arc::from(base), adjustments.rotation);
+    let r = wrapped.render(render_adj.crop.as_ref(), size, &render_adj);
     let t_render = t0.elapsed();
     let mut rgb = Vec::with_capacity((size.width * size.height * 3) as usize);
     for px in r.rgba.chunks_exact(4) {

@@ -580,6 +580,39 @@ fn crop_preset_handler(
     }
 }
 
+/// A rotate-button handler: adds `delta` quarter-turns CW (1 = 90° CW, 3 = 90°
+/// CCW) to the photo's rotation. Rotation swaps the display dims for odd deltas,
+/// so the Image section and the crop overlay must re-project against the new
+/// dims immediately — the controller re-renders the preview, but the editor's
+/// `full_size` cell is only refreshed here (set_photo runs once per photo).
+fn rotate_handler(
+    delta: u8,
+    active_id: Rc<Cell<Option<u64>>>,
+    state: Arc<RwLock<AppState>>,
+    on_event: Arc<dyn Fn(AppEvent) + Send + Sync + 'static>,
+    full_size: Rc<Cell<Option<(u32, u32)>>>,
+    crop_area: DrawingArea,
+    info1: Label,
+    info2: Label,
+    is_raw: Rc<Cell<bool>>,
+) -> impl Fn(&Button) + 'static {
+    move |_| {
+        let Some(id) = active_id.get() else { return };
+        let mut adj = current_adjustments(&state.read().unwrap(), id);
+        adj.rotation = (adj.rotation + delta) % 4;
+        if let Some((fw, fh)) = full_size.get() {
+            // rotate_dims(display, delta): odd deltas swap W/H, even keep them.
+            let (nfw, nfh) = if delta % 2 == 1 { (fh, fw) } else { (fw, fh) };
+            full_size.set(Some((nfw, nfh)));
+            let src = if is_raw.get() { "RAW" } else { "JPEG" };
+            info1.set_text(&format!("{src} · {} × {}", nfw, nfh));
+            info2.set_text(&output_line((nfw, nfh), adj.crop));
+        }
+        crop_area.queue_draw();
+        on_event(AppEvent::PhotoEdit { id, adjustments: adj });
+    }
+}
+
 pub struct EditorScreen {
     pub root: GBox,
     pub preview: Picture,
@@ -606,6 +639,8 @@ pub struct EditorScreen {
     crop_23: Button,
     crop_32: Button,
     crop_orig: Button,
+    rotate_ccw: Button,
+    rotate_cw: Button,
     reject_button: Button,
     close_button: Button,
     /// Current photo id (set by `set_photo`), read by the signal closures.
@@ -688,10 +723,8 @@ impl EditorScreen {
         panel_scroll.set_hexpand(false);
         panel_scroll.set_vexpand(true);
         let panel = GBox::new(Orientation::Vertical, 10);
-        panel.add_css_class("editor-panel");
         panel.set_width_request(332);
         panel.set_hexpand(false);
-        panel.set_margin_start(4);
 
         let file_label = Label::new(Some(""));
         file_label.add_css_class("editor-file");
@@ -783,6 +816,19 @@ impl EditorScreen {
         }
         panel.append(&presets);
 
+        // ---- Rotate ---- (user rotation on top of any EXIF/libraw flip)
+        panel.append(&section_label("Rotate"));
+        let rotate_row = GBox::new(Orientation::Horizontal, 6);
+        let rotate_ccw = Button::with_label("↺ CCW");
+        let rotate_cw = Button::with_label("↻ CW");
+        rotate_ccw.set_tooltip_text(Some("Rotate 90° counter-clockwise"));
+        rotate_cw.set_tooltip_text(Some("Rotate 90° clockwise"));
+        rotate_ccw.set_hexpand(true);
+        rotate_cw.set_hexpand(true);
+        rotate_row.append(&rotate_ccw);
+        rotate_row.append(&rotate_cw);
+        panel.append(&rotate_row);
+
         // ---- Image ----
         panel.append(&section_label("Image"));
         let info = GBox::new(Orientation::Vertical, 2);
@@ -796,6 +842,21 @@ impl EditorScreen {
         info.append(&info2);
         panel.append(&info);
 
+        panel_scroll.set_child(Some(&panel));
+
+        // Right column: the scrollable control panel on top, and a FIXED bottom
+        // block (hints + nav + reject/close) below it — pinned to the bottom of
+        // the editor and always reachable even when the panel scrolls on short
+        // windows. The framed background wraps the whole column so the bottom
+        // block reads as part of the same panel.
+        let right_col = GBox::new(Orientation::Vertical, 8);
+        right_col.add_css_class("editor-panel");
+        right_col.set_width_request(332);
+        right_col.set_hexpand(false);
+        right_col.set_vexpand(true);
+        right_col.set_margin_start(4);
+        right_col.append(&panel_scroll);
+
         // Hint (crop-interaction hint; crop drag is deferred in the port).
         let hint = Label::new(Some(
             "Drag handles to resize · drag inside to move · Shift keeps ratio",
@@ -803,14 +864,16 @@ impl EditorScreen {
         hint.add_css_class("dim-label");
         hint.set_halign(gtk4::Align::Start);
         hint.set_wrap(true);
-        panel.append(&hint);
 
         // Keyboard fine-tune hint.
         let kb_hint = Label::new(Some("Fine-tune: Q/W exposure · A/S warmth · Z/X tint"));
         kb_hint.add_css_class("dim-label");
         kb_hint.set_halign(gtk4::Align::Start);
         kb_hint.set_wrap(true);
-        panel.append(&kb_hint);
+
+        let bottom_block = GBox::new(Orientation::Vertical, 6);
+        bottom_block.append(&hint);
+        bottom_block.append(&kb_hint);
 
         // Nav: ‹ Prev | Next ›.
         let nav_row = GBox::new(Orientation::Horizontal, 6);
@@ -820,7 +883,7 @@ impl EditorScreen {
         nav_next.set_hexpand(true);
         nav_row.append(&nav_prev);
         nav_row.append(&nav_next);
-        panel.append(&nav_row);
+        bottom_block.append(&nav_row);
 
         // Bottom: Reject | Close.
         let bottom = GBox::new(Orientation::Horizontal, 6);
@@ -831,10 +894,10 @@ impl EditorScreen {
         close_button.set_hexpand(true);
         bottom.append(&reject_button);
         bottom.append(&close_button);
-        panel.append(&bottom);
+        bottom_block.append(&bottom);
 
-        panel_scroll.set_child(Some(&panel));
-        root.append(&panel_scroll);
+        right_col.append(&bottom_block);
+        root.append(&right_col);
 
         let screen = Self {
             root,
@@ -861,6 +924,8 @@ impl EditorScreen {
             crop_23,
             crop_32,
             crop_orig,
+            rotate_ccw,
+            rotate_cw,
             reject_button,
             close_button,
             active_id: Rc::new(Cell::new(None)),
@@ -1493,6 +1558,30 @@ impl EditorScreen {
             }
             o(AppEvent::PhotoEdit { id, adjustments: adj });
         });
+
+        // Rotate ↺ / ↻ (user rotation on top of EXIF/libraw orientation).
+        self.rotate_ccw.connect_clicked(rotate_handler(
+            3,
+            Rc::clone(&active_id),
+            Arc::clone(&state),
+            Arc::clone(&on_event),
+            Rc::clone(&full_size),
+            self.crop_area.clone(),
+            self.info1.clone(),
+            self.info2.clone(),
+            Rc::clone(&self.is_raw),
+        ));
+        self.rotate_cw.connect_clicked(rotate_handler(
+            1,
+            Rc::clone(&active_id),
+            Arc::clone(&state),
+            Arc::clone(&on_event),
+            Rc::clone(&full_size),
+            self.crop_area.clone(),
+            self.info1.clone(),
+            self.info2.clone(),
+            Rc::clone(&self.is_raw),
+        ));
 
         // Nav.
         let (o1, o2) = (Arc::clone(&on_event), Arc::clone(&on_event));

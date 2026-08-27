@@ -1,20 +1,36 @@
 use crate::errors::{Error, Result};
 use crate::image::rawffi::Raw;
 use crate::image::types::{DecodedRaw, Size};
+use image::ImageDecoder;
 
-/// Decode JPEG/PNG to sRGB RGBA8 at full resolution (JPEG base).
+/// Decode JPEG/PNG to sRGB RGBA8 at full resolution (JPEG base), applying the
+/// EXIF Orientation tag so the pixels match what the camera captured (portrait
+/// shots from phones/DSLRs land upright). `load_from_memory` ignores orientation,
+/// so we must use `ImageReader` + `into_decoder().orientation()`.
 /// `image` crate output is already sRGB; photoup keeps JPEGs in sRGB space and
 /// applies exposure/WB/rolloff at render time.
 pub fn decode_jpeg(data: &[u8]) -> Result<(Size, Vec<u8>)> {
-    let img = image::load_from_memory(data).map_err(|e| Error::Image(e.to_string()))?;
+    let reader = image::ImageReader::new(std::io::Cursor::new(data));
+    let mut decoder = reader
+        .with_guessed_format()
+        .map_err(|e| Error::Image(e.to_string()))?
+        .into_decoder()
+        .map_err(|e| Error::Image(e.to_string()))?;
+    let orientation = decoder
+        .orientation()
+        .map_err(|e| Error::Image(e.to_string()))?;
+    let mut img = image::DynamicImage::from_decoder(decoder)
+        .map_err(|e| Error::Image(e.to_string()))?;
+    img.apply_orientation(orientation);
     let rgba = img.into_rgba8();
     let (w, h) = (rgba.width(), rgba.height());
+    let raw = rgba.into_raw();
     Ok((
         Size {
             width: w,
             height: h,
         },
-        rgba.into_raw(),
+        raw,
     ))
 }
 
@@ -310,6 +326,7 @@ mod tests {
                     wb_offset: off,
                     hue,
                     crop: None,
+                    rotation: 0,
                 };
                 let r = base.render_with_ev(None, Size { width: rw, height: rh }, &adj, None);
                 let fname = outdir.join(format!("{stem}-{tag}.png"));

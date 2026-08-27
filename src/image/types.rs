@@ -45,6 +45,9 @@ pub struct Adjustments {
     /// Hue (green↔magenta) tint, -1..+1, 0 = neutral.
     pub hue: f32,
     pub crop: Option<NormalizedCrop>,
+    /// User rotation in clockwise quarter-turns (0..3). 0 = none, 1 = 90° CW,
+    /// 2 = 180°, 3 = 270° CW (90° CCW). Applied on top of any EXIF orientation.
+    pub rotation: u8,
 }
 
 impl Default for Adjustments {
@@ -55,6 +58,7 @@ impl Default for Adjustments {
             wb_offset: 0.0,
             hue: 0.0,
             crop: None,
+            rotation: 0,
         }
     }
 }

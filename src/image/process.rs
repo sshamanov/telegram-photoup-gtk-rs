@@ -5,6 +5,7 @@ use crate::image::srgb::{
     wb_gains, wb_transform3x3,
 };
 use crate::image::types::{Adjustments, DecodedRaw, ExposureMode, NormalizedCrop, Rect, Size};
+use std::sync::Arc;
 
 /// A decoded source ready to render at any size. Mirrors photoup's `DecodedBase`.
 pub trait Base: Send + Sync {
@@ -49,6 +50,117 @@ pub fn crop_rect(width: u32, height: u32, crop: Option<&NormalizedCrop>) -> Rect
             width,
             height,
         },
+    }
+}
+
+/// Clockwise quarter-turn dimensions (`q` = 0..3, 0 = none). Odd quarters swap W/H.
+pub fn rotate_dims(w: u32, h: u32, q: u8) -> (u32, u32) {
+    if q & 1 == 1 { (h, w) } else { (w, h) }
+}
+
+/// Rotate a `w*h*ch` interleaved buffer by `q` quarter-turns clockwise.
+/// Returns `(buffer, out_w, out_h)`. Mapping (source → destination):
+/// q=1: out(ox, oy) = in(oy, h-1-ox); q=2: out = in flipped both axes;
+/// q=3: out(ox, oy) = in(w-1-oy, ox). dims swap for odd q.
+fn rotate_channels<T: Copy + Default>(src: &[T], w: u32, h: u32, q: u8, ch: usize) -> (Vec<T>, u32, u32) {
+    let (ow, oh) = rotate_dims(w, h, q);
+    let n = (w as usize) * (h as usize);
+    debug_assert_eq!(src.len(), n * ch);
+    let mut out = vec![T::default(); n * ch];
+    match q {
+        0 => out.copy_from_slice(src),
+        1 => {
+            for y in 0..h {
+                for x in 0..w {
+                    let si = (y * w + x) as usize * ch;
+                    let di = (x * h + (h - 1 - y)) as usize * ch;
+                    out[di..di + ch].copy_from_slice(&src[si..si + ch]);
+                }
+            }
+        }
+        2 => {
+            for y in 0..h {
+                for x in 0..w {
+                    let si = (y * w + x) as usize * ch;
+                    let di = ((h - 1 - y) * w + (w - 1 - x)) as usize * ch;
+                    out[di..di + ch].copy_from_slice(&src[si..si + ch]);
+                }
+            }
+        }
+        _ => {
+            for y in 0..h {
+                for x in 0..w {
+                    let si = (y * w + x) as usize * ch;
+                    let di = ((w - 1 - x) * h + y) as usize * ch;
+                    out[di..di + ch].copy_from_slice(&src[si..si + ch]);
+                }
+            }
+        }
+    }
+    (out, ow, oh)
+}
+
+/// Rotate a `w*h*4` RGBA buffer. See `rotate_channels`.
+pub fn rotate_rgba(src: &[u8], w: u32, h: u32, q: u8) -> (Vec<u8>, u32, u32) {
+    rotate_channels(src, w, h, q, 4)
+}
+
+/// Rotate a `w*h*3` interleaved LINEAR RGB sample (the WB pick/auto buffer).
+fn rotate_linear3(src: &[f32], w: u32, h: u32, q: u8) -> (Vec<f32>, u32, u32) {
+    rotate_channels(src, w, h, q, 3)
+}
+
+/// Orientation wrapper: renders the inner base, then rotates the buffer by
+/// `quarters` clockwise quarter-turns (0..3). All coordinates the caller sees
+/// — target `Size`, `full` dims, WB sample dims — are in the DISPLAY (rotated)
+/// space: `render_with_ev` back-rotates the target size so the inner render has
+/// the base aspect, and `linear_sample` returns display-oriented samples so the
+/// editor's WB pick/auto map clicks straight through. Crop is normalized and
+/// rotation-invariant, so it passes through unchanged.
+pub struct RotatedBase {
+    inner: Arc<dyn Base>,
+    quarters: u8,
+}
+
+impl RotatedBase {
+    pub fn new(inner: Arc<dyn Base>, quarters: u8) -> Self {
+        Self { inner, quarters: quarters % 4 }
+    }
+}
+
+impl Base for RotatedBase {
+    fn width(&self) -> u32 {
+        rotate_dims(self.inner.width(), self.inner.height(), self.quarters).0
+    }
+    fn height(&self) -> u32 {
+        rotate_dims(self.inner.width(), self.inner.height(), self.quarters).1
+    }
+
+    fn render_with_ev(
+        &self,
+        crop: Option<&NormalizedCrop>,
+        size: Size,
+        adjustments: &Adjustments,
+        ev_override: Option<f32>,
+    ) -> RenderResult {
+        let q = self.quarters;
+        if q == 0 {
+            return self.inner.render_with_ev(crop, size, adjustments, ev_override);
+        }
+        let (iw, ih) = rotate_dims(size.width, size.height, (4 - q) & 3);
+        let inner = self.inner.render_with_ev(crop, Size { width: iw, height: ih }, adjustments, ev_override);
+        let (rgba, _ow, _oh) = rotate_rgba(&inner.rgba, iw, ih, q);
+        RenderResult { rgba, auto_ev: inner.auto_ev }
+    }
+
+    fn linear_sample(&self, size: Size) -> Vec<f32> {
+        let q = self.quarters;
+        if q == 0 {
+            return self.inner.linear_sample(size);
+        }
+        let (iw, ih) = rotate_dims(size.width, size.height, (4 - q) & 3);
+        let sample = self.inner.linear_sample(Size { width: iw, height: ih });
+        rotate_linear3(&sample, iw, ih, q).0
     }
 }
 
@@ -544,6 +656,87 @@ mod tests {
         // The sample is < 1 (0..1 linear), unlike the tone-processed preview which
         // can lift highlights past the sensor values.
         assert!(out.iter().all(|&v| v >= 0.0 && v <= 1.0));
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+
+    /// A 3-wide × 2-tall RGBA marker buffer: cell (x,y) holds `(y*w + x + 1)` in R.
+    /// Row0 = 1,2,3 (top), row1 = 4,5,6 (bottom).
+    fn marker_rgba(w: u32, h: u32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let v = (y * w + x + 1) as u8;
+                buf.extend_from_slice(&[v, 0, 0, 255]);
+            }
+        }
+        buf
+    }
+
+    fn marker_at(rgba: &[u8], w: u32, x: u32, y: u32) -> u8 {
+        rgba[((y * w + x) * 4) as usize]
+    }
+
+    #[test]
+    fn rotate_90cw_maps_cells_correctly() {
+        let buf = marker_rgba(3, 2);
+        let (out, ow, oh) = rotate_rgba(&buf, 3, 2, 1);
+        assert_eq!((ow, oh), (2, 3), "90°CW swaps dims");
+        // 90°CW: display(ox,oy) = base(oy, h-1-ox), h=2. Base columns become
+        // display rows, reversed: left col (1,4) → top row [4,1], mid (2,5) → [5,2],
+        // right col (3,6) → bottom row [6,3].
+        assert_eq!(marker_at(&out, 2, 0, 0), 4, "top-left ← base(0,1)=4");
+        assert_eq!(marker_at(&out, 2, 1, 0), 1, "top-right ← base(0,0)=1");
+        assert_eq!(marker_at(&out, 2, 0, 1), 5, "mid-left ← base(1,1)=5");
+        assert_eq!(marker_at(&out, 2, 1, 1), 2, "mid-right ← base(1,0)=2");
+        assert_eq!(marker_at(&out, 2, 0, 2), 6, "bottom-left ← base(2,1)=6");
+        assert_eq!(marker_at(&out, 2, 1, 2), 3, "bottom-right ← base(2,0)=3");
+    }
+
+    #[test]
+    fn rotate_180_and_270() {
+        let buf = marker_rgba(3, 2);
+        let (out, ow, oh) = rotate_rgba(&buf, 3, 2, 2);
+        assert_eq!((ow, oh), (3, 2));
+        assert_eq!(marker_at(&out, 3, 2, 1), 1, "180° puts base(0,0) at bottom-right");
+        assert_eq!(marker_at(&out, 3, 0, 0), 6, "180° puts base(2,1) at top-left");
+
+        let (out3, ow3, oh3) = rotate_rgba(&buf, 3, 2, 3);
+        assert_eq!((ow3, oh3), (2, 3));
+        // 270°CW (90°CCW): display(ox,oy) = base(w-1-oy, ox). Top row of base
+        // (1 2 3) → left column reversed [3,2,1]; bottom row (4 5 6) → right [6,5,4].
+        assert_eq!(marker_at(&out3, 2, 0, 0), 3, "top-left ← base(2,0)=3");
+        assert_eq!(marker_at(&out3, 2, 1, 0), 6, "top-right ← base(2,1)=6");
+        assert_eq!(marker_at(&out3, 2, 0, 2), 1, "bottom-left ← base(0,0)=1");
+        assert_eq!(marker_at(&out3, 2, 1, 2), 4, "bottom-right ← base(0,1)=4");
+    }
+
+    #[test]
+    fn rotate_zero_passes_through_unchanged() {
+        let buf = marker_rgba(3, 2);
+        let (out, ow, oh) = rotate_rgba(&buf, 3, 2, 0);
+        assert_eq!((ow, oh), (3, 2));
+        assert_eq!(out, buf);
+    }
+
+    /// End-to-end through `RotatedBase`: dims swap and `linear_sample` comes back
+    /// display-oriented (raw pre-tone values, so exact). Base 3×2 with markers;
+    /// after 90°CW the display is 2×3 and the top row holds base's left column.
+    #[test]
+    fn rotated_base_swaps_dims_and_sample_orientation() {
+        let base = JpegBase::new(3, 2, marker_rgba(3, 2));
+        let wrapped = RotatedBase::new(Arc::new(base), 1);
+        assert_eq!((wrapped.width(), wrapped.height()), (2, 3));
+        let sample = wrapped.linear_sample(Size { width: 2, height: 3 });
+        let s2l = srgb_to_linear();
+        // sample[y*w+x*3] == s2l[marker]. Top-left display = base(0,1) = 4.
+        let at = |x: u32, y: u32| sample[((y * 2 + x) * 3) as usize];
+        assert!((at(0, 0) - s2l[4]).abs() < 1e-6, "top-left display ← base(0,1)");
+        assert!((at(1, 0) - s2l[1]).abs() < 1e-6, "top-right display ← base(0,0)");
+        assert!((at(1, 2) - s2l[3]).abs() < 1e-6, "bottom-right display ← base(2,0)");
     }
 }
 
