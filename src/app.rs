@@ -615,16 +615,7 @@ impl AppController {
                 // and `set_selected` fires `selected_notify` synchronously, which
                 // would try to borrow the controller a second time (re-entrancy
                 // panic). The idle callback runs after the borrow is released.
-                if let Some(sel) = self
-                    .main_screen
-                    .grid
-                    .model()
-                    .and_then(|m| m.downcast::<gtk4::SingleSelection>().ok())
-                {
-                    glib::idle_add_local_once(move || {
-                        sel.set_selected(gtk4::INVALID_LIST_POSITION);
-                    });
-                }
+                self.deselect_grid();
             }
             _ => {}
         }
