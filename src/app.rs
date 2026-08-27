@@ -717,9 +717,11 @@ impl AppController {
                     ));
                     // A successful render clears any prior error badge so a re-render
                     // can recover a previously-failed photo. The EV badge turns on
-                    // when the thumb is ready and |autoEV| > 0.05 (photoup).
+                    // when the thumb is ready and |EV| > 0.05 (photoup). Show the
+                    // EFFECTIVE EV (manual slider in Manual mode, autoEV otherwise) —
+                    // a raw autoEV would mislead when the user set a manual EV.
                     row.set_error(false);
-                    row.set_ev(auto_ev);
+                    row.set_ev(self.effective_ev_for(id, auto_ev));
                     row.set_ready(true);
                 }
                 // Keep the editor's EV indicator in sync if this is the active photo.
@@ -831,9 +833,11 @@ impl AppController {
                         size.1 as i32,
                     ));
                     // Same as ThumbReady: a successful render clears the error badge
-                    // and refreshes the EV badge with the re-rendered autoEV.
+                    // and refreshes the EV badge with the effective EV (manual slider
+                    // in Manual mode, autoEV otherwise) — never the raw autoEV, which
+                    // would mask a manual correction made in the editor.
                     row.set_error(false);
-                    row.set_ev(auto_ev);
+                    row.set_ev(self.effective_ev_for(id, auto_ev));
                     row.set_ready(true);
                 }
             }
