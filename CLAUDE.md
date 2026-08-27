@@ -7,17 +7,17 @@ A native GTK4/libadwaita desktop app that fixes dark or monochrome-cast photos
 4:4:4 mozjpeg JPEGs at Q100**, quality lowered adaptively only to stay under
 Telegram's ~10 MB photo limit (`MAX_PHOTO_BYTES = 10_000_000`).
 
-It is a port of the browser app `../photoup` (same app and flow, same quality
-thesis) to native Rust + GTK, with real parallelism.
+It is a native Rust + GTK app with real parallelism: photos are decoded,
+auto-exposed, white-balanced and tone-mapped across a worker pool, and the
+edited results upload straight to a Telegram group.
 
-Design spec: `docs/superpowers/specs/2026-08-19-photoup2-design.md`
+Original inception design: `docs/superpowers/specs/2026-08-19-photoup2-design.md`
 Implementation plan: `docs/superpowers/plans/2026-08-19-photoup2.md`
 
 ## System boundaries
 
 - **THIS project CAN install system packages** — it is a native app compiling
-  against system GTK4/libadwaita/libraw. (This differs from photoup, the browser
-  app, which is constrained to Docker/JS.)
+  against system GTK4/libadwaita/libraw.
 - Dev is Ubuntu 24.04, prod is Arch. The **same `Cargo.toml` builds on both**:
   `libadwaita` is pinned to feature `v1_5` (Ubuntu ships 1.5.0; Arch's newer
   libadwaita is backward-compatible). **Do NOT bump `adw` to `v1_7`+** — it
@@ -44,10 +44,10 @@ Implementation plan: `docs/superpowers/plans/2026-08-19-photoup2.md`
 - **Always measure with `--release`.** The debug build runs the pure-Rust JPEG
   decoder ~10× slower (a 36MP JPG thumbnail ~7 s debug vs <1 s release); libraw
   is compiled C++ and fast in both. Timings from a debug build are misleading.
-- The UI flow is a port of photoup's (login → grid with default-checked
-  thumbnails → editor → send-as-album) — see the README "UI flow" section.
-  Known gaps vs photoup: no neutral-picker, Crop button not functional, no QR
-  login.
+- UI flow: login → grid with default-checked thumbnails → editor → send-as-album
+  — see the README "UI flow" section. Known gaps: no QR login (grammers 0.10
+  dropped it); the interactive crop drag is deferred (the crop presets and
+  overlay work).
 
 ## Architecture
 
@@ -74,10 +74,11 @@ Three Kingdoms threading (borrowed from mpd-client), all in one Rust crate
   is the contract the UI and tests both speak. Real impl is `GrammersSession`
   (`src/telegram/grammers.rs`); **`MockAdapter`** (`src/telegram/mock.rs`) is the
   deterministic mock used by integration tests in `tests/telegram_mock.rs`.
-- **Image pipeline** is a faithful port of photoup's `src/lib/image/*` math
-  (same LUTs, same auto-exposure math, same mozjpeg settings) so output matches
-  photoup. `AppController` (`src/app.rs`) owns the wiring: screens, pool, and
-  telegram worker.
+- **Image pipeline** is photoup2's own linear-light implementation: per-pixel
+  exposure + WB gains applied in linear space, a precomputed tone LUT (linear →
+  sRGB with highlight rolloff; RAW also gets a camera-Standard S-curve), and
+  4:4:4 mozjpeg Q100 encode. `AppController` (`src/app.rs`) owns the wiring:
+  screens, pool, and telegram worker.
 
 ## Image pipeline
 
@@ -87,7 +88,7 @@ Three Kingdoms threading (borrowed from mpd-client), all in one Rust crate
 - Export format is **final, NOT tunable**: 4:4:4 mozjpeg Q100, adaptive quality
   down to `MAX_PHOTO_BYTES`, longest edge ≤2560px (`EXPORT_EDGE`). Interactive
   preview renders at `PREVIEW_EDGE = 1024`; grid thumbnails at ≤512px.
-- RAW decodes with **photoup's exact LibRaw params** (`src/image/decode.rs`):
+- RAW decodes with these LibRaw params (`src/image/decode.rs`):
   `use_camera_wb` (or `user_mul`), `use_camera_matrix=1`, `output_color=1`
   (sRGB primaries + gamma), `output_bps=16`, `no_auto_bright=1`, `half_size`
   (interactive only; exports pass `full_size`), `user_qual=3`.
@@ -108,7 +109,7 @@ before calling the change done — do not assert visual correctness without
 looking. (The `Read` tool may not display images on some model backends; the VLM
 endpoint always works.)
 
-- **VLM** (dev-time only, from ../photoup): OpenAI-compatible vision API
+- **VLM** (dev-time only): OpenAI-compatible vision API
   `https://<vlm-endpoint>/api/chat/completions`, `model: "qwen3-vl:30b-instruct"`,
   `Authorization: Bearer sk-REDACTED`. Send the image as
   `{"type":"image_url","image_url":{"url":"data:image/png;base64,<b64>"}}` in a
@@ -119,7 +120,7 @@ endpoint always works.)
   `out/wb_before_after/`.
 
 The user's real NEF/CR2/JPEG samples stay local in `./samples/` (gitignored)
-and are the source of truth for RAW parity with photoup.
+and are the source of truth for RAW output quality.
 
 ## Commit discipline
 
@@ -132,7 +133,7 @@ code).
 
 - **Progressive, not baseline, JPEG.** mozjpeg's Rust binding has no baseline
   switch and defaults to progressive; scan order is pixel-neutral, so decoded
-  pixels are identical to photoup's baseline output.
+  pixels are unaffected by the progressive scan order.
 - **RAW access-hash caveat for supergroups/channels.** Sending needs the peer's
   access hash; `DialogInfo.access_hash` is `None` for plain basic groups/users
   (fine) but can be missing for some channels/supergroups — sends there fail

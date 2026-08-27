@@ -1,11 +1,8 @@
-# photoup2 UI — photoup parity spec
+# photoup2 UI — specification
 
-The app must replicate photoup's UI flow and layout as closely as GTK4 allows.
-This is the authority document for the UI; extracted from photoup's actual
-Svelte components (`../photoup/src/App.svelte`,
-`components/gallery/PhotoThumb.svelte`, `components/editor/EditorPanel.svelte`,
-`components/ui/UsageIndicator.svelte`, `components/gallery/GroupSelector.svelte`,
-`components/upload/UploadZone.svelte`, `components/auth/AuthScreen.svelte`).
+This is the authority document for the UI: the screens, their layout, and the
+exact button/section labels. Keep the layout, captions, and interaction as
+described here.
 
 ## Screens
 
@@ -15,9 +12,9 @@ screens.
 
 ## Login screen
 
-- Centered column, title "photoup".
-- Tabs **Phone | QR** (photoup has both; our grammers 0.10 drops QR — phone only).
-- Phone flow: phone input → **Send code** → code input → **Sign in** → if 2FA,
+- Centered column, title "photoup2".
+- Phone login only (grammers 0.10 dropped the QR flow).
+- Flow: phone input → **Send code** → code input → **Sign in** → if 2FA,
   password input → **Confirm**.
 - Captions: placeholders "+1234567890", "Code", "2FA password".
 
@@ -27,17 +24,17 @@ Layout top to bottom:
 
 1. **Header**: title, then actions: group selector, **Reset**, **Logout**.
    - Group selector: a label "Send to" + a select of the account's groups
-     (photoup fetches up to 1000 dialogs).
-   - **Reset** → clears all loaded photos (photoup's `clearPhotos`).
+     (fetches up to 1000 dialogs).
+   - **Reset** → clears all loaded photos.
    - **Logout** → Telegram logout + clear photos.
 2. **Upload zone**: a dashed box, "**Upload photos**" / "Drop JPEG / PNG / NEF /
    CR2 here, or press Ctrl+V to paste". Click opens a file picker; drag-drop and
    paste accepted.
-3. **Usage indicator** (photoup `UsageIndicator`): only while photos are being
-   processed — a pulsing dot + "**Processing {name}**" and, if more than one, "
-   ({n} queued)". NOT a ready/sent counter, NOT a RAM gauge.
+3. **Usage indicator**: only while photos are being processed — a pulsing dot +
+   "**Processing {name}**" and, if more than one, "({n} queued)". NOT a
+   ready/sent counter, NOT a RAM gauge.
 4. **Grid**: square thumbnails, `repeat(auto-fill, minmax(180px, 1fr))`, ~14px
-   gap. Each cell (photoup `PhotoThumb`):
+   gap. Each cell:
    - Square image, `object-fit: cover` (crop to fill). While decoding shows a
      centered "developing…" placeholder; on error, "error" in red.
    - **Checkbox, absolute top-left** (custom dark pill, checkmark when checked).
@@ -72,17 +69,21 @@ point.
 3. Section "**Exposure**":
    - EV slider, min −3, max +5, step 0.1, zero-centered (drag updates live,
      release commits).
-   - Row: **Auto** (active when mode=auto) | **Slide** (aggressive) | **Rest**
-     (photoup's label — reset exposure) | the current EV value (e.g. `+2.7`).
+   - Row: **Auto** (auto-exposure) | **Slide** (aggressive) | **Rest** (reset
+     exposure to 0) | the current EV value (e.g. `+2.7`).
 4. Section "**White balance**":
-   - Temperature (warmth) slider, **−4..+4**, step 0.05, zero-centered (wider than
-     photoup's ±2 — some images need a stronger cool shift).
+   - Temperature (warmth) slider, **−4..+4**, step 0.05, zero-centered (the wider
+     range covers images that need a strong cool shift).
    - Hue (tint) slider, **−1..+1**, step 0.01, zero-centered (fine-grained).
-   - Row: **Auto** (auto-WB) | **Pick** (neutral picker mode) | **Reset** | the
-     current WB display.
+   - Row: **Auto** (clinical neutralization) | **Auto2** (neutralize but keep the
+     warm ambience, Nikon AUTO2 style) | **Reset** | the current WB display.
+     The neutral **Pick** needs no button — clicking the preview samples the
+     gray point directly.
 5. Section "**Crop**":
    - Presets: **1:1** | **2:3** | **3:2** | **Original**.
-6. Section "**Image**":
+6. Section "**Rotate**":
+   - **↺ CCW** | **↻ CW** (90° steps; applied on top of the EXIF orientation).
+7. Section "**Image**":
    - EXIF lines: camera, lens, `shutter · aperture · ISO`, date.
    - `RAW · 7360 × 4912` (source type + full dimensions).
    - `output 2560 × 1709 px`.
@@ -90,15 +91,16 @@ point.
 8. Nav: **‹ Prev** | **Next ›** (disabled at ends).
 9. Bottom: **Reject** (remove this photo) | **Close** (back to grid).
 
-## Notes for the GTK port
+## Notes for the GTK implementation
 
 - Keep the layout/captions/sections EXACTLY as above; do not rename buttons or
-  sections. ("Exposure"/"White balance"/"Crop"/"Image"; Auto/Slide/Rest;
-  Auto/Pick/Reset; 1:1/2:3/3:2/Original; ‹ Prev/Next ›; Reject/Close;
-  Reset/Logout; Send {n} selected; Preparing/Sending.)
-- photoup is a light-on-dark theme with an orange accent and a display font;
+  sections. ("Exposure"/"White balance"/"Crop"/"Rotate"/"Image";
+  Auto/Slide/Rest; Auto/Auto2/Reset; 1:1/2:3/3:2/Original; ↺ CCW/↻ CW;
+  ‹ Prev/Next ›; Reject/Close; Reset/Logout; Send {n} selected;
+  Preparing/Sending.)
+- The theme is a light-on-dark look with an amber accent and a display font;
   matching the exact theme is optional — matching the layout, labels, and
   interaction is required.
-- The neutral-picker (Pick) and crop drag are interactive features that exist in
-  photoup; the desktop port should implement them (or mark them clearly as
-  deferred, but the buttons/sections must be present).
+- The neutral-pick (click the preview) and crop presets are implemented; the
+  interactive crop drag is deferred — the crop section and overlay must stay
+  present.

@@ -4,6 +4,13 @@ Date: 2026-08-19
 Status: approved
 Author: discussion between schaman and Claude Code
 
+> **Historical note (2026-08-27):** this is the original inception design. The
+> app has since diverged from the "faithful photoup port" premise below — it is
+> now photoup2's own implementation (own exposure/WB math, editor rotation, WB
+> Auto2, diverged UI). Treat the parity claims in this document as context on
+> how the project started, NOT as current requirements. The living docs are
+> `CLAUDE.md`, `README.md`, and `docs/ui-spec.md`.
+
 ## Background
 
 photoup is a working browser app that fixes photos which came out too dark or

@@ -5,21 +5,19 @@ with a monochrome camera picture style (NEF, CR2, JPEG, PNG) and uploads them to
 a Telegram group as **inline ≤2560px, 4:4:4 mozjpeg JPEGs at Q100** (quality
 lowered adaptively only to stay under Telegram's ~10 MB photo limit).
 
-It is a port of the browser app [photoup](../photoup) — same app, same flow,
-same quality thesis — to native Rust + GTK with real parallelism. The browser
-version is sequential and RAM-limited; the desktop version processes many photos
-across cores with a bounded memory budget.
+A native Rust + GTK re-implementation of the photo-fixing flow with real
+parallelism: the desktop app processes many photos across cores with a bounded
+memory budget.
 
 ## Why
 
 - **Fix in one step.** Load photos → the pipeline auto-exposes them (with mild
   highlight rolloff) and, for RAW, applies the camera "Standard" tone curve and
   camera as-shot white balance. No per-photo work needed.
-- **Same output as photoup, verified by eye.** The image math is ported
-  verbatim from photoup's pipeline, so the desktop export matches the browser
-  app pixel-for-pixel.
-- **Real formats.** Decodes real sensor data from NEF/CR2 through LibRaw (same
-  engine photoup used), plus JPEG/PNG.
+- **Verifiable output.** The image math is unit-tested and its results are
+  checked by eye against real sample renders before every delivery.
+- **Real formats.** Decodes real sensor data from NEF/CR2 through LibRaw, plus
+  JPEG/PNG.
 - **Telegram-native.** Uploads as inline `photo` media (no file attachments),
   multi-photo batches as albums.
 
@@ -35,8 +33,8 @@ threading (borrowed from mpd-client):
 | **Image worker pool** | `nproc − 2` workers, each running a complete photo job (decode → process → encode). Single-threaded libs (libraw, mozjpeg) scale by independent jobs across workers. |
 
 Loose coupling via adapters: the `TelegramAdapter` trait is implemented by
-`GrammersSession` (real) and `MockAdapter` (tests). The image pipeline is a
-faithful port of photoup's `src/lib/image/*`.
+`GrammersSession` (real) and `MockAdapter` (tests). The image pipeline is
+photoup2's own linear-light implementation.
 
 **Pipeline:** decode once → cached linear base → re-render from the base on
 every edit (never cumulative) → ≤512px grid thumbnails / 1024px editor preview /
@@ -45,8 +43,7 @@ every edit (never cumulative) → ≤512px grid thumbnails / 1024px editor previ
 
 ## Build / run
 
-System deps (native app — unlike photoup's Docker constraint, this project may
-install system packages):
+System deps (this is a native app, so it installs system packages):
 
 ```bash
 # Debian/Ubuntu
@@ -84,8 +81,7 @@ so later launches skip login.
 
 ## UI flow
 
-The UI is a port of photoup's — same screens, captions, buttons, and layout.
-The exact spec (extracted from photoup's components) is the authority document:
+The full UI spec is the authority document:
 
 **`docs/ui-spec.md`**
 
@@ -93,14 +89,13 @@ In short: Login (phone/code/2FA) → Main screen (header with group selector +
 **Reset** + **Logout**; upload zone; "Processing {name} (n queued)" usage
 indicator; a square-thumbnail grid with checkbox top-left, EV badge top-right,
 filename + RAW/JPG badge) → Editor (preview + right panel: histogram, Exposure
-[Auto/Slide/Rest + EV], White balance [Auto/Pick/Reset + temp/hue], Crop
-[1:1/2:3/3:2/Original], Image [EXIF + output size], Prev/Next, Reject/Close) →
-sticky **Send {n} selected** footer (Preparing/Sending progress; sent photos
-are removed after a successful send).
+[Auto/Slide/Rest + EV], White balance [Auto/Auto2/Pick/Reset + temp/hue], Crop
+[1:1/2:3/3:2/Original], Rotate [↺ CCW/↻ CW], Image [EXIF + output size],
+Prev/Next, Reject/Close) → sticky **Send {n} selected** footer (Preparing/
+Sending progress; sent photos are removed after a successful send).
 
-Known gaps vs photoup (tracked in `docs/ui-spec.md`): QR login is unavailable
-(grammers 0.10); the neutral-picker (Pick) and interactive crop may be
-implemented incrementally.
+Known gaps (tracked in `docs/ui-spec.md`): QR login is unavailable (grammers
+0.10); the interactive crop drag is deferred (the presets and overlay work).
 
 ## Development
 
@@ -117,7 +112,7 @@ implemented incrementally.
 
 - **Progressive, not baseline, JPEG.** mozjpeg's Rust binding has no baseline
   switch and defaults to progressive. Scan order is pixel-neutral, so decoded
-  pixels are identical to photoup's baseline output — not a quality divergence.
+  pixels are unaffected by the progressive scan order.
 - **RAW access-hash caveat for supergroups/channels.** Sending to a
   channel/supergroup requires the peer's access hash. It is present for most
   dialogs, but a plain basic group or a minimal user may carry `None`; a send
@@ -129,5 +124,5 @@ implemented incrementally.
 
 Image output is verified by looking at real renders — no VLM in the loop. The
 user's real NEF/CR2/JPEG samples live in `./samples/` (gitignored, local only)
-and are used to confirm RAW parity with photoup. The RAW decode test in
+and are used to confirm RAW decode quality. The RAW decode test in
 `src/image/decode.rs` uses a sample file automatically when one is present.
