@@ -341,6 +341,134 @@ mod tests {
         }
     }
 
+    /// Diagnostic: render every sample in Manual0 / Auto / Aggressive at preview
+    /// (1024) and export (2560) edge, print rendered-luminance percentiles and
+    /// clip %, and the preview-vs-export tone diff at matched scale. Dumps the
+    /// 1024 renders to out/ev_curves/ for visual (VLM) inspection. Run with
+    /// `cargo test --lib ev_debug_curves -- --nocapture`.
+    #[test]
+    fn ev_debug_curves() {
+        use crate::image::math::fit_within;
+        use crate::image::process::{Base, JpegBase, RawBase};
+        use crate::image::resize::downscale_rgba;
+        use crate::image::types::{Adjustments, ExposureMode, Size};
+
+        // (p50, p60, p90, p99, mean, clip%) over rendered luminance.
+        fn lums_stats(rgba: &[u8]) -> (f32, f32, f32, f32, f32, f32) {
+            let mut lums: Vec<u8> = rgba
+                .chunks_exact(4)
+                .map(|p| {
+                    (0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32)
+                        .round() as u8
+                })
+                .collect();
+            lums.sort_unstable();
+            let n = lums.len();
+            let pct = |q: f32| lums[((n as f32 * q) as usize).min(n - 1)] as f32;
+            let mean = lums.iter().map(|&v| v as f32).sum::<f32>() / n as f32;
+            let clipped = lums.iter().filter(|&&v| v > 250).count();
+            (
+                pct(0.5),
+                pct(0.6),
+                pct(0.9),
+                pct(0.99),
+                mean,
+                clipped as f32 / n as f32 * 100.0,
+            )
+        }
+
+        let mut files = Vec::new();
+        for dir in ["samples", "../photoup/samples"] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                        if matches!(ext, "JPG" | "jpg" | "jpeg" | "NEF" | "nef" | "CR2" | "cr2") {
+                            files.push(p);
+                        }
+                    }
+                }
+            }
+        }
+        files.sort();
+        let outdir = std::path::Path::new("out").join("ev_curves");
+        std::fs::create_dir_all(&outdir).ok();
+
+        for path in &files {
+            let Ok(data) = std::fs::read(path) else { continue };
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("photo")
+                .to_string();
+            let ext = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let is_raw = matches!(ext.as_str(), "nef" | "cr2");
+            let base: std::sync::Arc<dyn Base> = if is_raw {
+                let Ok(decoded) =
+                    decode_raw(&data, &RawDecodeOpts { full_size: false, user_mul: None })
+                else {
+                    continue;
+                };
+                std::sync::Arc::new(RawBase::new(decoded))
+            } else {
+                let Ok((size, rgba)) = decode_jpeg(&data) else { continue };
+                std::sync::Arc::new(JpegBase::new(size.width, size.height, rgba))
+            };
+            println!(
+                "=== {stem} ({ext}) {}x{} ===",
+                base.width(),
+                base.height()
+            );
+            for (label, mode) in [
+                ("Manual0", ExposureMode::Manual),
+                ("Auto", ExposureMode::Auto),
+                ("Aggressive", ExposureMode::Aggressive),
+            ] {
+                let adj = Adjustments {
+                    exposure_mode: mode,
+                    exposure_ev: 0.0,
+                    wb_offset: 0.0,
+                    hue: 0.0,
+                    crop: None,
+                    rotation: 0,
+                };
+                let (pw, ph) = fit_within(base.width(), base.height(), 1024);
+                let (xw, xh) = fit_within(base.width(), base.height(), 2560);
+                let preview = base.render_with_ev(None, Size { width: pw, height: ph }, &adj, None);
+                let export = base.render_with_ev(None, Size { width: xw, height: xh }, &adj, None);
+                let (p50, p60, p90, p99, mean, clip) = lums_stats(&preview.rgba);
+                let scaled = downscale_rgba(&export.rgba, xw, xh, pw, ph);
+                let mut maxdiff = 0u16;
+                let mut gt8 = 0usize;
+                for (a, b) in preview.rgba.chunks_exact(4).zip(scaled.chunks_exact(4)) {
+                    for c in 0..3 {
+                        let d = a[c].abs_diff(b[c]);
+                        maxdiff = maxdiff.max(d as u16);
+                        if d > 8 {
+                            gt8 += 1;
+                        }
+                    }
+                }
+                let gt8pct = gt8 as f32 / (preview.rgba.len() / 4) as f32 * 100.0;
+                println!(
+                    "  {label:11} ev={ev:.2} p50={p50:.0} p60={p60:.0} p90={p90:.0} p99={p99:.0} mean={mean:.0} clip%={clip:.1} 1024-vs-2560(->1024): maxdiff={maxdiff} >8px={gt8pct:.2}%",
+                    ev = preview.auto_ev
+                );
+                let fname = outdir.join(format!("{stem}-{label}.png"));
+                if let Ok(f) = std::fs::File::create(&fname) {
+                    let mut w = std::io::BufWriter::new(f);
+                    image::codecs::png::PngEncoder::new(&mut w)
+                        .write_image(&preview.rgba, pw, ph, image::ExtendedColorType::Rgba8)
+                        .expect("write png");
+                }
+            }
+        }
+    }
+
     fn make_png_png(w: u32, h: u32) -> Vec<u8> {
         // Build a solid red PNG using the image crate's encoder.
         let mut buf = Vec::new();
