@@ -109,7 +109,7 @@ looking. (The `Read` tool may not display images on some model backends; the VLM
 endpoint always works.)
 
 - **VLM** (dev-time only, from ../photoup): OpenAI-compatible vision API
-  `https://<vlm-endpoint>/api/chat/completions`, `model: "vision"`,
+  `https://<vlm-endpoint>/api/chat/completions`, `model: "qwen3-vl:30b-instruct"`,
   `Authorization: Bearer sk-REDACTED`. Send the image as
   `{"type":"image_url","image_url":{"url":"data:image/png;base64,<b64>"}}` in a
   message, ask for per-image severity/neutrality ratings.
