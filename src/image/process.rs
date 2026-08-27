@@ -180,13 +180,19 @@ fn sample_luminances_rgba(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
 }
 
 fn auto_ev_for(lums: &[u8], aggressive: bool) -> f32 {
-    // Median anchor (p50), midtones → histogram center. EV is solved in linear
-    // space, so the anchor lands exactly on the target after the tone LUT.
+    // Median anchor (p50), midtones → histogram center; EV solved in linear space
+    // so the anchor lands exactly on the target after the tone LUT. The highlight
+    // cap (p99 → 245) bounds the EV on skewed histograms so the lift never shoves
+    // a mass of pixels into pure white — the median-anchor-alone failure.
     auto_exposure_ev(
         lums,
         &AutoExpOpts {
             target: if aggressive { 150.0 } else { 128.0 },
             percentile: 0.5,
+            // Aggressive rides the top 1% up to 252 (a brighter Auto), while Auto
+            // keeps it at 245 — the cap still prevents a mass white peak in both.
+            hi_target: if aggressive { 252.0 } else { 245.0 },
+            hi_percentile: 0.99,
             max_ev: 6.0,
             ..Default::default()
         },
@@ -573,12 +579,15 @@ mod tests {
 
     #[test]
     fn crop_selects_region_for_exposure() {
-        // Two-tone base: left half dark (linear 0.02), right half bright (linear 0.5).
+        // Two-tone base: left 60% dark (linear 0.02), right 40% bright (linear 0.5).
+        // The dark majority keeps the full-frame p50 firmly in the dark, so the
+        // crop/full discrimination is unambiguous (a 50/50 split would land p50
+        // right on the boundary).
         let (w, h) = (64, 32);
         let mut rgba = vec![0u8; (w * h * 4) as usize];
         for y in 0..h {
             for x in 0..w {
-                let byte = if x < w / 2 {
+                let byte = if (x as f32) < w as f32 * 0.6 {
                     gray_linear(0.02)
                 } else {
                     gray_linear(0.5)
@@ -591,11 +600,13 @@ mod tests {
             }
         }
         let base = JpegBase::new(w, h, rgba);
-        // Crop to the bright right half.
+        // Crop fully inside the bright region (dark starts at source x < 39, so
+        // x=40..61 is all bright — a crop touching the boundary would blend a
+        // dark column into the downscale and blur the render).
         let crop = NormalizedCrop {
-            x: 0.5,
+            x: 0.62,
             y: 0.0,
-            width: 0.5,
+            width: 0.35,
             height: 1.0,
         };
         let out = base.render(
@@ -606,18 +617,34 @@ mod tests {
             },
             &Adjustments::default(),
         );
-        // Sampling the bright half → auto-EV is negative (already bright). The
-        // negative sign is the proof the EV was computed from the crop, not the
-        // full frame (a full-frame sample would see the dark half and go positive).
+        // The full frame sees the dark 60% majority → strong positive EV. The
+        // crop sees only the bright region → auto-EV stays ≤ 0 (the no-darkening
+        // floor; the old sign test used a negative EV that the current floor
+        // design no longer produces). The difference is the proof the EV was
+        // computed from the crop, not the full frame.
+        let full = base.render(
+            None,
+            Size {
+                width: 16,
+                height: 16,
+            },
+            &Adjustments::default(),
+        );
         assert!(
-            out.auto_ev < 0.0,
-            "auto_ev {} should be negative for a bright crop",
+            out.auto_ev <= 0.0,
+            "auto_ev {} should be ≤ 0 for a bright crop",
             out.auto_ev
         );
-        // Median anchor centers the crop's midtones on the auto target (~128).
         assert!(
-            out.rgba[0] > 100 && out.rgba[0] < 160,
-            "crop render should center midtones on the auto target, got {}",
+            full.auto_ev > out.auto_ev + 0.5,
+            "full-frame auto_ev {} should exceed the bright-crop {}",
+            full.auto_ev,
+            out.auto_ev
+        );
+        // The bright crop is left near source brightness (no darkening, no lift).
+        assert!(
+            out.rgba[0] > 160,
+            "bright crop should stay near source, got {}",
             out.rgba[0]
         );
     }
