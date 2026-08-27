@@ -45,7 +45,13 @@ impl Default for AutoExpOpts {
 }
 
 /// Global auto-exposure as an EV offset, from a downsampled luminance distribution.
-/// Port of photoup `autoExposureEV` (math.ts).
+///
+/// The luminance bytes are sRGB-encoded, but the exposure gain is applied in
+/// LINEAR space (linear value × 2^EV, then a linear→sRGB tone LUT). So the EV is
+/// solved in linear space too: the anchor percentile pixel lands exactly on
+/// `opts.target` in the tone-mapped output. (The naive sRGB ratio would land the
+/// anchor ~25–30% below target because of gamma — that's the old "exposure feels
+/// weak" bug.)
 pub fn auto_exposure_ev(luminances: &[u8], opts: &AutoExpOpts) -> f32 {
     if luminances.is_empty() {
         return 0.0;
@@ -54,7 +60,15 @@ pub fn auto_exposure_ev(luminances: &[u8], opts: &AutoExpOpts) -> f32 {
     sorted.sort_unstable();
     let idx = (sorted.len() - 1).min((sorted.len() as f32 * opts.percentile) as usize);
     let measured = sorted[idx] as f32;
-    let ev = (opts.target / measured.max(1.0)).log2();
+    let srgb_to_linear = |v: f32| {
+        let c = (v / 255.0).clamp(0.0, 1.0);
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let ev = (srgb_to_linear(opts.target) / srgb_to_linear(measured).max(1e-6)).log2();
     clamp(ev, opts.min_ev, opts.max_ev)
 }
 

@@ -235,7 +235,6 @@ mod tests {
                 q(&p_off, 0.10), q(&p_off, 0.50), q(&p_off, 0.90), c_lo, c_hi, hc, nc
             );
         }
-        assert!(files.len() >= 0); // informational only
     }
 
     /// TEMPORARY: render every RAW sample as-shot vs old-pick vs new-pick WB to
@@ -290,7 +289,7 @@ mod tests {
 
             // New pick (the fix) vs the previous mapping (which dropped gb).
             let (new_off, new_hue) = wb_from_pick(mr as f32, mg as f32, mb as f32, cam3);
-            let (gr, gg, gb) = match cam3.and_then(|m| crate::image::srgb::invert3x3(&m)) {
+            let (gr, gg, _gb) = match cam3.and_then(|m| crate::image::srgb::invert3x3(&m)) {
                 Some(minv) => {
                     let q0 = minv[0][0] * mr as f32 + minv[0][1] * mg as f32 + minv[0][2] * mb as f32;
                     let q1 = minv[1][0] * mr as f32 + minv[1][1] * mg as f32 + minv[1][2] * mb as f32;

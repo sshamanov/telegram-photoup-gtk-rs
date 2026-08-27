@@ -180,11 +180,14 @@ fn sample_luminances_rgba(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
 }
 
 fn auto_ev_for(lums: &[u8], aggressive: bool) -> f32 {
+    // Median anchor (p50), midtones → histogram center. EV is solved in linear
+    // space, so the anchor lands exactly on the target after the tone LUT.
     auto_exposure_ev(
         lums,
         &AutoExpOpts {
-            target: if aggressive { 230.0 } else { 180.0 },
-            max_ev: 4.0,
+            target: if aggressive { 150.0 } else { 128.0 },
+            percentile: 0.5,
+            max_ev: 6.0,
             ..Default::default()
         },
     )
@@ -265,7 +268,7 @@ impl Base for JpegBase {
         // Downscale the (cropped) source to the target size in sRGB space.
         let mut down = downscale_rgba(src, rect.width, rect.height, size.width, size.height);
 
-        let lut = jpeg_tone_lut(aggressive); // JPEG never gets the RAW S-curve
+        let lut = jpeg_tone_lut(false); // highlight rolloff applies in Auto AND aggressive; JPEG never gets the RAW S-curve
         let (gr, gg, gb) = gain_coefficients(ev, adjustments.wb_offset, adjustments.hue);
         let s2l = srgb_to_linear();
         let mut rgba = vec![0u8; (size.width * size.height * 4) as usize];
@@ -419,7 +422,7 @@ impl Base for RawBase {
 
         let gain = 2.0f32.powf(ev);
         let (wr, wg, wb) = wb_gains(adjustments.wb_offset, adjustments.hue);
-        let lut = raw_tone_lut(aggressive); // RAW gets the camera-Standard S-curve
+        let lut = raw_tone_lut(false); // rolloff applies in Auto AND aggressive; RAW gets the camera-Standard S-curve
         let mut rgba = vec![0u8; (size.width * size.height * 4) as usize];
 
         // With the camera color matrix, apply WB as T = M·diag(wb)·M⁻¹ so the preview
@@ -603,14 +606,20 @@ mod tests {
             },
             &Adjustments::default(),
         );
-        // Sampling the bright half → auto-EV is slightly negative (already bright).
+        // Sampling the bright half → auto-EV is negative (already bright). The
+        // negative sign is the proof the EV was computed from the crop, not the
+        // full frame (a full-frame sample would see the dark half and go positive).
         assert!(
             out.auto_ev < 0.0,
             "auto_ev {} should be negative for a bright crop",
             out.auto_ev
         );
-        // The rendered crop stays bright (linear 0.5 at ~-0.06EV → sRGB ~184).
-        assert!(out.rgba[0] > 150, "crop render too dark: {}", out.rgba[0]);
+        // Median anchor centers the crop's midtones on the auto target (~128).
+        assert!(
+            out.rgba[0] > 100 && out.rgba[0] < 160,
+            "crop render should center midtones on the auto target, got {}",
+            out.rgba[0]
+        );
     }
 
     #[test]
