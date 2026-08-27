@@ -85,6 +85,12 @@ Three Kingdoms threading (borrowed from mpd-client), all in one Rust crate
 - **Decode once → cached base → render.** Decoded RAW/JPEG becomes a renderable
   `Base` (`JpegBase` / `RawBase`, `src/image/process.rs`); every edit re-renders
   from that original base — never cumulative, never re-decode.
+- **Auto-exposure** (`auto_exposure_ev`, `src/image/math.rs`): solved in LINEAR
+  space (the gain is applied as `linear × 2^EV`) so the anchor percentile lands
+  exactly on its target in the tone-mapped output. Median (p50) anchor: Auto
+  targets 128, Aggressive 150, `max_ev` 6.0. Both modes apply the same
+  highlight-rolloff tone LUT — Aggressive is a brighter Auto, NOT a hard-clip
+  mode.
 - Export format is **final, NOT tunable**: 4:4:4 mozjpeg Q100, adaptive quality
   down to `MAX_PHOTO_BYTES`, longest edge ≤2560px (`EXPORT_EDGE`). Interactive
   preview renders at `PREVIEW_EDGE = 1024`; grid thumbnails at ≤512px.
