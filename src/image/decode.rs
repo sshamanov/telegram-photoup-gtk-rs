@@ -344,9 +344,16 @@ mod tests {
     /// (1024) and export (2560) edge, print rendered-luminance percentiles and
     /// clip %, and the preview-vs-export tone diff at matched scale. Dumps the
     /// 1024 renders to out/ev_curves/ for visual (VLM) inspection. Run with
-    /// `cargo test --lib ev_debug_curves -- --nocapture`.
+    /// `PHOTOUP2_DEBUG_CURVES=1 cargo test --lib ev_debug_curves -- --nocapture`.
     #[test]
     fn ev_debug_curves() {
+        // Opt-in: this decodes EVERY sample and renders 3 modes at 1024+2560,
+        // which takes ~15 min in the slow debug-mode JPEG decoder over the dev
+        // instance's 19 samples — it would hang a plain `cargo test`.
+        if std::env::var_os("PHOTOUP2_DEBUG_CURVES").is_none() {
+            eprintln!("skipping ev_debug_curves — set PHOTOUP2_DEBUG_CURVES=1 to render curves over ./samples");
+            return;
+        }
         use crate::image::math::fit_within;
         use crate::image::process::{Base, JpegBase, RawBase};
         use crate::image::resize::downscale_rgba;
