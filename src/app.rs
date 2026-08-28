@@ -611,10 +611,8 @@ impl AppController {
                 self.release_active_photo_data();
                 // Deselect the grid row so clicking the same photo again re-opens
                 // the editor (SingleSelection won't re-emit if already selected).
-                // Deferred to an idle callback: we're inside `poll()`'s `RefMut`,
-                // and `set_selected` fires `selected_notify` synchronously, which
-                // would try to borrow the controller a second time (re-entrancy
-                // panic). The idle callback runs after the borrow is released.
+                // `deselect_grid` runs synchronously (safe inside this borrow: the
+                // `selected_notify` handler only schedules an idle callback).
                 self.deselect_grid();
             }
             _ => {}
@@ -1664,8 +1662,13 @@ impl AppController {
         self.refresh_screens();
     }
 
-    /// Clear the grid's selection (deferred to idle: we may be inside `poll()`'s
-    /// RefMut borrow, and `set_selected` fires `selected_notify` synchronously).
+    /// Clear the grid's selection so clicking the same photo again re-opens the
+    /// editor (SingleSelection won't re-emit `selected_notify` for a repeated
+    /// index). Runs synchronously — the `selected_notify` handler (see `setup`)
+    /// defers its controller borrow to an idle callback, so `set_selected` here
+    /// (even inside `poll()`'s `RefMut`) only schedules that callback and cannot
+    /// re-borrow. Deferring it instead let a fast re-click land while the row was
+    /// still selected, swallowing the click.
     fn deselect_grid(&mut self) {
         if let Some(sel) = self
             .main_screen
@@ -1673,9 +1676,7 @@ impl AppController {
             .model()
             .and_then(|m| m.downcast::<gtk4::SingleSelection>().ok())
         {
-            glib::idle_add_local_once(move || {
-                sel.set_selected(gtk4::INVALID_LIST_POSITION);
-            });
+            sel.set_selected(gtk4::INVALID_LIST_POSITION);
         }
     }
 
