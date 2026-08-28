@@ -92,7 +92,7 @@ Three Kingdoms threading (borrowed from mpd-client), all in one Rust crate
   modes differ only in highlight handling: **Auto** caps the p99-brightest pixel
   at 252 (just under white, no mass clip), and the cap is clamped at ≥ 0 so an
   already-blown photo keeps its white point instead of a pointless drag-down;
-  **Aggressive (Slide)** drops the cap entirely — the median governs the lift up
+  **Burn** drops the cap entirely — the median governs the lift up
   to `max_ev` 6.0 and highlights may clip to pure white. The difference between
   the two modes is therefore exactly clipping and white point.
 - Export format is **final, NOT tunable**: 4:4:4 mozjpeg Q100, adaptive quality

@@ -89,7 +89,7 @@ In short: Login (phone/code/2FA) → Main screen (header with group selector +
 **Reset** + **Logout**; upload zone; "Processing {name} (n queued)" usage
 indicator; a square-thumbnail grid with checkbox top-left, EV badge top-right,
 filename + RAW/JPG badge) → Editor (preview + right panel: histogram, Exposure
-[Auto/Slide/Rest + EV], White balance [Auto/Auto2/Pick/Reset + temp/hue], Crop
+[Auto/Burn/Rest + EV], White balance [Auto/Auto2/Pick/Reset + temp/hue], Crop
 [1:1/2:3/3:2/Original], Rotate [↺ CCW/↻ CW], Image [EXIF + output size],
 Prev/Next, Reject/Close) → sticky **Send {n} selected** footer (Preparing/
 Sending progress; sent photos are removed after a successful send).

@@ -69,7 +69,7 @@ point.
 3. Section "**Exposure**":
    - EV slider, min −3, max +5, step 0.1, zero-centered (drag updates live,
      release commits).
-   - Row: **Auto** (auto-exposure) | **Slide** (aggressive) | **Rest** (reset
+   - Row: **Auto** (auto-exposure) | **Burn** (aggressive) | **Rest** (reset
      exposure to 0) | the current EV value (e.g. `+2.7`).
 4. Section "**White balance**":
    - Temperature (warmth) slider, **−4..+4**, step 0.05, zero-centered (the wider
@@ -95,7 +95,7 @@ point.
 
 - Keep the layout/captions/sections EXACTLY as above; do not rename buttons or
   sections. ("Exposure"/"White balance"/"Crop"/"Rotate"/"Image";
-  Auto/Slide/Rest; Auto/Auto2/Reset; 1:1/2:3/3:2/Original; ↺ CCW/↻ CW;
+  Auto/Burn/Rest; Auto/Auto2/Reset; 1:1/2:3/3:2/Original; ↺ CCW/↻ CW;
   ‹ Prev/Next ›; Reject/Close; Reset/Logout; Send {n} selected;
   Preparing/Sending.)
 - The theme is a light-on-dark look with an amber accent and a display font;
