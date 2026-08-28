@@ -1133,7 +1133,12 @@ impl EditorScreen {
     /// so "0 correction" sits where the correction is, not always at the center).
     pub fn set_ev(&self, ev: f32) {
         self.ev_value.set_text(&format!("{ev:+.2} EV"));
-        if self.current_mode.get() != ExposureMode::Manual {
+        // Don't move the slider while the user is dragging it: a preview render
+        // landing mid-drag would re-sync the slider and (via `set_value`'s
+        // stale-drag guard) cancel the live drag — the "knob detaches from the
+        // pointer" bug. The user is in control during a drag; `set_ev` only
+        // positions the slider in the auto modes.
+        if self.current_mode.get() != ExposureMode::Manual && !self.exposure_slider.is_dragging() {
             self.suppress.set(true);
             self.exposure_slider.set_value(ev as f64);
             self.suppress.set(false);

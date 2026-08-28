@@ -164,7 +164,12 @@ impl FineSlider {
     pub fn set_value(&self, v: f64) {
         let v = v.clamp(self.min, self.max);
         let old = self.value.get();
-        if (v - old).abs() > 1e-9 {
+        // 1e-6 (not 1e-9): a f32→f64 roundtrip of an echo value (e.g. the editor's
+        // `set_ev` re-asserting the slider's own value after a render) lands ~1e-8
+        // off and must not count as a real change — otherwise it both marks a live
+        // drag stale and nudges the slider off its snapped grid. A real change is
+        // never below the 0.01 step.
+        if (v - old).abs() > 1e-6 {
             if self.dragging.get() {
                 self.stale_drag.set(true);
             }
@@ -178,6 +183,13 @@ impl FineSlider {
 
     pub fn value(&self) -> f64 {
         self.value.get()
+    }
+
+    /// Whether a drag is currently live. The editor uses this so a preview render
+    /// landing mid-drag does not re-sync the slider under the user's pointer (which
+    /// would cancel the drag via `set_value`'s stale-drag guard).
+    pub fn is_dragging(&self) -> bool {
+        self.dragging.get()
     }
 
     /// Register the change callback (fired on every effective `set_value`,
