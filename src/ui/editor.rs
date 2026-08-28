@@ -490,6 +490,56 @@ fn resize_crop_shift(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> N
     NormalizedCrop { x, y, width: w, height: h }
 }
 
+/// Alt pressed: resize around the crop's center — the center stays put and both
+/// edges move symmetrically, instead of `resize_crop`'s opposite-edge anchor.
+fn resize_crop_center(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> NormalizedCrop {
+    let cx = c.x + c.width / 2.0;
+    let cy = c.y + c.height / 2.0;
+    let max_w = 2.0 * cx.min(1.0 - cx);
+    let max_h = 2.0 * cy.min(1.0 - cy);
+    let mut width = c.width;
+    let mut height = c.height;
+    if matches!(handle, Handle::E | Handle::Ne | Handle::Se) {
+        width = (c.width + ndx).clamp(MIN_CROP, max_w);
+    }
+    if matches!(handle, Handle::W | Handle::Nw | Handle::Sw) {
+        width = (c.width - ndx).clamp(MIN_CROP, max_w);
+    }
+    if matches!(handle, Handle::S | Handle::Se | Handle::Sw) {
+        height = (c.height + ndy).clamp(MIN_CROP, max_h);
+    }
+    if matches!(handle, Handle::N | Handle::Nw | Handle::Ne) {
+        height = (c.height - ndy).clamp(MIN_CROP, max_h);
+    }
+    NormalizedCrop { x: cx - width / 2.0, y: cy - height / 2.0, width, height }
+}
+
+/// Alt+Shift pressed: keep the aspect ratio AND keep the center fixed — the same
+/// scale logic as `resize_crop_shift`, but anchored at the crop center instead of
+/// the opposite edge.
+fn resize_crop_shift_center(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> NormalizedCrop {
+    let sx = match handle {
+        Handle::E | Handle::Ne | Handle::Se => ndx,
+        Handle::W | Handle::Nw | Handle::Sw => -ndx,
+        _ => 0.0,
+    } / c.width;
+    let sy = match handle {
+        Handle::S | Handle::Se | Handle::Sw => ndy,
+        Handle::N | Handle::Nw | Handle::Ne => -ndy,
+        _ => 0.0,
+    } / c.height;
+    let s = 1.0 + sx.max(sy);
+    let cx = c.x + c.width / 2.0;
+    let cy = c.y + c.height / 2.0;
+    let max_w = 2.0 * cx.min(1.0 - cx);
+    let max_h = 2.0 * cy.min(1.0 - cy);
+    let scale = ((c.width * s).clamp(MIN_CROP, max_w) / c.width)
+        .min((c.height * s).clamp(MIN_CROP, max_h) / c.height);
+    let w = c.width * scale;
+    let h = c.height * scale;
+    NormalizedCrop { x: cx - w / 2.0, y: cy - h / 2.0, width: w, height: h }
+}
+
 fn rounded_rect(cr: &gtk4::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
     let r = r.min(w / 2.0).min(h / 2.0);
     cr.new_sub_path();
@@ -1253,16 +1303,17 @@ impl EditorScreen {
             let Some(d) = *drag_update.borrow() else { return };
             let ndx = (x / d.disp_w) as f32;
             let ndy = (y / d.disp_h) as f32;
-            let shift = gesture.current_event_state().contains(gdk4::ModifierType::SHIFT_MASK);
+            let state = gesture.current_event_state();
+            let shift = state.contains(gdk4::ModifierType::SHIFT_MASK);
+            let alt = state.contains(gdk4::ModifierType::ALT_MASK);
             let new = match d.kind {
                 DragKind::Move => move_crop(d.start_crop, ndx, ndy),
-                DragKind::Resize { handle } => {
-                    if shift {
-                        resize_crop_shift(d.start_crop, handle, ndx, ndy)
-                    } else {
-                        resize_crop(d.start_crop, handle, ndx, ndy)
-                    }
-                }
+                DragKind::Resize { handle } => match (alt, shift) {
+                    (true, true) => resize_crop_shift_center(d.start_crop, handle, ndx, ndy),
+                    (true, false) => resize_crop_center(d.start_crop, handle, ndx, ndy),
+                    (false, true) => resize_crop_shift(d.start_crop, handle, ndx, ndy),
+                    (false, false) => resize_crop(d.start_crop, handle, ndx, ndy),
+                },
             };
             *crop_update.borrow_mut() = Some(new);
             area_update.queue_draw();
@@ -1773,5 +1824,49 @@ mod tests {
         assert!((fine_step(0.50, 1, 0.01) - 0.51).abs() < 1e-9);
         assert!((fine_step(-0.05, 1, 0.01) - (-0.04)).abs() < 1e-9);
         assert!((fine_step(-0.05, -1, 0.01) - (-0.06)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resize_center_keeps_center() {
+        // A centered crop {0.3,0.3,0.4,0.4} has center (0.5,0.5).
+        let c = NormalizedCrop { x: 0.3, y: 0.3, width: 0.4, height: 0.4 };
+        // SE grow: width+0.1, height+0.1; both edges move so the center stays.
+        let r = resize_crop_center(c, Handle::Se, 0.1, 0.1);
+        assert!((r.x + r.width / 2.0 - 0.5).abs() < 1e-6, "x-center {}", r.x + r.width / 2.0);
+        assert!((r.y + r.height / 2.0 - 0.5).abs() < 1e-6, "y-center {}", r.y + r.height / 2.0);
+        assert!((r.width - 0.5).abs() < 1e-6 && (r.height - 0.5).abs() < 1e-6);
+        // W shrink: dragging the left edge right shrinks width around the center.
+        let r2 = resize_crop_center(c, Handle::W, 0.1, 0.0);
+        assert!((r2.x + r2.width / 2.0 - 0.5).abs() < 1e-6);
+        assert!((r2.width - 0.3).abs() < 1e-6);
+        // The center never escapes the frame: growing far past one edge clamps
+        // the half-extent to that edge (2*cx = 0.4 here), leaving x >= 0.
+        let near_left = NormalizedCrop { x: 0.1, y: 0.1, width: 0.2, height: 0.2 };
+        let r3 = resize_crop_center(near_left, Handle::E, 0.5, 0.0);
+        assert!(r3.x >= -1e-6, "x {:.4}", r3.x);
+        assert!((r3.width - 0.4).abs() < 1e-6, "clamped to 2*cx=0.4, got {}", r3.width);
+    }
+
+    #[test]
+    fn resize_shift_center_keeps_center_and_ratio() {
+        let c = NormalizedCrop { x: 0.3, y: 0.2, width: 0.4, height: 0.3 }; // ratio 4:3
+        // SE grow driven by the dominant axis (E: sx=0.25 > sy=0.1667).
+        let r = resize_crop_shift_center(c, Handle::Se, 0.1, 0.05);
+        assert!((r.x + r.width / 2.0 - 0.5).abs() < 1e-6, "cx {}", r.x + r.width / 2.0);
+        assert!((r.y + r.height / 2.0 - 0.35).abs() < 1e-6, "cy {}", r.y + r.height / 2.0);
+        assert!(
+            (r.width / r.height - c.width / c.height).abs() < 1e-6,
+            "ratio {}",
+            r.width / r.height
+        );
+        assert!(r.width > c.width, "grew: {} vs {}", r.width, c.width);
+        // Side drag keeps ratio and center too.
+        let r2 = resize_crop_shift_center(c, Handle::E, 0.1, 0.0);
+        assert!((r2.x + r2.width / 2.0 - 0.5).abs() < 1e-6);
+        assert!((r2.width / r2.height - c.width / c.height).abs() < 1e-6);
+        // Shrink (corner dragged inward) shrinks both axes, center still fixed.
+        let r3 = resize_crop_shift_center(c, Handle::Se, -0.1, -0.05);
+        assert!(r3.width < c.width && r3.height < c.height);
+        assert!((r3.x + r3.width / 2.0 - 0.5).abs() < 1e-6);
     }
 }
