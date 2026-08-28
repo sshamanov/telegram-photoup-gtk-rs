@@ -315,9 +315,14 @@ const ACCENT: (f64, f64, f64) = (0xFF as f64 / 255.0, 0x7A as f64 / 255.0, 0x45 
 /// Handle fill, photoup `.h` background #f2eadf.
 const HANDLE_FILL: (f64, f64, f64) = (0xF2 as f64 / 255.0, 0xEA as f64 / 255.0, 0xDF as f64 / 255.0);
 /// Handle square size in px.
-const HANDLE_SIZE: f64 = 20.0;
+const HANDLE_SIZE: f64 = 14.0;
 /// Half-extent hit radius (px) around a handle anchor for grabbing it.
-const HANDLE_HIT: f64 = 40.0;
+const HANDLE_HIT: f64 = 26.0;
+/// Border-grab tolerance (px): a press within this distance of a crop-box edge
+/// grabs that edge for resizing. The crop box's 1.5px accent border is a thin
+/// target on its own — this widens the grabbable band so clicking the border
+/// resizes instead of silently doing nothing (the "handle not picked" bug).
+const EDGE_HIT: f64 = 10.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Handle {
@@ -380,6 +385,29 @@ fn crop_rect(p: &Projection, c: &NormalizedCrop) -> (f64, f64, f64, f64) {
         c.width as f64 * p.disp_w,
         c.height as f64 * p.disp_h,
     )
+}
+
+/// Map a press near the crop-box border to the resize handle it should grab.
+/// Corners win over edges; returns `None` when the press is not near any edge
+/// (the caller then falls through to Move / no-op). Used as a second pass after
+/// the handle-anchor hit test so the whole border is grabbable, not just the 8
+/// small handle squares.
+fn edge_handle_at(x: f64, y: f64, rx: f64, ry: f64, rw: f64, rh: f64) -> Option<Handle> {
+    let near_top = (y - ry).abs() <= EDGE_HIT;
+    let near_bottom = (y - (ry + rh)).abs() <= EDGE_HIT;
+    let near_left = (x - rx).abs() <= EDGE_HIT;
+    let near_right = (x - (rx + rw)).abs() <= EDGE_HIT;
+    match (near_top, near_bottom, near_left, near_right) {
+        (true, _, true, _) => Some(Handle::Nw),
+        (true, _, _, true) => Some(Handle::Ne),
+        (_, true, true, _) => Some(Handle::Sw),
+        (_, true, _, true) => Some(Handle::Se),
+        (true, _, _, _) => Some(Handle::N),
+        (_, true, _, _) => Some(Handle::S),
+        (_, _, true, _) => Some(Handle::W),
+        (_, _, _, true) => Some(Handle::E),
+        _ => None,
+    }
 }
 
 /// The 8 handle anchors (corners + edge midpoints) of the crop rect.
@@ -1312,8 +1340,11 @@ impl EditorScreen {
             }
             let kind = match best {
                 Some((handle, _)) => DragKind::Resize { handle },
-                None if x >= rx && x <= rx + rw && y >= ry && y <= ry + rh => DragKind::Move,
-                _ => return,
+                None => match edge_handle_at(x, y, rx, ry, rw, rh) {
+                    Some(handle) => DragKind::Resize { handle },
+                    None if x >= rx && x <= rx + rw && y >= ry && y <= ry + rh => DragKind::Move,
+                    _ => return,
+                },
             };
             *drag_begin.borrow_mut() = Some(DragState {
                 kind,
@@ -1409,10 +1440,12 @@ impl EditorScreen {
             };
             let (rx, ry, rw, rh) = crop_rect(&p, &c);
             let hit2 = HANDLE_HIT * HANDLE_HIT;
-            if handle_anchors(rx, ry, rw, rh)
+            let near_handle = handle_anchors(rx, ry, rw, rh)
                 .iter()
-                .any(|(_h, hx, hy)| (x - hx) * (x - hx) + (y - hy) * (y - hy) <= hit2)
-            {
+                .any(|(_h, hx, hy)| (x - hx) * (x - hx) + (y - hy) * (y - hy) <= hit2);
+            // A press on the crop border is a resize grab, not a pick — keep the
+            // click and drag gestures in agreement about what is "the handle".
+            if near_handle || edge_handle_at(x, y, rx, ry, rw, rh).is_some() {
                 return;
             }
             // Normalized position over the displayed (letterboxed) image.
@@ -1902,6 +1935,47 @@ mod tests {
 
     /// Regression for the writer-side panic: a crop shunted flush against an edge
     /// (`x: 0.95, width: 0.05`) has center cx = 0.975000006, whose f32
+    /// Border presses resolve to the right resize handle: any point within
+    /// `EDGE_HIT` px of an edge grabs that edge, corners win over edges, and the
+    /// interior / far-outside presses are not grabs. This is the second pass that
+    /// makes the whole crop-box border grabbable (not just the 8 handle squares).
+    #[test]
+    fn edge_handle_at_resolves_border_grabs() {
+        let (rx, ry, rw, rh) = (100.0, 100.0, 400.0, 300.0); // 100,100 → 500,400
+        // On each edge midpoint — must grab that edge.
+        assert_eq!(edge_handle_at(300.0, 100.0, rx, ry, rw, rh), Some(Handle::N));
+        assert_eq!(edge_handle_at(300.0, 400.0, rx, ry, rw, rh), Some(Handle::S));
+        assert_eq!(edge_handle_at(100.0, 250.0, rx, ry, rw, rh), Some(Handle::W));
+        assert_eq!(edge_handle_at(500.0, 250.0, rx, ry, rw, rh), Some(Handle::E));
+        // Corners — both bordering edges resolve to the corner handle.
+        assert_eq!(edge_handle_at(95.0, 95.0, rx, ry, rw, rh), Some(Handle::Nw));
+        assert_eq!(edge_handle_at(505.0, 95.0, rx, ry, rw, rh), Some(Handle::Ne));
+        assert_eq!(edge_handle_at(95.0, 405.0, rx, ry, rw, rh), Some(Handle::Sw));
+        assert_eq!(edge_handle_at(505.0, 405.0, rx, ry, rw, rh), Some(Handle::Se));
+        // A few px inside an edge still grabs it (the tolerance band).
+        assert_eq!(edge_handle_at(300.0, 107.0, rx, ry, rw, rh), Some(Handle::N));
+        // Deep inside the box or far outside → not a border grab.
+        assert_eq!(edge_handle_at(300.0, 250.0, rx, ry, rw, rh), None);
+        assert_eq!(edge_handle_at(300.0, 140.0, rx, ry, rw, rh), None);
+        assert_eq!(edge_handle_at(20.0, 250.0, rx, ry, rw, rh), None);
+        assert_eq!(edge_handle_at(300.0, 600.0, rx, ry, rw, rh), None);
+    }
+
+    /// An edge grab that hugs the bottom edge must still clamp in-frame (the
+    /// `clamp_crop` net from the panic fix applies to edge-grab drags too).
+    #[test]
+    fn edge_grab_at_bottom_edge_stays_in_frame() {
+        let mut c = NormalizedCrop { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
+        // Simulate grabbing the bottom edge and dragging it down (ndy > 0 pushes
+        // the rect past the frame; the writer must clamp it back).
+        c = resize_crop(c, Handle::S, 0.0, 0.25);
+        assert!(c.y + c.height <= 1.0 + 1e-6 && c.height >= MIN_CROP, "{c:?}");
+        // Grabbing the top edge and dragging it up.
+        c = NormalizedCrop { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
+        c = resize_crop(c, Handle::N, 0.0, 0.3);
+        assert!(c.y >= -1e-6 && c.height >= MIN_CROP, "{c:?}");
+    }
+
     /// `2·(1−cx)` bound dips a hair under MIN_CROP → `.clamp(MIN_CROP, bound)`
     /// used to panic. The bound is now floored at MIN_CROP.
     #[test]
