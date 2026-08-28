@@ -1036,6 +1036,19 @@ impl EditorScreen {
         self.preview.set_paintable(texture);
     }
 
+    /// Set the display dimensions of the active photo. `dims` must be the
+    /// DISPLAY-oriented size (already rotated) — the crop projection and the
+    /// handle hit-test scale normalized crop coordinates against it.
+    ///
+    /// Without this the crop box is never drawn and crop drags silently no-op
+    /// (both `draw_crop_overlay` and `drag_begin` bail when `full_size` is None).
+    /// `set_photo` normally fills it, but a photo opened before its thumbnail has
+    /// finished decoding gets filled here once the preview render lands.
+    pub fn set_full_size(&self, dims: (u32, u32)) {
+        self.full_size.set(Some(dims));
+        self.crop_area.queue_draw();
+    }
+
     /// Fine-tune the exposure EV slider (keyboard Q/W). Moving the slider fires its
     /// value_changed → PhotoEdit (switches to Manual EV, like dragging it by hand).
     /// Steps snap to the 0.05 grid: an auto value like +1.93 → +1.90 (Q) / +1.95 (W).

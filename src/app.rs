@@ -805,6 +805,7 @@ impl AppController {
                         size.0 as i32,
                         size.1 as i32,
                     )));
+                    self.editor.set_full_size(full);
                     self.editor.set_histogram(&histogram);
                     self.editor.set_ev(self.effective_ev_for(id, auto_ev));
                     // The decode path carries the camera matrix the editor's WB
