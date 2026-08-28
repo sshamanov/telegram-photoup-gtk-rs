@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock};
 use gtk4::prelude::*;
 use gtk4::{Box as GBox, Button, DrawingArea, Label, Orientation, Picture};
 
-use crate::image::math::crop_to_pixels;
+use crate::image::math::{clamp_crop, crop_to_pixels};
 use crate::ui::slider::FineSlider;
 use crate::image::process::export_dimensions;
 use crate::image::srgb::{auto_wb, wb_from_pick};
@@ -319,7 +319,7 @@ const HANDLE_SIZE: f64 = 14.0;
 /// Half-extent hit radius (px) around a handle anchor for grabbing it.
 const HANDLE_HIT: f64 = 26.0;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Handle {
     Nw,
     N,
@@ -398,11 +398,14 @@ fn handle_anchors(rx: f64, ry: f64, rw: f64, rh: f64) -> [(Handle, f64, f64); 8]
 
 /// Drag inside the selection: shift the rect, clamped to [0,1].
 fn move_crop(c: NormalizedCrop, ndx: f32, ndy: f32) -> NormalizedCrop {
-    NormalizedCrop {
-        x: (c.x + ndx).clamp(0.0, 1.0 - c.width),
-        y: (c.y + ndy).clamp(0.0, 1.0 - c.height),
-        ..c
-    }
+    clamp_crop(
+        NormalizedCrop {
+            x: (c.x + ndx).clamp(0.0, 1.0 - c.width),
+            y: (c.y + ndy).clamp(0.0, 1.0 - c.height),
+            ..c
+        },
+        MIN_CROP,
+    )
 }
 
 /// Resize one edge/corner; the opposite edge stays put (photoup default path).
@@ -412,20 +415,20 @@ fn resize_crop(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> Normali
     let mut width = c.width;
     let mut height = c.height;
     if matches!(handle, Handle::E | Handle::Ne | Handle::Se) {
-        width = (c.width + ndx).clamp(MIN_CROP, 1.0 - c.x);
+        width = (c.width + ndx).clamp(MIN_CROP, (1.0 - c.x).max(MIN_CROP));
     }
     if matches!(handle, Handle::W | Handle::Nw | Handle::Sw) {
         x = (c.x + ndx).clamp(0.0, c.x + c.width - MIN_CROP);
         width = c.x + c.width - x;
     }
     if matches!(handle, Handle::S | Handle::Se | Handle::Sw) {
-        height = (c.height + ndy).clamp(MIN_CROP, 1.0 - c.y);
+        height = (c.height + ndy).clamp(MIN_CROP, (1.0 - c.y).max(MIN_CROP));
     }
     if matches!(handle, Handle::N | Handle::Nw | Handle::Ne) {
         y = (c.y + ndy).clamp(0.0, c.y + c.height - MIN_CROP);
         height = c.y + c.height - y;
     }
-    NormalizedCrop { x, y, width, height }
+    clamp_crop(NormalizedCrop { x, y, width, height }, MIN_CROP)
 }
 
 /// Shift pressed: keep the aspect ratio (photoup `resizeCrop` shift branch).
@@ -434,22 +437,28 @@ fn resize_crop_shift(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> N
     if is_side {
         if matches!(handle, Handle::E | Handle::W) {
             let (x, w) = if handle == Handle::E {
-                (c.x, (c.width + ndx).clamp(MIN_CROP, 1.0 - c.x))
+                (c.x, (c.width + ndx).clamp(MIN_CROP, (1.0 - c.x).max(MIN_CROP)))
             } else {
                 let x = (c.x + ndx).clamp(0.0, c.x + c.width - MIN_CROP);
                 (x, c.x + c.width - x)
             };
             let h = c.height * (w / c.width);
-            return NormalizedCrop { x, y: c.y + (c.height - h) / 2.0, width: w, height: h };
+            return clamp_crop(
+                NormalizedCrop { x, y: c.y + (c.height - h) / 2.0, width: w, height: h },
+                MIN_CROP,
+            );
         }
         let (y, h) = if handle == Handle::S {
-            (c.y, (c.height + ndy).clamp(MIN_CROP, 1.0 - c.y))
+            (c.y, (c.height + ndy).clamp(MIN_CROP, (1.0 - c.y).max(MIN_CROP)))
         } else {
             let y = (c.y + ndy).clamp(0.0, c.y + c.height - MIN_CROP);
             (y, c.y + c.height - y)
         };
         let w = c.width * (h / c.height);
-        return NormalizedCrop { x: c.x + (c.width - w) / 2.0, y, width: w, height: h };
+        return clamp_crop(
+            NormalizedCrop { x: c.x + (c.width - w) / 2.0, y, width: w, height: h },
+            MIN_CROP,
+        );
     }
     // Corner handles anchor the opposite corner.
     let sx = match handle {
@@ -467,12 +476,14 @@ fn resize_crop_shift(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> N
         c.x + c.width
     } else {
         1.0 - c.x
-    };
+    }
+    .max(MIN_CROP);
     let max_h = if matches!(handle, Handle::N | Handle::Nw | Handle::Ne) {
         c.y + c.height
     } else {
         1.0 - c.y
-    };
+    }
+    .max(MIN_CROP);
     let scale = ((c.width * s).clamp(MIN_CROP, max_w) / c.width)
         .min((c.height * s).clamp(MIN_CROP, max_h) / c.height);
     let w = c.width * scale;
@@ -487,7 +498,7 @@ fn resize_crop_shift(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> N
     } else {
         c.y
     };
-    NormalizedCrop { x, y, width: w, height: h }
+    clamp_crop(NormalizedCrop { x, y, width: w, height: h }, MIN_CROP)
 }
 
 /// Alt pressed: resize around the crop's center — the center stays put and both
@@ -495,8 +506,8 @@ fn resize_crop_shift(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> N
 fn resize_crop_center(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> NormalizedCrop {
     let cx = c.x + c.width / 2.0;
     let cy = c.y + c.height / 2.0;
-    let max_w = 2.0 * cx.min(1.0 - cx);
-    let max_h = 2.0 * cy.min(1.0 - cy);
+    let max_w = (2.0 * cx.min(1.0 - cx)).max(MIN_CROP);
+    let max_h = (2.0 * cy.min(1.0 - cy)).max(MIN_CROP);
     let mut width = c.width;
     let mut height = c.height;
     if matches!(handle, Handle::E | Handle::Ne | Handle::Se) {
@@ -511,7 +522,10 @@ fn resize_crop_center(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> 
     if matches!(handle, Handle::N | Handle::Nw | Handle::Ne) {
         height = (c.height - ndy).clamp(MIN_CROP, max_h);
     }
-    NormalizedCrop { x: cx - width / 2.0, y: cy - height / 2.0, width, height }
+    clamp_crop(
+        NormalizedCrop { x: cx - width / 2.0, y: cy - height / 2.0, width, height },
+        MIN_CROP,
+    )
 }
 
 /// Alt+Shift pressed: keep the aspect ratio AND keep the center fixed — the same
@@ -531,13 +545,13 @@ fn resize_crop_shift_center(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f3
     let s = 1.0 + sx.max(sy);
     let cx = c.x + c.width / 2.0;
     let cy = c.y + c.height / 2.0;
-    let max_w = 2.0 * cx.min(1.0 - cx);
-    let max_h = 2.0 * cy.min(1.0 - cy);
+    let max_w = (2.0 * cx.min(1.0 - cx)).max(MIN_CROP);
+    let max_h = (2.0 * cy.min(1.0 - cy)).max(MIN_CROP);
     let scale = ((c.width * s).clamp(MIN_CROP, max_w) / c.width)
         .min((c.height * s).clamp(MIN_CROP, max_h) / c.height);
     let w = c.width * scale;
     let h = c.height * scale;
-    NormalizedCrop { x: cx - w / 2.0, y: cy - h / 2.0, width: w, height: h }
+    clamp_crop(NormalizedCrop { x: cx - w / 2.0, y: cy - h / 2.0, width: w, height: h }, MIN_CROP)
 }
 
 fn rounded_rect(cr: &gtk4::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
@@ -615,12 +629,15 @@ fn crop_preset_handler(
         } else {
             (target, 1.0)
         };
-        let crop = NormalizedCrop {
-            x: (1.0 - w) / 2.0,
-            y: (1.0 - h) / 2.0,
-            width: w,
-            height: h,
-        };
+        let crop = clamp_crop(
+            NormalizedCrop {
+                x: (1.0 - w) / 2.0,
+                y: (1.0 - h) / 2.0,
+                width: w,
+                height: h,
+            },
+            MIN_CROP,
+        );
         *crop_cell.borrow_mut() = Some(crop);
         crop_area.queue_draw();
         let mut adj = current_adjustments(&state.read().unwrap(), id);
@@ -1881,5 +1898,78 @@ mod tests {
         let r3 = resize_crop_shift_center(c, Handle::Se, -0.1, -0.05);
         assert!(r3.width < c.width && r3.height < c.height);
         assert!((r3.x + r3.width / 2.0 - 0.5).abs() < 1e-6);
+    }
+
+    /// Regression for the writer-side panic: a crop shunted flush against an edge
+    /// (`x: 0.95, width: 0.05`) has center cx = 0.975000006, whose f32
+    /// `2·(1−cx)` bound dips a hair under MIN_CROP → `.clamp(MIN_CROP, bound)`
+    /// used to panic. The bound is now floored at MIN_CROP.
+    #[test]
+    fn center_resize_at_edge_never_panics() {
+        // The exact failing input from the fuzz: right-edge crop, Ne grow, Alt.
+        let c = NormalizedCrop { x: 0.95, y: 0.0, width: 0.050000012, height: 0.82297975 };
+        let r = resize_crop_center(c, Handle::Ne, 0.529804707, 0.043798685);
+        assert!(r.x + r.width <= 1.0 + 1e-6 && r.width >= MIN_CROP, "in-frame: {r:?}");
+        // Same shape via the shift-center and plain-shift paths.
+        let r2 = resize_crop_shift_center(c, Handle::Ne, 0.5, 0.0);
+        assert!(r2.x + r2.width <= 1.0 + 1e-6 && r2.width >= MIN_CROP, "in-frame: {r2:?}");
+        let r3 = resize_crop_shift(c, Handle::Ne, 0.5, 0.0);
+        assert!(r3.x + r3.width <= 1.0 + 1e-6 && r3.width >= MIN_CROP, "in-frame: {r3:?}");
+    }
+
+    /// Fuzz: a chain of random drags (like a real user edit session) must never
+    /// make a writer panic nor leave a crop that overhangs the image. This is the
+    /// regression net for the "one photo stuck" worker panic: before the
+    /// writers clamped their output, an edge-hugging crop could produce a pixel
+    /// rect past the image edge and the render panicked.
+    #[test]
+    fn fuzz_drag_chain_keeps_rect_in_bounds() {
+        use crate::image::math::crop_to_pixels;
+        let mut seed: u64 = 0x9e3779b97f4a7c15;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed as f64 / u64::MAX as f64) as f32
+        };
+        let (w, h) = (3680u32, 2456u32);
+        let mut c = NormalizedCrop { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
+        for step in 0..200_000 {
+            let r = crop_to_pixels(&c, w, h);
+            assert!(
+                r.x + r.width <= w && r.y + r.height <= h,
+                "step {step}: crop {:?} → rect {r:?} overhangs {w}x{h}",
+                c
+            );
+            // random drag
+            let handle = match (rnd() * 8.0) as usize {
+                0 => Handle::N, 1 => Handle::S, 2 => Handle::E, 3 => Handle::W,
+                4 => Handle::Ne, 5 => Handle::Nw, 6 => Handle::Se, _ => Handle::Sw,
+            };
+            let alt = rnd() < 0.3;
+            let shift = rnd() < 0.3;
+            let ndx = (rnd() - 0.5) * 2.0; // -1..1
+            let ndy = (rnd() - 0.5) * 2.0;
+            let do_move = rnd() < 0.15;
+            let res = std::panic::catch_unwind(|| {
+                if do_move {
+                    move_crop(c, ndx, ndy)
+                } else {
+                    match (alt, shift) {
+                        (true, true) => resize_crop_shift_center(c, handle, ndx, ndy),
+                        (true, false) => resize_crop_center(c, handle, ndx, ndy),
+                        (false, true) => resize_crop_shift(c, handle, ndx, ndy),
+                        (false, false) => resize_crop(c, handle, ndx, ndy),
+                    }
+                }
+            });
+            match res {
+                Ok(c2) => c = c2,
+                Err(_) => panic!(
+                    "writer panicked at step {step}: c={c:?} handle={handle:?} alt={alt} \
+                     shift={shift} ndx={ndx:.9} ndy={ndy:.9}"
+                ),
+            }
+        }
     }
 }

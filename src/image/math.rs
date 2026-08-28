@@ -16,13 +16,45 @@ pub fn fit_within(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
     )
 }
 
-/// Convert a normalized crop to integer pixel coordinates for a given source size.
+/// Clamp a normalized crop into the frame `[0,1]²`, keeping at least `min_frac`
+/// in each dimension. Never panics — NaN, negative, oversized, or empty inputs
+/// all land on a valid in-frame crop. (The per-axis bounds are computed before
+/// the clamp, so the clamp's min ≤ max is guaranteed by construction.)
+pub fn clamp_crop(c: NormalizedCrop, min_frac: f32) -> NormalizedCrop {
+    let min_frac = min_frac.max(1e-3);
+    let x = if c.x.is_nan() { 0.0 } else { c.x };
+    let y = if c.y.is_nan() { 0.0 } else { c.y };
+    let mut w = if c.width.is_nan() { 1.0 } else { c.width };
+    let mut h = if c.height.is_nan() { 1.0 } else { c.height };
+    // Floor the size, then collapse anything oversized to the full frame.
+    w = w.max(min_frac).min(1.0);
+    h = h.max(min_frac).min(1.0);
+    // Origin clamped so the rect stays inside — bounds are ≥ 0 here.
+    NormalizedCrop {
+        x: x.clamp(0.0, 1.0 - w),
+        y: y.clamp(0.0, 1.0 - h),
+        width: w,
+        height: h,
+    }
+}
+
+/// Convert a normalized crop to integer pixel coordinates for a given source
+/// size. The result is clamped into the image: no `x + width` may exceed the
+/// source (rounding of a crop hugging the right/bottom edge would otherwise
+/// overhang by a pixel or two and panic the crop-extraction loop in
+/// `process.rs`).
 pub fn crop_to_pixels(crop: &NormalizedCrop, width: u32, height: u32) -> Rect {
+    let width = width.max(1);
+    let height = height.max(1);
+    let x = ((crop.x * width as f32).round() as i64).clamp(0, width as i64 - 1);
+    let y = ((crop.y * height as f32).round() as i64).clamp(0, height as i64 - 1);
+    let w = ((crop.width * width as f32).round() as i64).max(1).min(width as i64 - x);
+    let h = ((crop.height * height as f32).round() as i64).max(1).min(height as i64 - y);
     Rect {
-        x: (crop.x * width as f32).round() as u32,
-        y: (crop.y * height as f32).round() as u32,
-        width: ((crop.width * width as f32).round() as u32).max(1),
-        height: ((crop.height * height as f32).round() as u32).max(1),
+        x: x as u32,
+        y: y as u32,
+        width: w as u32,
+        height: h as u32,
     }
 }
 
@@ -159,6 +191,43 @@ mod tests {
                 height: 400
             }
         );
+    }
+
+    /// Regression: the "one photo stuck" panic. A crop hugging the right edge
+    /// rounds its x and width up independently, so a crop whose normalized
+    /// x + width is ≈ 1.0 used to produce a pixel rect that overhangs the image
+    /// by a couple of pixels — the crop-extraction loop then read past the
+    /// buffer (`range end index ... out of range`).
+    #[test]
+    fn crop_to_pixels_clamps_overhang() {
+        let (w, h) = (3680u32, 2456u32);
+        // x + width ≈ 1.0 exactly; both terms round up → old code gave W+2.
+        let edge = NormalizedCrop { x: 0.4999, y: 0.0, width: 0.5001, height: 1.0 };
+        let r = crop_to_pixels(&edge, w, h);
+        assert!(r.x + r.width <= w, "right overhang: {:?}", r);
+        assert!(r.y + r.height <= h, "bottom overhang: {:?}", r);
+        assert!(r.width >= 1 && r.height >= 1, "collapsed: {:?}", r);
+        // Full frame stays full frame.
+        let full = NormalizedCrop { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
+        assert_eq!(crop_to_pixels(&full, w, h), Rect { x: 0, y: 0, width: 3680, height: 2456 });
+        // Degenerate inputs never panic and never produce an empty rect.
+        let bad = NormalizedCrop { x: f32::NAN, y: -2.0, width: 3.0, height: f32::INFINITY };
+        let r = crop_to_pixels(&bad, w, h);
+        assert!(r.x + r.width <= w && r.y + r.height <= h && r.width >= 1 && r.height >= 1);
+    }
+
+    #[test]
+    fn clamp_crop_sanitizes_degenerate_input() {
+        let c = clamp_crop(
+            NormalizedCrop { x: f32::NAN, y: -1.0, width: 0.0, height: 2.0 },
+            0.05,
+        );
+        assert!(c.x >= 0.0 && c.x + c.width <= 1.0 + 1e-6);
+        assert!(c.y >= 0.0 && c.y + c.height <= 1.0 + 1e-6);
+        assert!(c.width >= 0.05 && c.height >= 0.05);
+        // In-frame input is unchanged (identity).
+        let ok = NormalizedCrop { x: 0.3, y: 0.2, width: 0.4, height: 0.5 };
+        assert_eq!(clamp_crop(ok, 0.05), ok);
     }
 
     #[test]

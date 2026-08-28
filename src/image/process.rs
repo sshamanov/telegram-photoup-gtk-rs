@@ -649,6 +649,33 @@ mod tests {
         );
     }
 
+    /// Regression for the "one photo stuck" panic: a crop whose normalized
+    /// x + width ≈ 1.0 rounds x and width up independently, producing a pixel
+    /// rect that overhangs the image — the crop-extraction loop then read past
+    /// the buffer and the worker panicked. Rendering must clamp into the frame
+    /// instead.
+    #[test]
+    fn render_with_edge_crop_stays_in_bounds() {
+        let base = uniform_base(0.5, 64, 48);
+        // x·64 = 31.5 and width·64 = 32.5: both round up (32 + 33 = 65 > 64).
+        let edge = NormalizedCrop {
+            x: 31.5 / 64.0,
+            y: 0.0,
+            width: 32.5 / 64.0,
+            height: 1.0,
+        };
+        assert!((edge.x + edge.width - 1.0).abs() < 1e-6, "normalized sum ≈ 1");
+        // Must not panic: pre-fix this read `self.rgba[src_off..src_off + 33·4]`
+        // past the 64-px row end. The clamped rect is 32 px wide and downscales
+        // to the 16×16 output.
+        let out = base.render(
+            Some(&edge),
+            Size { width: 16, height: 16 },
+            &Adjustments::default(),
+        );
+        assert_eq!(out.rgba.len(), 16 * 16 * 4, "render with edge crop failed");
+    }
+
     #[test]
     fn rolloff_preserves_highlight_detail() {
         // A value in the rolloff band must be below its linear→srgb identity.
