@@ -31,12 +31,18 @@ pub struct AutoExpOpts {
     pub min_ev: f32,
     pub max_ev: f32,
     pub percentile: f32,
-    /// Highlight cap: the `hi_percentile`-brightest pixel is allowed to ride at
-    /// most to this sRGB byte value. Caps the EV on skewed histograms so a mass
-    /// of pixels never blows into pure white (the median-anchor failure: photos
-    /// that aren't a normal distribution got hard-clipped, up to 20–40% white).
+    /// Highlight cap (`Auto`): the `hi_percentile`-brightest pixel may ride at
+    /// most to this sRGB byte value, and the cap is clamped at ≥ 0 — a photo
+    /// already brighter than it keeps its white point instead of being dragged
+    /// down pointlessly. Keeps a skewed histogram from blowing a mass of pixels
+    /// into pure white.
     pub hi_target: f32,
     pub hi_percentile: f32,
+    /// When true (`Aggressive`), the highlight cap is dropped entirely: the
+    /// median anchor governs the lift and highlights may clip to white. The two
+    /// modes therefore differ in exactly what they should — clipping and white
+    /// point — not in midtone target.
+    pub clip_highlights: bool,
 }
 
 impl Default for AutoExpOpts {
@@ -46,8 +52,9 @@ impl Default for AutoExpOpts {
             min_ev: -3.0,
             max_ev: 4.0,
             percentile: 0.6,
-            hi_target: 245.0,
+            hi_target: 252.0,
             hi_percentile: 0.99,
+            clip_highlights: false,
         }
     }
 }
@@ -61,16 +68,17 @@ impl Default for AutoExpOpts {
 /// anchor ~25–30% below target because of gamma — that's the old "exposure feels
 /// weak" bug.)
 ///
-/// Two bounds sit around the median anchor, because a single global EV can't both
-/// center the midtones and respect a skewed histogram:
-/// - **Highlight cap** (`hi_target`/`hi_percentile`): the brightest few percent of
-///   pixels may reach at most `hi_target`, so dark-photo lifting never shoves a
-///   big bright area into pure white. A skewed histogram therefore gets as much
-///   lift as its highlights allow, and the dark bulk simply stays dark — the
-///   alternative (centering the median) is what clipped 20–40% of pixels white.
-/// - **No-darkening floor**: auto never goes negative, except as far as the
-///   highlight cap demands (a photo already brighter than `hi_target` is pulled
-///   back to it). Bright photos are left alone instead of "centered" down to gray.
+/// Auto never darkens a photo: EV is floored at 0, so bright photos are left
+/// alone instead of "centered" down to gray. The two exposure modes differ only
+/// in how they treat highlights:
+/// - **Auto** (`clip_highlights: false`): a highlight cap binds the lift — the
+///   `hi_percentile`-brightest pixel may ride at most to `hi_target` (just under
+///   white), so a skewed histogram never blows a mass of pixels into pure white
+///   and the dark bulk simply stays dark. The cap is clamped at ≥ 0: a photo
+///   already brighter than `hi_target` keeps its white point (EV 0), never a
+///   pointless drag-down.
+/// - **Aggressive** (`clip_highlights: true`): no cap — the median anchor
+///   governs the lift up to `max_ev` and highlights are free to clip to white.
 pub fn auto_exposure_ev(luminances: &[u8], opts: &AutoExpOpts) -> f32 {
     if luminances.is_empty() {
         return 0.0;
@@ -89,10 +97,17 @@ pub fn auto_exposure_ev(luminances: &[u8], opts: &AutoExpOpts) -> f32 {
         let idx = (sorted.len() - 1).min((sorted.len() as f32 * p) as usize);
         sorted[idx] as f32
     };
-    let median_ev = (srgb_to_linear(opts.target) / srgb_to_linear(at(opts.percentile)).max(1e-6)).log2();
-    let cap_ev =
-        (srgb_to_linear(opts.hi_target) / srgb_to_linear(at(opts.hi_percentile)).max(1e-6)).log2();
-    let ev = clamp(median_ev, cap_ev.min(0.0), cap_ev.min(opts.max_ev));
+    let median_ev =
+        (srgb_to_linear(opts.target) / srgb_to_linear(at(opts.percentile)).max(1e-6)).log2();
+    let ev = if opts.clip_highlights {
+        clamp(median_ev, 0.0, opts.max_ev)
+    } else {
+        let cap_ev = (srgb_to_linear(opts.hi_target)
+            / srgb_to_linear(at(opts.hi_percentile)).max(1e-6))
+        .log2()
+        .max(0.0);
+        clamp(median_ev, 0.0, cap_ev.min(opts.max_ev))
+    };
     clamp(ev, opts.min_ev, opts.max_ev)
 }
 

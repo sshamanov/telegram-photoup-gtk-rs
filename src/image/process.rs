@@ -180,20 +180,20 @@ fn sample_luminances_rgba(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
 }
 
 fn auto_ev_for(lums: &[u8], aggressive: bool) -> f32 {
-    // Median anchor (p50), midtones → histogram center; EV solved in linear space
-    // so the anchor lands exactly on the target after the tone LUT. The highlight
-    // cap (p99 → 245) bounds the EV on skewed histograms so the lift never shoves
-    // a mass of pixels into pure white — the median-anchor-alone failure.
+    // Both modes anchor the midtones (p50 → 128), solved in linear space so the
+    // anchor lands exactly on the target after the tone LUT. The modes differ
+    // only in how they treat highlights: Auto caps p99 at 252 (just under white,
+    // no mass clip, never darkens), Aggressive drops the cap so the median
+    // governs and highlights may clip to white.
     auto_exposure_ev(
         lums,
         &AutoExpOpts {
-            target: if aggressive { 150.0 } else { 128.0 },
+            target: 128.0,
             percentile: 0.5,
-            // Aggressive rides the top 1% up to 252 (a brighter Auto), while Auto
-            // keeps it at 245 — the cap still prevents a mass white peak in both.
-            hi_target: if aggressive { 252.0 } else { 245.0 },
+            hi_target: if aggressive { 255.0 } else { 252.0 },
             hi_percentile: 0.99,
             max_ev: 6.0,
+            clip_highlights: aggressive,
             ..Default::default()
         },
     )
