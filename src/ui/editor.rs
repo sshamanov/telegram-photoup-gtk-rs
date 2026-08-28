@@ -722,6 +722,9 @@ impl EditorScreen {
         panel_scroll.set_width_request(332);
         panel_scroll.set_hexpand(false);
         panel_scroll.set_vexpand(true);
+        // Hide the vertical scrollbar (the panel can overflow on short windows)
+        // but keep wheel scrolling: policy only controls scrollbar visibility.
+        panel_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Never);
         let panel = GBox::new(Orientation::Vertical, 10);
         panel.set_width_request(332);
         panel.set_hexpand(false);
