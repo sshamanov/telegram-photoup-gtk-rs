@@ -556,23 +556,36 @@ fn resize_crop_center(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> 
     )
 }
 
-/// Alt+Shift pressed: keep the aspect ratio AND keep the center fixed — the same
-/// scale logic as `resize_crop_shift`, but anchored at the crop center instead of
-/// the opposite edge.
+/// Alt+Shift pressed: keep the aspect ratio AND keep the center fixed — the crop
+/// scales around its center so the dragged handle follows the pointer. A side drag
+/// moves that one edge (the opposite moves symmetrically, so the dimension changes
+/// by 2× the pointer delta); a corner drag scales by its dominant axis. Inward
+/// drags shrink, outward grow; the result is clamped to stay in-frame and ≥ MIN_CROP.
 fn resize_crop_shift_center(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> NormalizedCrop {
-    let sx = match handle {
-        Handle::E | Handle::Ne | Handle::Se => ndx,
-        Handle::W | Handle::Nw | Handle::Sw => -ndx,
-        _ => 0.0,
-    } / c.width;
-    let sy = match handle {
-        Handle::S | Handle::Se | Handle::Sw => ndy,
-        Handle::N | Handle::Nw | Handle::Ne => -ndy,
-        _ => 0.0,
-    } / c.height;
-    let s = 1.0 + sx.max(sy);
     let cx = c.x + c.width / 2.0;
     let cy = c.y + c.height / 2.0;
+    // Side handles scale off their single axis (allowing a negative `s` to shrink);
+    // the old `sx.max(sy)` left the zero second axis in the max, so an inward side
+    // drag clamped to `s = 1.0` — sides could only grow, never shrink.
+    let s = match handle {
+        Handle::E => 1.0 + 2.0 * ndx / c.width,
+        Handle::W => 1.0 - 2.0 * ndx / c.width,
+        Handle::S => 1.0 + 2.0 * ndy / c.height,
+        Handle::N => 1.0 - 2.0 * ndy / c.height,
+        _ => {
+            let sx = match handle {
+                Handle::Ne | Handle::Se => ndx,
+                Handle::Nw | Handle::Sw => -ndx,
+                _ => 0.0,
+            } / c.width;
+            let sy = match handle {
+                Handle::Se | Handle::Sw => ndy,
+                Handle::Ne | Handle::Nw => -ndy,
+                _ => 0.0,
+            } / c.height;
+            1.0 + 2.0 * sx.max(sy)
+        }
+    };
     let max_w = (2.0 * cx.min(1.0 - cx)).max(MIN_CROP);
     let max_h = (2.0 * cy.min(1.0 - cy)).max(MIN_CROP);
     let scale = ((c.width * s).clamp(MIN_CROP, max_w) / c.width)
@@ -1974,6 +1987,29 @@ mod tests {
         c = NormalizedCrop { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
         c = resize_crop(c, Handle::N, 0.0, 0.3);
         assert!(c.y >= -1e-6 && c.height >= MIN_CROP, "{c:?}");
+    }
+
+    /// Alt+Shift on a SIDE handle must resize in both directions, not just corners.
+    /// Before the fix `s = 1.0 + sx.max(sy)` left the side's zero second axis in the
+    /// max, so an inward side drag clamped to `s = 1.0` — sides could grow but never
+    /// shrink (only corners, whose second axis is non-zero, could shrink).
+    #[test]
+    fn shift_center_side_handles_resize_both_directions() {
+        let c = NormalizedCrop { x: 0.25, y: 0.25, width: 0.5, height: 0.5 };
+        // Right edge outward → grows, center fixed, ratio kept.
+        let grown = resize_crop_shift_center(c, Handle::E, 0.1, 0.0);
+        assert!(grown.width > c.width, "right edge outward grows: {grown:?}");
+        assert!((grown.height / grown.width - 1.0).abs() < 1e-4, "ratio kept: {grown:?}");
+        assert!(
+            (grown.x + grown.width / 2.0 - 0.5).abs() < 1e-4,
+            "center x fixed: {grown:?}"
+        );
+        // Right edge inward → shrinks (was a no-op before the fix).
+        let shrunk = resize_crop_shift_center(c, Handle::E, -0.1, 0.0);
+        assert!(shrunk.width < c.width, "right edge inward shrinks: {shrunk:?}");
+        // Top edge inward (drag down) → shrinks too.
+        let n_shrunk = resize_crop_shift_center(c, Handle::N, 0.0, 0.1);
+        assert!(n_shrunk.height < c.height, "top edge inward shrinks: {n_shrunk:?}");
     }
 
     /// `2·(1−cx)` bound dips a hair under MIN_CROP → `.clamp(MIN_CROP, bound)`
