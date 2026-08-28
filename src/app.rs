@@ -1009,11 +1009,12 @@ impl AppController {
 
     fn on_load(&mut self) {
         let filter = gtk4::FileFilter::new();
-        filter.add_pattern("*.jpg");
-        filter.add_pattern("*.jpeg");
-        filter.add_pattern("*.png");
-        filter.add_pattern("*.nef");
-        filter.add_pattern("*.cr2");
+        // `add_suffix` matches case-insensitively — real camera files are
+        // uppercase (`DSC_4858.NEF`, `IMG_7833.CR2`), and pattern globs are
+        // case-sensitive, which hid RAW files from the dialog before.
+        for ext in IMAGE_EXTS {
+            filter.add_suffix(&format!(".{ext}"));
+        }
         filter.set_name(Some("Photos"));
         let filters = gtk4::gio::ListStore::new::<gtk4::FileFilter>();
         filters.append(&filter);
@@ -2142,7 +2143,27 @@ fn run_export_job(
 mod tests {
     use super::*;
     use crate::image::types::ExposureMode;
+    use gtk4::prelude::*;
     use image::ImageEncoder;
+
+    #[test]
+    fn is_image_path_is_case_insensitive() {
+        // The dialog filter uses `add_suffix` (case-insensitive), and the
+        // drag-drop/paste gate `is_image_path` lowercases too — both must accept
+        // the uppercase extensions cameras actually produce.
+        for p in [
+            "/x/DSC_4858.NEF",
+            "/x/IMG_7833.CR2",
+            "/x/a.JPG",
+            "/x/b.PNG",
+            "/x/c.nef",
+            "/x/d.jpeg",
+        ] {
+            assert!(is_image_path(Path::new(p)), "{p} must be a photo");
+        }
+        assert!(!is_image_path(Path::new("/x/notes.txt")));
+        assert!(!is_image_path(Path::new("/x/a.tif")));
+    }
 
     fn make_jpeg_file(w: u32, h: u32) -> PathBuf {
         let img = image::RgbImage::from_fn(w, h, |x, y| {
