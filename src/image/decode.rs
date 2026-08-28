@@ -340,7 +340,7 @@ mod tests {
         }
     }
 
-    /// Diagnostic: render every sample in Manual0 / Auto / Aggressive at preview
+    /// Diagnostic: render every sample in Manual0 / Auto / Burn at preview
     /// (1024) and export (2560) edge, print rendered-luminance percentiles and
     /// clip %, and the preview-vs-export tone diff at matched scale. Dumps the
     /// 1024 renders to out/ev_curves/ for visual (VLM) inspection. Run with
@@ -425,7 +425,7 @@ mod tests {
             for (label, mode) in [
                 ("Manual0", ExposureMode::Manual),
                 ("Auto", ExposureMode::Auto),
-                ("Aggressive", ExposureMode::Aggressive),
+                ("Burn", ExposureMode::Burn),
             ] {
                 let adj = Adjustments {
                     exposure_mode: mode,

@@ -32,7 +32,7 @@ pub struct NormalizedCrop {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExposureMode {
     Auto,
-    Aggressive,
+    Burn,
     Manual,
 }
 

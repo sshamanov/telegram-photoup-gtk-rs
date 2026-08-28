@@ -1627,7 +1627,7 @@ impl AppController {
     }
 
     /// The EV the editor's indicator should show after a render of `id`: the
-    /// render's auto EV in Auto/Aggressive mode, the manual EV otherwise.
+    /// render's auto EV in Auto/Burn mode, the manual EV otherwise.
     fn effective_ev_for(&self, id: u64, render_auto_ev: f32) -> f32 {
         let st = self.state.read().unwrap();
         let Some(adj) = st.photos.iter().find(|p| p.id == id).map(|p| p.adjustments) else {
@@ -1909,7 +1909,7 @@ impl AppController {
 }
 
 /// Effective exposure correction for a photo (photoup `shownEV`): autoEV while in
-/// auto/aggressive mode, the manual EV otherwise.
+/// auto/burn mode, the manual EV otherwise.
 fn shown_ev(p: &PhotoState) -> f32 {
     match p.adjustments.exposure_mode {
         ExposureMode::Manual => p.adjustments.exposure_ev,

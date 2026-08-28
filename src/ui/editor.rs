@@ -630,7 +630,7 @@ pub struct EditorScreen {
     info1: Label,
     info2: Label,
     auto_exposure_btn: Button,
-    slide_exposure_btn: Button,
+    burn_exposure_btn: Button,
     rest_exposure_btn: Button,
     wb_auto_button: Button,
     wb_auto2_button: Button,
@@ -753,7 +753,7 @@ impl EditorScreen {
 
         let ev_row = GBox::new(Orientation::Horizontal, 6);
         let auto_exposure_btn = Button::with_label("Auto");
-        let slide_exposure_btn = Button::with_label("Slide");
+        let burn_exposure_btn = Button::with_label("Burn");
         let rest_exposure_btn = Button::with_label("Rest");
         let ev_value = Label::new(Some("+0.00 EV"));
         ev_value.add_css_class("editor-value");
@@ -763,7 +763,7 @@ impl EditorScreen {
         // ("+0.00 EV" ↔ "+?.?? EV" ↔ "-1.25 EV" are all 5 chars + unit).
         ev_value.set_width_chars(6);
         ev_row.append(&auto_exposure_btn);
-        ev_row.append(&slide_exposure_btn);
+        ev_row.append(&burn_exposure_btn);
         ev_row.append(&rest_exposure_btn);
         ev_row.append(&ev_value);
         panel.append(&ev_row);
@@ -915,7 +915,7 @@ impl EditorScreen {
             info1,
             info2,
             auto_exposure_btn,
-            slide_exposure_btn,
+            burn_exposure_btn,
             rest_exposure_btn,
             wb_auto_button,
             wb_auto2_button,
@@ -947,7 +947,7 @@ impl EditorScreen {
     }
 
     /// Push a photo into the editor: set active id, name, adjustments and the
-    /// info/nav rows. `shown_ev` is the effective EV (autoEV in auto/aggressive,
+    /// info/nav rows. `shown_ev` is the effective EV (autoEV in auto/burn,
     /// the manual EV otherwise) — what the slider should display.
     pub fn set_photo(
         &mut self,
@@ -1373,7 +1373,7 @@ impl EditorScreen {
         let wb_lab = self.wb_value.clone();
         let info2 = self.info2.clone();
 
-        // Exposure: Auto / Slide. Both switch to an auto mode whose EV is the
+        // Exposure: Auto / Burn. Both switch to an auto mode whose EV is the
         // render's auto-EV — show a placeholder until the re-render lands with the
         // real value (the controller's `set_ev` then updates the label).
         let (a, o, st, lab) = (
@@ -1395,10 +1395,10 @@ impl EditorScreen {
             Arc::clone(&state),
             ev_lab.clone(),
         );
-        self.slide_exposure_btn.connect_clicked(move |_| {
+        self.burn_exposure_btn.connect_clicked(move |_| {
             let Some(id) = a.get() else { return };
             let mut adj = current_adjustments(&st.read().unwrap(), id);
-            adj.exposure_mode = ExposureMode::Aggressive;
+            adj.exposure_mode = ExposureMode::Burn;
             lab.set_text("+?.?? EV");
             o(AppEvent::PhotoEdit { id, adjustments: adj });
         });

@@ -101,7 +101,7 @@ pub static RAW_HARD_LUT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new
 
 /// JPEG tone LUT (no camera S-curve). `hard_clip` = no rolloff (kept for
 /// reference only — the render paths always pass `false`, rolloff applies to
-/// Auto AND aggressive).
+/// Auto AND burn).
 pub fn jpeg_tone_lut(hard_clip: bool) -> &'static [u8] {
     if hard_clip {
         JPEG_HARD_LUT.get_or_init(|| build_tone_lut(false, true))

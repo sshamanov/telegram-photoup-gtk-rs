@@ -38,7 +38,7 @@ pub struct AutoExpOpts {
     /// into pure white.
     pub hi_target: f32,
     pub hi_percentile: f32,
-    /// When true (`Aggressive`), the highlight cap is dropped entirely: the
+    /// When true (`Burn`), the highlight cap is dropped entirely: the
     /// median anchor governs the lift and highlights may clip to white. The two
     /// modes therefore differ in exactly what they should — clipping and white
     /// point — not in midtone target.
@@ -77,7 +77,7 @@ impl Default for AutoExpOpts {
 ///   and the dark bulk simply stays dark. The cap is clamped at ≥ 0: a photo
 ///   already brighter than `hi_target` keeps its white point (EV 0), never a
 ///   pointless drag-down.
-/// - **Aggressive** (`clip_highlights: true`): no cap — the median anchor
+/// - **Burn** (`clip_highlights: true`): no cap — the median anchor
 ///   governs the lift up to `max_ev` and highlights are free to clip to white.
 pub fn auto_exposure_ev(luminances: &[u8], opts: &AutoExpOpts) -> f32 {
     if luminances.is_empty() {

@@ -179,21 +179,21 @@ fn sample_luminances_rgba(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
     lums
 }
 
-fn auto_ev_for(lums: &[u8], aggressive: bool) -> f32 {
+fn auto_ev_for(lums: &[u8], burn: bool) -> f32 {
     // Both modes anchor the midtones (p50 → 128), solved in linear space so the
     // anchor lands exactly on the target after the tone LUT. The modes differ
     // only in how they treat highlights: Auto caps p99 at 252 (just under white,
-    // no mass clip, never darkens), Aggressive drops the cap so the median
+    // no mass clip, never darkens), Burn drops the cap so the median
     // governs and highlights may clip to white.
     auto_exposure_ev(
         lums,
         &AutoExpOpts {
             target: 128.0,
             percentile: 0.5,
-            hi_target: if aggressive { 255.0 } else { 252.0 },
+            hi_target: if burn { 255.0 } else { 252.0 },
             hi_percentile: 0.99,
             max_ev: 6.0,
-            clip_highlights: aggressive,
+            clip_highlights: burn,
             ..Default::default()
         },
     )
@@ -242,7 +242,7 @@ impl Base for JpegBase {
         ev_override: Option<f32>,
     ) -> RenderResult {
         let rect = crop_rect(self.width, self.height, crop);
-        let aggressive = adjustments.exposure_mode == ExposureMode::Aggressive;
+        let burn = adjustments.exposure_mode == ExposureMode::Burn;
 
         // Materialize the crop (if any) once. The full image is the fast path; the
         // crop is extracted to its own buffer so both luminance sampling and the
@@ -267,14 +267,14 @@ impl Base for JpegBase {
         };
 
         let lums = sample_luminances_rgba(src, rect.width, rect.height);
-        let auto_ev = auto_ev_for(&lums, aggressive);
+        let auto_ev = auto_ev_for(&lums, burn);
         let auto_ev = ev_override.unwrap_or(auto_ev);
         let ev = effective_ev(adjustments.exposure_mode, adjustments.exposure_ev, auto_ev);
 
         // Downscale the (cropped) source to the target size in sRGB space.
         let mut down = downscale_rgba(src, rect.width, rect.height, size.width, size.height);
 
-        let lut = jpeg_tone_lut(false); // highlight rolloff applies in Auto AND aggressive; JPEG never gets the RAW S-curve
+        let lut = jpeg_tone_lut(false); // highlight rolloff applies in Auto AND burn; JPEG never gets the RAW S-curve
         let (gr, gg, gb) = gain_coefficients(ev, adjustments.wb_offset, adjustments.hue);
         let s2l = srgb_to_linear();
         let mut rgba = vec![0u8; (size.width * size.height * 4) as usize];
@@ -387,7 +387,7 @@ impl Base for RawBase {
         ev_override: Option<f32>,
     ) -> RenderResult {
         let rect = crop_rect(self.width, self.height, crop);
-        let aggressive = adjustments.exposure_mode == ExposureMode::Aggressive;
+        let burn = adjustments.exposure_mode == ExposureMode::Burn;
 
         let ev_sample = fit_within(rect.width, rect.height, 128);
         let lums = self.luminance_sample(
@@ -397,7 +397,7 @@ impl Base for RawBase {
                 height: ev_sample.1,
             },
         );
-        let auto_ev = auto_ev_for(&lums, aggressive);
+        let auto_ev = auto_ev_for(&lums, burn);
         let auto_ev = ev_override.unwrap_or(auto_ev);
         let ev = effective_ev(adjustments.exposure_mode, adjustments.exposure_ev, auto_ev);
 
@@ -428,7 +428,7 @@ impl Base for RawBase {
 
         let gain = 2.0f32.powf(ev);
         let (wr, wg, wb) = wb_gains(adjustments.wb_offset, adjustments.hue);
-        let lut = raw_tone_lut(false); // rolloff applies in Auto AND aggressive; RAW gets the camera-Standard S-curve
+        let lut = raw_tone_lut(false); // rolloff applies in Auto AND burn; RAW gets the camera-Standard S-curve
         let mut rgba = vec![0u8; (size.width * size.height * 4) as usize];
 
         // With the camera color matrix, apply WB as T = M·diag(wb)·M⁻¹ so the preview
