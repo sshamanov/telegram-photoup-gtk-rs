@@ -145,6 +145,7 @@ impl FineSlider {
             cancelled,
         };
         slider.wire_drag();
+        slider.wire_click();
         slider
     }
 
@@ -237,6 +238,27 @@ impl FineSlider {
         });
 
         self.area.add_controller(gesture);
+    }
+
+    /// Wire a click gesture: pressing anywhere on the track jumps the knob to that
+    /// position (step-snapped) — "click to set". A press that turns into a drag is
+    /// fine: the drag gesture then continues from the same pointer position, so the
+    /// two agree (the click only matters for a tap with no movement).
+    fn wire_click(&self) {
+        let click = gtk4::GestureClick::new();
+        let sl = self.clone();
+        let area = self.area.clone();
+        click.connect_pressed(move |_g, _n_press, x, _y| {
+            let w = area.width() as f64;
+            let track_len = (w - 2.0 * PAD).max(0.0);
+            if track_len <= 0.0 {
+                return;
+            }
+            let raw = sl.min + ((x - PAD) / track_len).clamp(0.0, 1.0) * (sl.max - sl.min);
+            let snapped = snap_to_grid(raw, sl.step, sl.min, sl.max);
+            sl.set_value(snapped);
+        });
+        self.area.add_controller(click);
     }
 
     /// One drag tick: pointer x (start + delta) → snapped value. If a
