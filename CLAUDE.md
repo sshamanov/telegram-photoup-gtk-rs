@@ -86,14 +86,15 @@ Three Kingdoms threading (borrowed from mpd-client), all in one Rust crate
   `Base` (`JpegBase` / `RawBase`, `src/image/process.rs`); every edit re-renders
   from that original base — never cumulative, never re-decode.
 - **Auto-exposure** (`auto_exposure_ev`, `src/image/math.rs`): solved in LINEAR
-  space (the gain is applied as `linear × 2^EV`) so the anchor percentile lands
-  exactly on its target in the tone-mapped output. Median (p50) anchor (Auto
-  128 / Aggressive 150) **plus a highlight cap**: the p99-brightest pixel may
-  ride at most to 245 (Auto) / 252 (Aggressive), so a skewed histogram gets as
-  much lift as its highlights allow and never blows a mass of pixels into pure
-  white — and auto never darkens a photo except as far as that cap demands.
-  `max_ev` 6.0. Both modes apply the same highlight-rolloff tone LUT —
-  Aggressive is a brighter Auto, NOT a hard-clip mode.
+  space (the gain is applied as `linear × 2^EV`) so the median pixel (p50) lands
+  exactly on its target in the tone-mapped output. Both modes anchor midtones on
+  128 and never darken (EV floored at 0 — bright photos are left alone). The
+  modes differ only in highlight handling: **Auto** caps the p99-brightest pixel
+  at 252 (just under white, no mass clip), and the cap is clamped at ≥ 0 so an
+  already-blown photo keeps its white point instead of a pointless drag-down;
+  **Aggressive (Slide)** drops the cap entirely — the median governs the lift up
+  to `max_ev` 6.0 and highlights may clip to pure white. The difference between
+  the two modes is therefore exactly clipping and white point.
 - Export format is **final, NOT tunable**: 4:4:4 mozjpeg Q100, adaptive quality
   down to `MAX_PHOTO_BYTES`, longest edge ≤2560px (`EXPORT_EDGE`). Interactive
   preview renders at `PREVIEW_EDGE = 1024`; grid thumbnails at ≤512px.
