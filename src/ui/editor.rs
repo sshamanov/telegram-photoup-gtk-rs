@@ -315,9 +315,9 @@ const ACCENT: (f64, f64, f64) = (0xFF as f64 / 255.0, 0x7A as f64 / 255.0, 0x45 
 /// Handle fill, photoup `.h` background #f2eadf.
 const HANDLE_FILL: (f64, f64, f64) = (0xF2 as f64 / 255.0, 0xEA as f64 / 255.0, 0xDF as f64 / 255.0);
 /// Handle square size in px.
-const HANDLE_SIZE: f64 = 14.0;
+const HANDLE_SIZE: f64 = 20.0;
 /// Half-extent hit radius (px) around a handle anchor for grabbing it.
-const HANDLE_HIT: f64 = 26.0;
+const HANDLE_HIT: f64 = 40.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Handle {
