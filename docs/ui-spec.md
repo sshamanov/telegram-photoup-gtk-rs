@@ -75,12 +75,17 @@ point.
    - Temperature (warmth) slider, **−4..+4**, step 0.05, zero-centered (the wider
      range covers images that need a strong cool shift).
    - Hue (tint) slider, **−1..+1**, step 0.01, zero-centered (fine-grained).
-   - Row: **Auto** (clinical neutralization) | **Auto2** (neutralize but keep the
-     warm ambience, Nikon AUTO2 style) | **Reset** | the current WB display.
-     The neutral **Pick** needs no button — clicking the preview samples the
-     gray point directly.
+    - Row: **Auto** (clinical neutralization) | **Auto2** (neutralize but keep the
+     warm ambience, Nikon AUTO2 style) | **Reset** | **Picker** | the current WB
+     display. **Picker** is a visible toggle (amber while active); only while it
+     is active does clicking the preview sample a neutral gray point.
 5. Section "**Crop**":
-   - Presets: **1:1** | **2:3** | **3:2** | **Original**.
+   - Presets: **1:1** | **2:3** | **3:2** | **Original** | **Pix**. **Pix** uses
+     the current crop's center and nearest 1:1, 3:2, 16:9, or 2:1 aspect while
+     preserving orientation, then creates the exact full-resolution source crop
+     `2560 × 2560`, `2560 × 1707`, `2560 × 1440`, or `2560 × 1280` (or a portrait
+     counterpart). At an edge it translates that rectangle inward; it never
+     shrinks it.
 6. Section "**Rotate**":
    - **↺ CCW** | **↻ CW** (90° steps; applied on top of the EXIF orientation).
 7. Section "**Image**":
@@ -95,12 +100,12 @@ point.
 
 - Keep the layout/captions/sections EXACTLY as above; do not rename buttons or
   sections. ("Exposure"/"White balance"/"Crop"/"Rotate"/"Image";
-  Auto/Burn/Rest; Auto/Auto2/Reset; 1:1/2:3/3:2/Original; ↺ CCW/↻ CW;
+  Auto/Burn/Rest; Auto/Auto2/Reset/Picker; 1:1/2:3/3:2/Original/Pix; ↺ CCW/↻ CW;
   ‹ Prev/Next ›; Reject/Close; Reset/Logout; Send {n} selected;
   Preparing/Sending.)
 - The theme is a light-on-dark look with an amber accent and a display font;
   matching the exact theme is optional — matching the layout, labels, and
   interaction is required.
-- The neutral-pick (click the preview) and crop presets are implemented; the
+- The neutral-picker toggle and crop presets are implemented; the
   interactive crop drag is deferred — the crop section and overlay must stay
   present.
