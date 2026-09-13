@@ -3,7 +3,7 @@
 //! directly, mirroring photoup's `raw.ts` options exactly.
 use crate::errors::{Error, Result};
 use crate::image::srgb::srgb16_to_linear;
-use crate::image::types::DecodedRaw;
+use crate::image::types::{DecodedRaw, Size};
 use libraw_sys::*;
 
 /// NOTE: `Raw` is deliberately NOT `Send`/`Sync`. It is created, used, and dropped
@@ -96,6 +96,9 @@ impl Raw {
         unsafe { libraw_dcraw_clear_mem(img) };
 
         Ok(DecodedRaw {
+            // `decode_raw` replaces this with the full-resolution geometry when
+            // this was a half-size interactive decode.
+            developed_size: Size { width, height },
             width,
             height,
             r,

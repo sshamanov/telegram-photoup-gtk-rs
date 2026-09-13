@@ -1,8 +1,8 @@
 use crate::image::math::{AutoExpOpts, auto_exposure_ev, crop_to_pixels, fit_within};
 use crate::image::resize::{downscale_crop, downscale_plane, downscale_rgba};
 use crate::image::srgb::{
-    gain_coefficients, jpeg_tone_lut, linear_to_srgb_byte, raw_tone_lut, srgb_to_linear, tone_index,
-    wb_gains, wb_transform3x3,
+    gain_coefficients, jpeg_tone_lut, linear_to_srgb_byte, raw_tone_lut, srgb_to_linear,
+    tone_index, wb_gains, wb_transform3x3,
 };
 use crate::image::types::{Adjustments, DecodedRaw, ExposureMode, NormalizedCrop, Rect, Size};
 use std::sync::Arc;
@@ -62,7 +62,13 @@ pub fn rotate_dims(w: u32, h: u32, q: u8) -> (u32, u32) {
 /// Returns `(buffer, out_w, out_h)`. Mapping (source → destination):
 /// q=1: out(ox, oy) = in(oy, h-1-ox); q=2: out = in flipped both axes;
 /// q=3: out(ox, oy) = in(w-1-oy, ox). dims swap for odd q.
-fn rotate_channels<T: Copy + Default>(src: &[T], w: u32, h: u32, q: u8, ch: usize) -> (Vec<T>, u32, u32) {
+fn rotate_channels<T: Copy + Default>(
+    src: &[T],
+    w: u32,
+    h: u32,
+    q: u8,
+    ch: usize,
+) -> (Vec<T>, u32, u32) {
     let (ow, oh) = rotate_dims(w, h, q);
     let n = (w as usize) * (h as usize);
     debug_assert_eq!(src.len(), n * ch);
@@ -124,7 +130,10 @@ pub struct RotatedBase {
 
 impl RotatedBase {
     pub fn new(inner: Arc<dyn Base>, quarters: u8) -> Self {
-        Self { inner, quarters: quarters % 4 }
+        Self {
+            inner,
+            quarters: quarters % 4,
+        }
     }
 }
 
@@ -145,12 +154,25 @@ impl Base for RotatedBase {
     ) -> RenderResult {
         let q = self.quarters;
         if q == 0 {
-            return self.inner.render_with_ev(crop, size, adjustments, ev_override);
+            return self
+                .inner
+                .render_with_ev(crop, size, adjustments, ev_override);
         }
         let (iw, ih) = rotate_dims(size.width, size.height, (4 - q) & 3);
-        let inner = self.inner.render_with_ev(crop, Size { width: iw, height: ih }, adjustments, ev_override);
+        let inner = self.inner.render_with_ev(
+            crop,
+            Size {
+                width: iw,
+                height: ih,
+            },
+            adjustments,
+            ev_override,
+        );
         let (rgba, _ow, _oh) = rotate_rgba(&inner.rgba, iw, ih, q);
-        RenderResult { rgba, auto_ev: inner.auto_ev }
+        RenderResult {
+            rgba,
+            auto_ev: inner.auto_ev,
+        }
     }
 
     fn linear_sample(&self, size: Size) -> Vec<f32> {
@@ -159,7 +181,10 @@ impl Base for RotatedBase {
             return self.inner.linear_sample(size);
         }
         let (iw, ih) = rotate_dims(size.width, size.height, (4 - q) & 3);
-        let sample = self.inner.linear_sample(Size { width: iw, height: ih });
+        let sample = self.inner.linear_sample(Size {
+            width: iw,
+            height: ih,
+        });
         rotate_linear3(&sample, iw, ih, q).0
     }
 }
@@ -322,11 +347,13 @@ pub struct RawBase {
 impl RawBase {
     pub fn new(full: DecodedRaw) -> Self {
         // rgb_cam[3][4]; use first 3 columns as the 3x3.
-        let cam_matrix3 = full.cam_matrix.map(|m| [
-            [m[0][0] as f32, m[0][1] as f32, m[0][2] as f32],
-            [m[1][0] as f32, m[1][1] as f32, m[1][2] as f32],
-            [m[2][0] as f32, m[2][1] as f32, m[2][2] as f32],
-        ]);
+        let cam_matrix3 = full.cam_matrix.map(|m| {
+            [
+                [m[0][0] as f32, m[0][1] as f32, m[0][2] as f32],
+                [m[1][0] as f32, m[1][1] as f32, m[1][2] as f32],
+                [m[2][0] as f32, m[2][1] as f32, m[2][2] as f32],
+            ]
+        });
         Self {
             width: full.width,
             height: full.height,
@@ -664,13 +691,19 @@ mod tests {
             width: 32.5 / 64.0,
             height: 1.0,
         };
-        assert!((edge.x + edge.width - 1.0).abs() < 1e-6, "normalized sum ≈ 1");
+        assert!(
+            (edge.x + edge.width - 1.0).abs() < 1e-6,
+            "normalized sum ≈ 1"
+        );
         // Must not panic: pre-fix this read `self.rgba[src_off..src_off + 33·4]`
         // past the 64-px row end. The clamped rect is 32 px wide and downscales
         // to the 16×16 output.
         let out = base.render(
             Some(&edge),
-            Size { width: 16, height: 16 },
+            Size {
+                width: 16,
+                height: 16,
+            },
             &Adjustments::default(),
         );
         assert_eq!(out.rgba.len(), 16 * 16 * 4, "render with edge crop failed");
@@ -708,7 +741,10 @@ mod tests {
         let (w, h) = (32u32, 32u32);
         let rgba = vec![200u8, 128, 80, 255].repeat((w * h) as usize);
         let base = JpegBase::new(w, h, rgba);
-        let out = base.linear_sample(Size { width: 8, height: 8 });
+        let out = base.linear_sample(Size {
+            width: 8,
+            height: 8,
+        });
         assert_eq!(out.len(), (8 * 8 * 3) as usize);
         let s2l = srgb_to_linear();
         for px in out.chunks_exact(3) {
@@ -764,8 +800,16 @@ mod rotation_tests {
         let buf = marker_rgba(3, 2);
         let (out, ow, oh) = rotate_rgba(&buf, 3, 2, 2);
         assert_eq!((ow, oh), (3, 2));
-        assert_eq!(marker_at(&out, 3, 2, 1), 1, "180° puts base(0,0) at bottom-right");
-        assert_eq!(marker_at(&out, 3, 0, 0), 6, "180° puts base(2,1) at top-left");
+        assert_eq!(
+            marker_at(&out, 3, 2, 1),
+            1,
+            "180° puts base(0,0) at bottom-right"
+        );
+        assert_eq!(
+            marker_at(&out, 3, 0, 0),
+            6,
+            "180° puts base(2,1) at top-left"
+        );
 
         let (out3, ow3, oh3) = rotate_rgba(&buf, 3, 2, 3);
         assert_eq!((ow3, oh3), (2, 3));
@@ -793,13 +837,25 @@ mod rotation_tests {
         let base = JpegBase::new(3, 2, marker_rgba(3, 2));
         let wrapped = RotatedBase::new(Arc::new(base), 1);
         assert_eq!((wrapped.width(), wrapped.height()), (2, 3));
-        let sample = wrapped.linear_sample(Size { width: 2, height: 3 });
+        let sample = wrapped.linear_sample(Size {
+            width: 2,
+            height: 3,
+        });
         let s2l = srgb_to_linear();
         // sample[y*w+x*3] == s2l[marker]. Top-left display = base(0,1) = 4.
         let at = |x: u32, y: u32| sample[((y * 2 + x) * 3) as usize];
-        assert!((at(0, 0) - s2l[4]).abs() < 1e-6, "top-left display ← base(0,1)");
-        assert!((at(1, 0) - s2l[1]).abs() < 1e-6, "top-right display ← base(0,0)");
-        assert!((at(1, 2) - s2l[3]).abs() < 1e-6, "bottom-right display ← base(2,0)");
+        assert!(
+            (at(0, 0) - s2l[4]).abs() < 1e-6,
+            "top-left display ← base(0,1)"
+        );
+        assert!(
+            (at(1, 0) - s2l[1]).abs() < 1e-6,
+            "top-right display ← base(0,0)"
+        );
+        assert!(
+            (at(1, 2) - s2l[3]).abs() < 1e-6,
+            "bottom-right display ← base(2,0)"
+        );
     }
 }
 
@@ -811,6 +867,10 @@ mod raw_base_tests {
     fn synth_raw(w: u32, h: u32, value: f32) -> RawBase {
         let n = (w * h) as usize;
         let mut dr = DecodedRaw {
+            developed_size: Size {
+                width: w,
+                height: h,
+            },
             width: w,
             height: h,
             r: vec![value; n],
@@ -864,6 +924,10 @@ mod raw_base_tests {
         let (w, h) = (32u32, 32u32);
         let n = (w * h) as usize;
         let dr = DecodedRaw {
+            developed_size: Size {
+                width: w,
+                height: h,
+            },
             width: w,
             height: h,
             r: vec![0.578; n],
@@ -873,7 +937,10 @@ mod raw_base_tests {
             cam_matrix: None,
         };
         let base = RawBase::new(dr);
-        let out = base.linear_sample(Size { width: 8, height: 8 });
+        let out = base.linear_sample(Size {
+            width: 8,
+            height: 8,
+        });
         assert_eq!(out.len(), (8 * 8 * 3) as usize);
         for px in out.chunks_exact(3) {
             assert!((px[0] - 0.578).abs() < 1e-6, "r {}", px[0]);
@@ -885,6 +952,10 @@ mod raw_base_tests {
     fn uniform_dr(w: u32, h: u32, value: f32) -> DecodedRaw {
         let n = (w * h) as usize;
         DecodedRaw {
+            developed_size: Size {
+                width: w,
+                height: h,
+            },
             width: w,
             height: h,
             r: vec![value; n],
@@ -907,7 +978,11 @@ mod raw_base_tests {
     fn raw_matrix_matches_per_channel_for_identity() {
         // Identity camera matrix → T = M·diag(wb)·M⁻¹ = diag(wb), so the matrix path
         // must produce the same result as per-channel gains (within 1 ulp of float order).
-        let eye = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
+        let eye = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ];
         let mut dr = uniform_dr(32, 32, 0.5);
         dr.cam_matrix = Some(eye);
         let with = RawBase::new(dr);
@@ -915,10 +990,27 @@ mod raw_base_tests {
         let mut adj = Adjustments::default();
         adj.wb_offset = 0.5;
         adj.hue = -0.2;
-        let a = with.render(None, Size { width: 16, height: 16 }, &adj);
-        let b = without.render(None, Size { width: 16, height: 16 }, &adj);
+        let a = with.render(
+            None,
+            Size {
+                width: 16,
+                height: 16,
+            },
+            &adj,
+        );
+        let b = without.render(
+            None,
+            Size {
+                width: 16,
+                height: 16,
+            },
+            &adj,
+        );
         let d = max_byte_diff(&a.rgba, &b.rgba);
-        assert!(d <= 1, "identity matrix must match per-channel WB, max diff {d}");
+        assert!(
+            d <= 1,
+            "identity matrix must match per-channel WB, max diff {d}"
+        );
     }
 
     #[test]
@@ -926,7 +1018,11 @@ mod raw_base_tests {
         // A camera-like matrix with cross-channel terms + non-neutral WB must produce
         // a DIFFERENT result than per-channel gains (which keep gray → gray). This
         // proves the matrix branch actually mixes channels.
-        let m = [[1.0, 0.2, 0.1, 0.0], [0.05, 1.0, 0.05, 0.0], [0.1, 0.2, 1.0, 0.0]];
+        let m = [
+            [1.0, 0.2, 0.1, 0.0],
+            [0.05, 1.0, 0.05, 0.0],
+            [0.1, 0.2, 1.0, 0.0],
+        ];
         let mut dr = uniform_dr(16, 16, 0.5);
         dr.cam_matrix = Some(m);
         let with = RawBase::new(dr);
@@ -934,9 +1030,26 @@ mod raw_base_tests {
         let mut adj = Adjustments::default();
         adj.wb_offset = 0.5;
         adj.hue = 0.2;
-        let a = with.render(None, Size { width: 8, height: 8 }, &adj);
-        let b = without.render(None, Size { width: 8, height: 8 }, &adj);
+        let a = with.render(
+            None,
+            Size {
+                width: 8,
+                height: 8,
+            },
+            &adj,
+        );
+        let b = without.render(
+            None,
+            Size {
+                width: 8,
+                height: 8,
+            },
+            &adj,
+        );
         let d = max_byte_diff(&a.rgba, &b.rgba);
-        assert!(d > 1, "cross-channel matrix must mix WB differently than per-channel, max diff {d}");
+        assert!(
+            d > 1,
+            "cross-channel matrix must mix WB differently than per-channel, max diff {d}"
+        );
     }
 }

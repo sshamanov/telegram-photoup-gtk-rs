@@ -13,11 +13,11 @@ use gtk4::prelude::*;
 use gtk4::{Box as GBox, Button, DrawingArea, Label, Orientation, Picture};
 
 use crate::image::math::{clamp_crop, crop_to_pixels};
-use crate::ui::slider::FineSlider;
 use crate::image::process::export_dimensions;
 use crate::image::srgb::{auto_wb, wb_from_pick};
 use crate::image::types::{Adjustments, ExposureMode, NormalizedCrop};
 use crate::state::{AppEvent, AppState};
+use crate::ui::slider::FineSlider;
 
 /// Longest edge of an export render (must match the controller's EXPORT_EDGE).
 const EXPORT_EDGE: u32 = 2560;
@@ -62,11 +62,13 @@ fn output_line(full: (u32, u32), crop: Option<NormalizedCrop>) -> String {
 /// The camera→sRGB matrix is carried as libraw's `rgb_cam[3][4]` (4 columns, 3
 /// used); the WB math needs the 3×3 part.
 fn cam_matrix3x3(m: Option<[[f32; 4]; 3]>) -> Option<[[f32; 3]; 3]> {
-    m.map(|m| [
-        [m[0][0], m[0][1], m[0][2]],
-        [m[1][0], m[1][1], m[1][2]],
-        [m[2][0], m[2][1], m[2][2]],
-    ])
+    m.map(|m| {
+        [
+            [m[0][0], m[0][1], m[0][2]],
+            [m[1][0], m[1][1], m[1][2]],
+            [m[2][0], m[2][1], m[2][2]],
+        ]
+    })
 }
 
 /// Grey-world reference for auto-WB (photoup `autoWhiteBalance`) over the LINEAR
@@ -74,7 +76,12 @@ fn cam_matrix3x3(m: Option<[[f32; 4]; 3]>) -> Option<[[f32; 3]; 3]> {
 /// pixels (linear thresholds — max-min < 0.2, luminance > 0.1), and fall back to
 /// the whole-region mean when too few qualify. Returns the channel means (0..1).
 /// The sample is already downscaled to ≤96px, so no further downscale is needed.
-fn auto_wb_mean_linear(rgb: &[f32], w: u32, h: u32, crop: Option<&NormalizedCrop>) -> Option<(f32, f32, f32)> {
+fn auto_wb_mean_linear(
+    rgb: &[f32],
+    w: u32,
+    h: u32,
+    crop: Option<&NormalizedCrop>,
+) -> Option<(f32, f32, f32)> {
     // Restrict to the crop region when one is set: WB auto must react to what's
     // actually in the frame after cropping, not the out-of-crop area.
     let (_, _, cropped) = match crop {
@@ -157,8 +164,12 @@ fn auto_wb_feed(
 /// A square `win×win` sample window around (cx, cy), clamped to the sample bounds
 /// — shared by `pick_sample_linear` and the `[wb]` debug log.
 fn pick_window_sized(w: u32, h: u32, cx: f64, cy: f64, win: isize) -> (usize, usize, usize, usize) {
-    let sx0 = ((cx.floor() as isize) - win / 2).max(0).min((w as isize - win).max(0));
-    let sy0 = ((cy.floor() as isize) - win / 2).max(0).min((h as isize - win).max(0));
+    let sx0 = ((cx.floor() as isize) - win / 2)
+        .max(0)
+        .min((w as isize - win).max(0));
+    let sy0 = ((cy.floor() as isize) - win / 2)
+        .max(0)
+        .min((h as isize - win).max(0));
     (
         sx0 as usize,
         sy0 as usize,
@@ -303,7 +314,10 @@ fn apply_wb(
     let mut adj = current_adjustments(&state.read().unwrap(), id);
     adj.wb_offset = offset;
     adj.hue = hue;
-    on_event(AppEvent::PhotoEdit { id, adjustments: adj });
+    on_event(AppEvent::PhotoEdit {
+        id,
+        adjustments: adj,
+    });
 }
 
 // ---- Crop overlay (photoup `.stage` + `.crop-box`) ----
@@ -311,9 +325,17 @@ fn apply_wb(
 /// Minimum crop size in normalized units (photoup `MIN_CROP`).
 const MIN_CROP: f32 = 0.05;
 /// Accent color, photoup `--accent` #ff7a45.
-const ACCENT: (f64, f64, f64) = (0xFF as f64 / 255.0, 0x7A as f64 / 255.0, 0x45 as f64 / 255.0);
+const ACCENT: (f64, f64, f64) = (
+    0xFF as f64 / 255.0,
+    0x7A as f64 / 255.0,
+    0x45 as f64 / 255.0,
+);
 /// Handle fill, photoup `.h` background #f2eadf.
-const HANDLE_FILL: (f64, f64, f64) = (0xF2 as f64 / 255.0, 0xEA as f64 / 255.0, 0xDF as f64 / 255.0);
+const HANDLE_FILL: (f64, f64, f64) = (
+    0xF2 as f64 / 255.0,
+    0xEA as f64 / 255.0,
+    0xDF as f64 / 255.0,
+);
 /// Handle square size in px.
 const HANDLE_SIZE: f64 = 14.0;
 /// Half-extent hit radius (px) around a handle anchor for grabbing it.
@@ -456,7 +478,15 @@ fn resize_crop(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> Normali
         y = (c.y + ndy).clamp(0.0, c.y + c.height - MIN_CROP);
         height = c.y + c.height - y;
     }
-    clamp_crop(NormalizedCrop { x, y, width, height }, MIN_CROP)
+    clamp_crop(
+        NormalizedCrop {
+            x,
+            y,
+            width,
+            height,
+        },
+        MIN_CROP,
+    )
 }
 
 /// Shift pressed: keep the aspect ratio (photoup `resizeCrop` shift branch).
@@ -465,26 +495,42 @@ fn resize_crop_shift(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> N
     if is_side {
         if matches!(handle, Handle::E | Handle::W) {
             let (x, w) = if handle == Handle::E {
-                (c.x, (c.width + ndx).clamp(MIN_CROP, (1.0 - c.x).max(MIN_CROP)))
+                (
+                    c.x,
+                    (c.width + ndx).clamp(MIN_CROP, (1.0 - c.x).max(MIN_CROP)),
+                )
             } else {
                 let x = (c.x + ndx).clamp(0.0, c.x + c.width - MIN_CROP);
                 (x, c.x + c.width - x)
             };
             let h = c.height * (w / c.width);
             return clamp_crop(
-                NormalizedCrop { x, y: c.y + (c.height - h) / 2.0, width: w, height: h },
+                NormalizedCrop {
+                    x,
+                    y: c.y + (c.height - h) / 2.0,
+                    width: w,
+                    height: h,
+                },
                 MIN_CROP,
             );
         }
         let (y, h) = if handle == Handle::S {
-            (c.y, (c.height + ndy).clamp(MIN_CROP, (1.0 - c.y).max(MIN_CROP)))
+            (
+                c.y,
+                (c.height + ndy).clamp(MIN_CROP, (1.0 - c.y).max(MIN_CROP)),
+            )
         } else {
             let y = (c.y + ndy).clamp(0.0, c.y + c.height - MIN_CROP);
             (y, c.y + c.height - y)
         };
         let w = c.width * (h / c.height);
         return clamp_crop(
-            NormalizedCrop { x: c.x + (c.width - w) / 2.0, y, width: w, height: h },
+            NormalizedCrop {
+                x: c.x + (c.width - w) / 2.0,
+                y,
+                width: w,
+                height: h,
+            },
             MIN_CROP,
         );
     }
@@ -526,7 +572,15 @@ fn resize_crop_shift(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> N
     } else {
         c.y
     };
-    clamp_crop(NormalizedCrop { x, y, width: w, height: h }, MIN_CROP)
+    clamp_crop(
+        NormalizedCrop {
+            x,
+            y,
+            width: w,
+            height: h,
+        },
+        MIN_CROP,
+    )
 }
 
 /// Alt pressed: resize around the crop's center — the center stays put and both
@@ -551,7 +605,12 @@ fn resize_crop_center(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> 
         height = (c.height - ndy).clamp(MIN_CROP, max_h);
     }
     clamp_crop(
-        NormalizedCrop { x: cx - width / 2.0, y: cy - height / 2.0, width, height },
+        NormalizedCrop {
+            x: cx - width / 2.0,
+            y: cy - height / 2.0,
+            width,
+            height,
+        },
         MIN_CROP,
     )
 }
@@ -561,7 +620,12 @@ fn resize_crop_center(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> 
 /// moves that one edge (the opposite moves symmetrically, so the dimension changes
 /// by 2× the pointer delta); a corner drag scales by its dominant axis. Inward
 /// drags shrink, outward grow; the result is clamped to stay in-frame and ≥ MIN_CROP.
-fn resize_crop_shift_center(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f32) -> NormalizedCrop {
+fn resize_crop_shift_center(
+    c: NormalizedCrop,
+    handle: Handle,
+    ndx: f32,
+    ndy: f32,
+) -> NormalizedCrop {
     let cx = c.x + c.width / 2.0;
     let cy = c.y + c.height / 2.0;
     // Side handles scale off their single axis (allowing a negative `s` to shrink);
@@ -592,7 +656,15 @@ fn resize_crop_shift_center(c: NormalizedCrop, handle: Handle, ndx: f32, ndy: f3
         .min((c.height * s).clamp(MIN_CROP, max_h) / c.height);
     let w = c.width * scale;
     let h = c.height * scale;
-    clamp_crop(NormalizedCrop { x: cx - w / 2.0, y: cy - h / 2.0, width: w, height: h }, MIN_CROP)
+    clamp_crop(
+        NormalizedCrop {
+            x: cx - w / 2.0,
+            y: cy - h / 2.0,
+            width: w,
+            height: h,
+        },
+        MIN_CROP,
+    )
 }
 
 fn rounded_rect(cr: &gtk4::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
@@ -600,8 +672,20 @@ fn rounded_rect(cr: &gtk4::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f6
     cr.new_sub_path();
     cr.arc(x + w - r, y + r, r, -std::f64::consts::FRAC_PI_2, 0.0);
     cr.arc(x + w - r, y + h - r, r, 0.0, std::f64::consts::FRAC_PI_2);
-    cr.arc(x + r, y + h - r, r, std::f64::consts::FRAC_PI_2, std::f64::consts::PI);
-    cr.arc(x + r, y + r, r, std::f64::consts::PI, 1.5 * std::f64::consts::PI);
+    cr.arc(
+        x + r,
+        y + h - r,
+        r,
+        std::f64::consts::FRAC_PI_2,
+        std::f64::consts::PI,
+    );
+    cr.arc(
+        x + r,
+        y + r,
+        r,
+        std::f64::consts::PI,
+        1.5 * std::f64::consts::PI,
+    );
     cr.close_path();
 }
 
@@ -660,32 +744,107 @@ fn crop_preset_handler(
 ) -> impl Fn(&Button) + 'static {
     move |_| {
         let Some(id) = active_id.get() else { return };
-        let Some((fw, fh)) = full_size.get() else { return };
+        let Some((fw, fh)) = full_size.get() else {
+            return;
+        };
         if fw == 0 || fh == 0 {
             return;
         }
-        let target = ratio * (fh as f32 / fw as f32);
-        let (w, h) = if target >= 1.0 {
-            (1.0, 1.0 / target)
-        } else {
-            (target, 1.0)
-        };
-        let crop = clamp_crop(
-            NormalizedCrop {
-                x: (1.0 - w) / 2.0,
-                y: (1.0 - h) / 2.0,
-                width: w,
-                height: h,
-            },
-            MIN_CROP,
+        apply_crop_ratio(
+            id,
+            ratio,
+            (fw, fh),
+            &state,
+            &on_event,
+            &crop_cell,
+            &crop_area,
+            &info2,
         );
-        *crop_cell.borrow_mut() = Some(crop);
-        crop_area.queue_draw();
-        let mut adj = current_adjustments(&state.read().unwrap(), id);
-        adj.crop = Some(crop);
-        info2.set_text(&output_line((fw, fh), Some(crop)));
-        on_event(AppEvent::PhotoEdit { id, adjustments: adj });
     }
+}
+
+/// Center a crop to `ratio` (width / height), mirror it into the overlay, and
+/// dispatch the edit. Shared by the fixed-ratio buttons and Pix.
+fn apply_crop_ratio(
+    id: u64,
+    ratio: f32,
+    full: (u32, u32),
+    state: &Arc<RwLock<AppState>>,
+    on_event: &Arc<dyn Fn(AppEvent) + Send + Sync + 'static>,
+    crop_cell: &Rc<RefCell<Option<NormalizedCrop>>>,
+    crop_area: &DrawingArea,
+    info2: &Label,
+) {
+    let target = ratio * (full.1 as f32 / full.0 as f32);
+    let (w, h) = if target >= 1.0 {
+        (1.0, 1.0 / target)
+    } else {
+        (target, 1.0)
+    };
+    let crop = clamp_crop(
+        NormalizedCrop {
+            x: (1.0 - w) / 2.0,
+            y: (1.0 - h) / 2.0,
+            width: w,
+            height: h,
+        },
+        MIN_CROP,
+    );
+    *crop_cell.borrow_mut() = Some(crop);
+    crop_area.queue_draw();
+    let mut adj = current_adjustments(&state.read().unwrap(), id);
+    adj.crop = Some(crop);
+    info2.set_text(&output_line(full, Some(crop)));
+    on_event(AppEvent::PhotoEdit {
+        id,
+        adjustments: adj,
+    });
+}
+
+/// Return the exact full-resolution source rectangle dimensions for Pix. It
+/// selects the nearest supported ratio while preserving orientation.
+fn pix_dimensions(current_ratio: f32) -> (u32, u32) {
+    const LANDSCAPE: [(u32, u32); 4] = [(2560, 2560), (2560, 1707), (2560, 1440), (2560, 1280)];
+    let portrait = current_ratio < 1.0;
+    LANDSCAPE
+        .into_iter()
+        .map(|(w, h)| if portrait { (h, w) } else { (w, h) })
+        .min_by(|(aw, ah), (bw, bh)| {
+            (current_ratio.ln() - (*aw as f32 / *ah as f32).ln())
+                .abs()
+                .total_cmp(&(current_ratio.ln() - (*bw as f32 / *bh as f32).ln()).abs())
+        })
+        .unwrap_or((2560, 2560))
+}
+
+/// Make the exact 2560-long-edge Pix crop in full-resolution pixels. The
+/// current crop supplies its center and its closest aspect; when that center is
+/// near an edge, translate the whole rectangle inward rather than shrinking it.
+fn pix_crop(full: (u32, u32), current: Option<NormalizedCrop>) -> Option<NormalizedCrop> {
+    let (fw, fh) = full;
+    let current = current.unwrap_or(NormalizedCrop {
+        x: 0.0,
+        y: 0.0,
+        width: 1.0,
+        height: 1.0,
+    });
+    let ratio = (current.width * fw as f32) / (current.height * fh as f32);
+    let (w, h) = pix_dimensions(ratio);
+    if w > fw || h > fh {
+        return None;
+    }
+    let cx = (current.x + current.width / 2.0) * fw as f32;
+    let cy = (current.y + current.height / 2.0) * fh as f32;
+    // Clamp the ORIGIN only: this moves the crop inward at an edge while its
+    // exact source-pixel width/height remain unchanged.
+    let x = (cx - w as f32 / 2.0).round().clamp(0.0, (fw - w) as f32) as u32;
+    let y = (cy - h as f32 / 2.0).round().clamp(0.0, (fh - h) as f32) as u32;
+    Some(NormalizedCrop {
+        x: x as f32 / fw as f32,
+        y: y as f32 / fh as f32,
+        width: w as f32 / fw as f32,
+        height: h as f32 / fh as f32,
+    })
 }
 
 /// A rotate-button handler: adds `delta` quarter-turns CW (1 = 90° CW, 3 = 90°
@@ -717,7 +876,10 @@ fn rotate_handler(
             info2.set_text(&output_line((nfw, nfh), adj.crop));
         }
         crop_area.queue_draw();
-        on_event(AppEvent::PhotoEdit { id, adjustments: adj });
+        on_event(AppEvent::PhotoEdit {
+            id,
+            adjustments: adj,
+        });
     }
 }
 
@@ -743,10 +905,12 @@ pub struct EditorScreen {
     wb_auto_button: Button,
     wb_auto2_button: Button,
     reset_wb_btn: Button,
+    picker_wb_btn: Button,
     crop_11: Button,
     crop_23: Button,
     crop_32: Button,
     crop_orig: Button,
+    crop_pix: Button,
     rotate_ccw: Button,
     rotate_cw: Button,
     reject_button: Button,
@@ -764,6 +928,9 @@ pub struct EditorScreen {
     /// rolloff, camera S-curve, sRGB), understating a strong cast — hence the
     /// linear pre-tone base sample.
     wb_sample: Rc<RefCell<Option<(Vec<f32>, u32, u32)>>>,
+    /// Explicit neutral-picker mode. A preview click only changes WB while this
+    /// switch is on; the picker itself uses an adaptive 7×7..31×31 sample.
+    picker_active: Rc<Cell<bool>>,
     /// The active photo's camera→sRGB color matrix (RAW only; `None` for JPEG /
     /// no matrix), pushed by the controller for WB Auto/Pick.
     cam_matrix: Rc<RefCell<Option<[[f32; 4]; 3]>>>,
@@ -894,13 +1061,14 @@ impl EditorScreen {
         let wb_row = GBox::new(Orientation::Horizontal, 6);
         // Auto = clinical neutralization of the frame's neutral reference; Auto2 =
         // the same but keeping the warm ambience (Nikon AUTO2 "keep warm lighting").
-        // The neutral-pick needs no button — clicking the preview samples a neutral
-        // point directly (except on crop handles).
         let wb_auto_button = Button::with_label("Auto");
         wb_auto_button.set_tooltip_text(Some("Neutralize the warm/cool cast (clinical)"));
         let wb_auto2_button = Button::with_label("Auto2");
-        wb_auto2_button.set_tooltip_text(Some("Neutralize but keep the warm ambience (Nikon AUTO2)"));
+        wb_auto2_button
+            .set_tooltip_text(Some("Neutralize but keep the warm ambience (Nikon AUTO2)"));
         let reset_wb_btn = Button::with_label("Reset");
+        let picker_wb_btn = Button::with_label("Picker");
+        picker_wb_btn.set_tooltip_text(Some("Toggle neutral picker (samples a 7×7–31×31 area)"));
         let wb_value = Label::new(Some("+0.00 · +0.00"));
         wb_value.add_css_class("editor-value");
         wb_value.set_hexpand(true);
@@ -909,6 +1077,7 @@ impl EditorScreen {
         wb_row.append(&wb_auto_button);
         wb_row.append(&wb_auto2_button);
         wb_row.append(&reset_wb_btn);
+        wb_row.append(&picker_wb_btn);
         wb_row.append(&wb_value);
         // Auto-WB + neutral-pick now have the preview pixels + camera matrix
         // wired (see wire_buttons) — enabled.
@@ -921,7 +1090,11 @@ impl EditorScreen {
         let crop_23 = Button::with_label("2:3");
         let crop_32 = Button::with_label("3:2");
         let crop_orig = Button::with_label("Original");
-        for b in [&crop_11, &crop_23, &crop_32, &crop_orig] {
+        let crop_pix = Button::with_label("Pix");
+        crop_pix.set_tooltip_text(Some(
+            "Snap crop to the nearest pixel-friendly export aspect",
+        ));
+        for b in [&crop_11, &crop_23, &crop_32, &crop_orig, &crop_pix] {
             b.set_hexpand(true);
             presets.append(b);
         }
@@ -1031,10 +1204,12 @@ impl EditorScreen {
             wb_auto_button,
             wb_auto2_button,
             reset_wb_btn,
+            picker_wb_btn,
             crop_11,
             crop_23,
             crop_32,
             crop_orig,
+            crop_pix,
             rotate_ccw,
             rotate_cw,
             reject_button,
@@ -1043,6 +1218,7 @@ impl EditorScreen {
             full_size: Rc::new(Cell::new(None)),
             crop,
             wb_sample: Rc::new(RefCell::new(None)),
+            picker_active: Rc::new(Cell::new(false)),
             cam_matrix: Rc::new(RefCell::new(None)),
             is_raw: Rc::new(Cell::new(false)),
             current_mode: Rc::new(Cell::new(ExposureMode::Auto)),
@@ -1079,6 +1255,8 @@ impl EditorScreen {
         // camera matrix).
         self.wb_sample.borrow_mut().take();
         self.cam_matrix.borrow_mut().take();
+        self.picker_active.set(false);
+        self.picker_wb_btn.remove_css_class("suggested-action");
         self.crop_area.queue_draw();
         self.file_label.set_text(name);
         self.file_label.set_tooltip_text(Some(name));
@@ -1172,34 +1350,35 @@ impl EditorScreen {
     /// (`compute_histogram`, 256 bins) is kept in the pipeline for a revert.
     pub fn set_histogram(&self, bins: &[u32]) {
         let bins: Vec<u32> = bins.to_vec();
-        self.histogram_area.set_draw_func(move |_area, cr, width, height| {
-            let h = height as f64;
-            let w = width as f64;
-            // Warm near-black bed (Darkroom bg) — the RGB channels glow against it.
-            cr.set_source_rgb(0.086, 0.075, 0.059);
-            let _ = cr.paint();
-            if bins.len() < 256 * 3 {
-                return; // luminance (256-bin) data or none — nothing to draw
-            }
-            let max = bins.iter().copied().max().unwrap_or(1).max(1) as f64;
-            let n = 256.0;
-            let channels = [
-                ((0.95, 0.30, 0.30), 0usize),   // R
-                ((0.30, 0.90, 0.40), 256),       // G
-                ((0.35, 0.45, 0.95), 512),       // B
-            ];
-            for (rgb, off) in channels {
-                cr.set_source_rgba(rgb.0, rgb.1, rgb.2, 0.62);
-                for i in 0..256usize {
-                    let v = bins[off + i];
-                    let x0 = (i as f64 / n) * w;
-                    let x1 = ((i + 1) as f64 / n) * w;
-                    let bh = (v as f64 / max) * h;
-                    cr.rectangle(x0, h - bh, (x1 - x0).max(1.0), bh);
+        self.histogram_area
+            .set_draw_func(move |_area, cr, width, height| {
+                let h = height as f64;
+                let w = width as f64;
+                // Warm near-black bed (Darkroom bg) — the RGB channels glow against it.
+                cr.set_source_rgb(0.086, 0.075, 0.059);
+                let _ = cr.paint();
+                if bins.len() < 256 * 3 {
+                    return; // luminance (256-bin) data or none — nothing to draw
                 }
-                let _ = cr.fill();
-            }
-        });
+                let max = bins.iter().copied().max().unwrap_or(1).max(1) as f64;
+                let n = 256.0;
+                let channels = [
+                    ((0.95, 0.30, 0.30), 0usize), // R
+                    ((0.30, 0.90, 0.40), 256),    // G
+                    ((0.35, 0.45, 0.95), 512),    // B
+                ];
+                for (rgb, off) in channels {
+                    cr.set_source_rgba(rgb.0, rgb.1, rgb.2, 0.62);
+                    for i in 0..256usize {
+                        let v = bins[off + i];
+                        let x0 = (i as f64 / n) * w;
+                        let x1 = ((i + 1) as f64 / n) * w;
+                        let bh = (v as f64 / max) * h;
+                        cr.rectangle(x0, h - bh, (x1 - x0).max(1.0), bh);
+                    }
+                    let _ = cr.fill();
+                }
+            });
     }
 
     pub fn set_nav(&self, has_prev: bool, has_next: bool) {
@@ -1261,7 +1440,10 @@ impl EditorScreen {
             adj.exposure_mode = ExposureMode::Manual;
             adj.exposure_ev = v as f32;
             lab.set_text(&format!("{:+.2} EV", adj.exposure_ev));
-            o(AppEvent::PhotoEdit { id, adjustments: adj });
+            o(AppEvent::PhotoEdit {
+                id,
+                adjustments: adj,
+            });
         });
 
         // Temperature slider.
@@ -1281,7 +1463,10 @@ impl EditorScreen {
             let mut adj = current_adjustments(&st.read().unwrap(), id);
             adj.wb_offset = v as f32;
             lab.set_text(&format!("{:+.2} · {:+.2}", adj.wb_offset, hue2.value()));
-            o(AppEvent::PhotoEdit { id, adjustments: adj });
+            o(AppEvent::PhotoEdit {
+                id,
+                adjustments: adj,
+            });
         });
 
         // Hue slider.
@@ -1301,7 +1486,10 @@ impl EditorScreen {
             let mut adj = current_adjustments(&st.read().unwrap(), id);
             adj.hue = v as f32;
             lab.set_text(&format!("{:+.2} · {:+.2}", temp2.value(), adj.hue));
-            o(AppEvent::PhotoEdit { id, adjustments: adj });
+            o(AppEvent::PhotoEdit {
+                id,
+                adjustments: adj,
+            });
         });
     }
 
@@ -1320,7 +1508,12 @@ impl EditorScreen {
             // you can drag/resize without clicking a preset first).
             let c = match *crop_draw.borrow() {
                 Some(c) => c,
-                None => NormalizedCrop { x: 0.0, y: 0.0, width: 1.0, height: 1.0 },
+                None => NormalizedCrop {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
             };
             let Some(full) = full_draw.get() else { return };
             draw_crop_overlay(cr, width as f64, height as f64, full, c);
@@ -1339,11 +1532,18 @@ impl EditorScreen {
             // frame ({0,0,1,1}) — press/drag/resize works without pressing a preset.
             let c = match *crop_begin.borrow() {
                 Some(c) => c,
-                None => NormalizedCrop { x: 0.0, y: 0.0, width: 1.0, height: 1.0 },
+                None => NormalizedCrop {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
             };
             let Some(full) = full_begin.get() else { return };
             let (aw, ah) = (area_begin.width() as f64, area_begin.height() as f64);
-            let Some(p) = project(aw, ah, full) else { return };
+            let Some(p) = project(aw, ah, full) else {
+                return;
+            };
             let (rx, ry, rw, rh) = crop_rect(&p, &c);
 
             let hit2 = HANDLE_HIT * HANDLE_HIT;
@@ -1379,7 +1579,9 @@ impl EditorScreen {
         let drag_update = Rc::clone(&drag);
         let info2_update = self.info2.clone();
         gesture.connect_drag_update(move |gesture, x, y| {
-            let Some(d) = *drag_update.borrow() else { return };
+            let Some(d) = *drag_update.borrow() else {
+                return;
+            };
             let ndx = (x / d.disp_w) as f32;
             let ndy = (y / d.disp_h) as f32;
             let state = gesture.current_event_state();
@@ -1417,15 +1619,18 @@ impl EditorScreen {
             let Some(id) = id_end.get() else { return };
             let mut adj = current_adjustments(&state_end.read().unwrap(), id);
             adj.crop = Some(c);
-            on_end(AppEvent::PhotoEdit { id, adjustments: adj });
+            on_end(AppEvent::PhotoEdit {
+                id,
+                adjustments: adj,
+            });
         });
 
         self.crop_area.add_controller(gesture);
 
-        // Neutral-pick on click (photoup `pickNeutral`): clicking the preview
-        // samples a 7×7 area under the cursor and maps it to warmth + hue. This is
-        // the DEFAULT click action — no Pick button/mode. Clicks on the crop box's
-        // 8 handles stay crop grabs (the drag gesture resizes them), and any
+        // Neutral-pick on click (photoup `pickNeutral`): when the explicit Picker
+        // switch is active, a click samples a 7×7..31×31 area under the cursor and
+        // maps it to warmth + hue. Clicks on the crop box's 8 handles stay crop
+        // grabs, and any
         // press-drag (crop move/resize) suppresses the click: we listen on
         // `released`, which GTK cancels once the drag gesture claims the sequence.
         // The click lands on the crop overlay (it fills the preview area), whose
@@ -1444,7 +1649,11 @@ impl EditorScreen {
         let hue_click = self.hue_slider.clone();
         let suppress_click = Rc::clone(&self.suppress);
         let wb_lab_click = self.wb_value.clone();
+        let picker_active_click = Rc::clone(&self.picker_active);
         click.connect_released(move |_g, _n_press, x, y| {
+            if !picker_active_click.get() {
+                return;
+            }
             let Some(id) = id_click.get() else { return };
             let Some(full) = full_click.get() else { return };
             let Some((data, pw, ph)) = &*wb_click.borrow() else { return };
@@ -1522,7 +1731,10 @@ impl EditorScreen {
             let mut adj = current_adjustments(&st.read().unwrap(), id);
             adj.exposure_mode = ExposureMode::Auto;
             lab.set_text("+?.?? EV");
-            o(AppEvent::PhotoEdit { id, adjustments: adj });
+            o(AppEvent::PhotoEdit {
+                id,
+                adjustments: adj,
+            });
         });
         let (a, o, st, lab) = (
             Rc::clone(&active_id),
@@ -1535,7 +1747,10 @@ impl EditorScreen {
             let mut adj = current_adjustments(&st.read().unwrap(), id);
             adj.exposure_mode = ExposureMode::Burn;
             lab.set_text("+?.?? EV");
-            o(AppEvent::PhotoEdit { id, adjustments: adj });
+            o(AppEvent::PhotoEdit {
+                id,
+                adjustments: adj,
+            });
         });
 
         // Rest: manual EV = 0, snap the slider.
@@ -1556,7 +1771,10 @@ impl EditorScreen {
             ev.set_value(0.0);
             s.set(false);
             lab.set_text("+0.00 EV");
-            o(AppEvent::PhotoEdit { id, adjustments: adj });
+            o(AppEvent::PhotoEdit {
+                id,
+                adjustments: adj,
+            });
         });
 
         // WB Reset: warmth + hue back to neutral, snap both sliders.
@@ -1579,7 +1797,10 @@ impl EditorScreen {
             hue.set_value(0.0);
             s.set(false);
             lab.set_text("+0.00 · +0.00");
-            o(AppEvent::PhotoEdit { id, adjustments: adj });
+            o(AppEvent::PhotoEdit {
+                id,
+                adjustments: adj,
+            });
         });
 
         // WB Auto (photoup `autoWhiteBalance`): the reference is a grey-world mean
@@ -1640,6 +1861,21 @@ impl EditorScreen {
             apply_wb(id, wb_offset, wb_hue, &st2, &o2, &s2, &temp2, &hue2, &lab2);
         });
 
+        // Picker is deliberately a persistent switch, not a one-shot click: the
+        // amber action styling makes the mode visible and prevents accidental WB
+        // edits while ordinary preview clicks are used for cropping/navigation.
+        let picker_active = Rc::clone(&self.picker_active);
+        let picker_button = self.picker_wb_btn.clone();
+        self.picker_wb_btn.connect_clicked(move |_| {
+            let active = !picker_active.get();
+            picker_active.set(active);
+            if active {
+                picker_button.add_css_class("suggested-action");
+            } else {
+                picker_button.remove_css_class("suggested-action");
+            }
+        });
+
         // Crop presets (each also mirrors the selection into the overlay).
         self.crop_11.connect_clicked(crop_preset_handler(
             1.0,
@@ -1672,6 +1908,41 @@ impl EditorScreen {
             info2.clone(),
         ));
 
+        // Pix makes an exact 2560-long-edge rectangle in FULL source pixels,
+        // using the current crop's center + nearest aspect. It translates the
+        // rectangle inward at edges instead of shrinking it.
+        let (a, st, o, full, crop, area, i2) = (
+            Rc::clone(&active_id),
+            Arc::clone(&state),
+            Arc::clone(&on_event),
+            Rc::clone(&full_size),
+            Rc::clone(&self.crop),
+            self.crop_area.clone(),
+            info2.clone(),
+        );
+        self.crop_pix.connect_clicked(move |_| {
+            let Some(id) = a.get() else { return };
+            let Some(full) = full.get() else { return };
+            if full.0 == 0 || full.1 == 0 {
+                return;
+            }
+            let Some(new_crop) = pix_crop(full, *crop.borrow()) else {
+                o(AppEvent::Toast(
+                    "Pix needs a source large enough for the selected 2560px crop".to_string(),
+                ));
+                return;
+            };
+            *crop.borrow_mut() = Some(new_crop);
+            area.queue_draw();
+            let mut adj = current_adjustments(&st.read().unwrap(), id);
+            adj.crop = Some(new_crop);
+            i2.set_text(&output_line(full, Some(new_crop)));
+            o(AppEvent::PhotoEdit {
+                id,
+                adjustments: adj,
+            });
+        });
+
         // Original: no crop → no selection box drawn.
         let (a, o, st, full, crop_cell, area, i2) = (
             Rc::clone(&active_id),
@@ -1691,7 +1962,10 @@ impl EditorScreen {
             if let Some(full) = full.get() {
                 i2.set_text(&output_line(full, None));
             }
-            o(AppEvent::PhotoEdit { id, adjustments: adj });
+            o(AppEvent::PhotoEdit {
+                id,
+                adjustments: adj,
+            });
         });
 
         // Rotate ↺ / ↻ (user rotation on top of EXIF/libraw orientation).
@@ -1769,6 +2043,35 @@ mod tests {
     }
 
     #[test]
+    fn pix_uses_fixed_full_res_dimensions_and_translates_at_edges() {
+        assert_eq!(pix_dimensions(1.21), (2560, 2560));
+        assert_eq!(pix_dimensions(1.58), (2560, 1707));
+        assert_eq!(pix_dimensions(1.72), (2560, 1440));
+        assert_eq!(pix_dimensions(2.15), (2560, 1280));
+        assert_eq!(pix_dimensions(0.54), (1440, 2560));
+
+        // A 25600px square source with a centered crop becomes an exact 2560px
+        // square source crop — it is NOT the whole image scaled down at export.
+        let centered = pix_crop((25_600, 25_600), None).expect("fits");
+        assert_eq!(crop_to_pixels(&centered, 25_600, 25_600).width, 2560);
+        assert_eq!(crop_to_pixels(&centered, 25_600, 25_600).height, 2560);
+        assert_eq!(crop_to_pixels(&centered, 25_600, 25_600).x, 11_520);
+
+        // Near the right/bottom edge, retain the exact pixels and translate the
+        // origin inward instead of shrinking the crop.
+        let near_edge = NormalizedCrop {
+            x: 0.98,
+            y: 0.98,
+            width: 0.01,
+            height: 0.01,
+        };
+        let edge = pix_crop((4_000, 4_000), Some(near_edge)).expect("fits");
+        let rect = crop_to_pixels(&edge, 4_000, 4_000);
+        assert_eq!((rect.width, rect.height), (2560, 2560));
+        assert_eq!((rect.x, rect.y), (1440, 1440));
+    }
+
+    #[test]
     fn wb_mean_helpers_sample() {
         // Neutral gray (linear): all pixels qualify as near-neutral → mean exactly gray.
         let gray = linear_fill(16, 16, [0.2159, 0.2159, 0.2159]);
@@ -1780,16 +2083,12 @@ mod tests {
         // Saturated warm: max-min = 0.498 > 0.2 → no neutral pixels → whole-region mean.
         let warm = linear_fill(16, 16, [0.578, 0.216, 0.080]);
         let (r, g, b) = auto_wb_mean_linear(&warm, 16, 16, None).expect("warm sample");
-        assert!(
-            (r - 0.578).abs() < 1e-4 && (g - 0.216).abs() < 1e-4 && (b - 0.080).abs() < 1e-4
-        );
+        assert!((r - 0.578).abs() < 1e-4 && (g - 0.216).abs() < 1e-4 && (b - 0.080).abs() < 1e-4);
 
         // Pick: window around the center of a uniform warm block — no noise, so
         // the 7×7 window is kept and the mean is the fill colour exactly.
         let ((r, g, b), win) = pick_sample_linear(&warm, 16, 16, 8.0, 8.0).expect("pick sample");
-        assert!(
-            (r - 0.578).abs() < 1e-4 && (g - 0.216).abs() < 1e-4 && (b - 0.080).abs() < 1e-4
-        );
+        assert!((r - 0.578).abs() < 1e-4 && (g - 0.216).abs() < 1e-4 && (b - 0.080).abs() < 1e-4);
         assert_eq!(win, 7, "uniform fill -> no noise growth");
     }
 
@@ -1828,7 +2127,14 @@ mod tests {
 
         // EV indicator: formatted + fixed-width label.
         let (mut editor, _events) = test_editor();
-        editor.set_photo(1, "test.jpg", &Adjustments::default(), 0.0, false, Some((800, 600)));
+        editor.set_photo(
+            1,
+            "test.jpg",
+            &Adjustments::default(),
+            0.0,
+            false,
+            Some((800, 600)),
+        );
         editor.set_ev(1.5);
         assert_eq!(editor.ev_value.text(), "+1.50 EV");
         editor.set_ev(-0.35);
@@ -1839,40 +2145,81 @@ mod tests {
         // AUTO (clinical) on a neutral gray image (linear 0.2159) → no change;
         // AUTO2 (warm) → the fixed +0.15 warm bias, no tint.
         let (mut editor, events) = test_editor();
-        editor.set_photo(7, "gray.jpg", &Adjustments::default(), 0.0, false, Some((16, 16)));
+        editor.set_photo(
+            7,
+            "gray.jpg",
+            &Adjustments::default(),
+            0.0,
+            false,
+            Some((16, 16)),
+        );
         editor.set_wb_sample(linear_fill(16, 16, [0.2159, 0.2159, 0.2159]), 16, 16);
         editor.wb_auto_button.emit_clicked();
         let adj = find_photo_edit(&events, 7).expect("neutral PhotoEdit (Auto)");
-        assert!((adj.wb_offset - 0.0).abs() < 1e-4, "offset {}", adj.wb_offset);
+        assert!(
+            (adj.wb_offset - 0.0).abs() < 1e-4,
+            "offset {}",
+            adj.wb_offset
+        );
         assert!((adj.hue - 0.0).abs() < 1e-4, "hue {}", adj.hue);
         editor.wb_auto2_button.emit_clicked();
         let adj = find_photo_edit(&events, 7).expect("neutral PhotoEdit (Auto2)");
-        assert!((adj.wb_offset - 0.15).abs() < 1e-4, "offset {}", adj.wb_offset);
+        assert!(
+            (adj.wb_offset - 0.15).abs() < 1e-4,
+            "offset {}",
+            adj.wb_offset
+        );
         assert!((adj.hue - 0.0).abs() < 1e-4, "hue {}", adj.hue);
 
         // AUTO (clinical) on a warm image → full neutralization: the exact pick fit
         // on (0.578,0.216,0.080) is offset ≈ −2.853, hue ≈ +0.009.
         let (mut editor, events) = test_editor();
-        editor.set_photo(8, "warm.jpg", &Adjustments::default(), 0.0, false, Some((16, 16)));
+        editor.set_photo(
+            8,
+            "warm.jpg",
+            &Adjustments::default(),
+            0.0,
+            false,
+            Some((16, 16)),
+        );
         editor.set_wb_sample(linear_fill(16, 16, [0.578, 0.216, 0.080]), 16, 16);
         editor.wb_auto_button.emit_clicked();
         let adj = find_photo_edit(&events, 8).expect("warm PhotoEdit (Auto)");
         assert!(adj.wb_offset < -0.3, "offset {}", adj.wb_offset);
-        assert!((adj.wb_offset - -2.852998).abs() < 1e-3, "offset {}", adj.wb_offset);
+        assert!(
+            (adj.wb_offset - -2.852998).abs() < 1e-3,
+            "offset {}",
+            adj.wb_offset
+        );
         assert!((adj.hue - 0.008614).abs() < 1e-3, "hue {}", adj.hue);
         // AUTO2 (warm) → 60% of the correction + 0.15 warm bias (offset ≈ −1.562),
         // keeping the ambience like Nikon AUTO2 "keep warm lighting colors".
         editor.wb_auto2_button.emit_clicked();
         let adj = find_photo_edit(&events, 8).expect("warm PhotoEdit (Auto2)");
-        assert!((adj.wb_offset - -1.561799).abs() < 1e-3, "offset {}", adj.wb_offset);
+        assert!(
+            (adj.wb_offset - -1.561799).abs() < 1e-3,
+            "offset {}",
+            adj.wb_offset
+        );
         assert!((adj.hue - 0.002584).abs() < 1e-3, "hue {}", adj.hue);
 
         // No wb sample → the handler must not emit anything or crash.
         let (mut editor, events) = test_editor();
-        editor.set_photo(9, "nopreview.jpg", &Adjustments::default(), 0.0, false, Some((16, 16)));
+        editor.set_photo(
+            9,
+            "nopreview.jpg",
+            &Adjustments::default(),
+            0.0,
+            false,
+            Some((16, 16)),
+        );
         editor.wb_auto_button.emit_clicked();
         assert!(
-            !events.lock().unwrap().iter().any(|e| matches!(e, AppEvent::PhotoEdit { .. })),
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, AppEvent::PhotoEdit { .. })),
             "must not emit PhotoEdit without a wb sample"
         );
     }
@@ -1910,11 +2257,24 @@ mod tests {
     #[test]
     fn resize_center_keeps_center() {
         // A centered crop {0.3,0.3,0.4,0.4} has center (0.5,0.5).
-        let c = NormalizedCrop { x: 0.3, y: 0.3, width: 0.4, height: 0.4 };
+        let c = NormalizedCrop {
+            x: 0.3,
+            y: 0.3,
+            width: 0.4,
+            height: 0.4,
+        };
         // SE grow: width+0.1, height+0.1; both edges move so the center stays.
         let r = resize_crop_center(c, Handle::Se, 0.1, 0.1);
-        assert!((r.x + r.width / 2.0 - 0.5).abs() < 1e-6, "x-center {}", r.x + r.width / 2.0);
-        assert!((r.y + r.height / 2.0 - 0.5).abs() < 1e-6, "y-center {}", r.y + r.height / 2.0);
+        assert!(
+            (r.x + r.width / 2.0 - 0.5).abs() < 1e-6,
+            "x-center {}",
+            r.x + r.width / 2.0
+        );
+        assert!(
+            (r.y + r.height / 2.0 - 0.5).abs() < 1e-6,
+            "y-center {}",
+            r.y + r.height / 2.0
+        );
         assert!((r.width - 0.5).abs() < 1e-6 && (r.height - 0.5).abs() < 1e-6);
         // W shrink: dragging the left edge right shrinks width around the center.
         let r2 = resize_crop_center(c, Handle::W, 0.1, 0.0);
@@ -1922,19 +2282,41 @@ mod tests {
         assert!((r2.width - 0.3).abs() < 1e-6);
         // The center never escapes the frame: growing far past one edge clamps
         // the half-extent to that edge (2*cx = 0.4 here), leaving x >= 0.
-        let near_left = NormalizedCrop { x: 0.1, y: 0.1, width: 0.2, height: 0.2 };
+        let near_left = NormalizedCrop {
+            x: 0.1,
+            y: 0.1,
+            width: 0.2,
+            height: 0.2,
+        };
         let r3 = resize_crop_center(near_left, Handle::E, 0.5, 0.0);
         assert!(r3.x >= -1e-6, "x {:.4}", r3.x);
-        assert!((r3.width - 0.4).abs() < 1e-6, "clamped to 2*cx=0.4, got {}", r3.width);
+        assert!(
+            (r3.width - 0.4).abs() < 1e-6,
+            "clamped to 2*cx=0.4, got {}",
+            r3.width
+        );
     }
 
     #[test]
     fn resize_shift_center_keeps_center_and_ratio() {
-        let c = NormalizedCrop { x: 0.3, y: 0.2, width: 0.4, height: 0.3 }; // ratio 4:3
+        let c = NormalizedCrop {
+            x: 0.3,
+            y: 0.2,
+            width: 0.4,
+            height: 0.3,
+        }; // ratio 4:3
         // SE grow driven by the dominant axis (E: sx=0.25 > sy=0.1667).
         let r = resize_crop_shift_center(c, Handle::Se, 0.1, 0.05);
-        assert!((r.x + r.width / 2.0 - 0.5).abs() < 1e-6, "cx {}", r.x + r.width / 2.0);
-        assert!((r.y + r.height / 2.0 - 0.35).abs() < 1e-6, "cy {}", r.y + r.height / 2.0);
+        assert!(
+            (r.x + r.width / 2.0 - 0.5).abs() < 1e-6,
+            "cx {}",
+            r.x + r.width / 2.0
+        );
+        assert!(
+            (r.y + r.height / 2.0 - 0.35).abs() < 1e-6,
+            "cy {}",
+            r.y + r.height / 2.0
+        );
         assert!(
             (r.width / r.height - c.width / c.height).abs() < 1e-6,
             "ratio {}",
@@ -1961,17 +2343,41 @@ mod tests {
     fn edge_handle_at_resolves_border_grabs() {
         let (rx, ry, rw, rh) = (100.0, 100.0, 400.0, 300.0); // 100,100 → 500,400
         // On each edge midpoint — must grab that edge.
-        assert_eq!(edge_handle_at(300.0, 100.0, rx, ry, rw, rh), Some(Handle::N));
-        assert_eq!(edge_handle_at(300.0, 400.0, rx, ry, rw, rh), Some(Handle::S));
-        assert_eq!(edge_handle_at(100.0, 250.0, rx, ry, rw, rh), Some(Handle::W));
-        assert_eq!(edge_handle_at(500.0, 250.0, rx, ry, rw, rh), Some(Handle::E));
+        assert_eq!(
+            edge_handle_at(300.0, 100.0, rx, ry, rw, rh),
+            Some(Handle::N)
+        );
+        assert_eq!(
+            edge_handle_at(300.0, 400.0, rx, ry, rw, rh),
+            Some(Handle::S)
+        );
+        assert_eq!(
+            edge_handle_at(100.0, 250.0, rx, ry, rw, rh),
+            Some(Handle::W)
+        );
+        assert_eq!(
+            edge_handle_at(500.0, 250.0, rx, ry, rw, rh),
+            Some(Handle::E)
+        );
         // Corners — both bordering edges resolve to the corner handle.
         assert_eq!(edge_handle_at(95.0, 95.0, rx, ry, rw, rh), Some(Handle::Nw));
-        assert_eq!(edge_handle_at(505.0, 95.0, rx, ry, rw, rh), Some(Handle::Ne));
-        assert_eq!(edge_handle_at(95.0, 405.0, rx, ry, rw, rh), Some(Handle::Sw));
-        assert_eq!(edge_handle_at(505.0, 405.0, rx, ry, rw, rh), Some(Handle::Se));
+        assert_eq!(
+            edge_handle_at(505.0, 95.0, rx, ry, rw, rh),
+            Some(Handle::Ne)
+        );
+        assert_eq!(
+            edge_handle_at(95.0, 405.0, rx, ry, rw, rh),
+            Some(Handle::Sw)
+        );
+        assert_eq!(
+            edge_handle_at(505.0, 405.0, rx, ry, rw, rh),
+            Some(Handle::Se)
+        );
         // A few px inside an edge still grabs it (the tolerance band).
-        assert_eq!(edge_handle_at(300.0, 107.0, rx, ry, rw, rh), Some(Handle::N));
+        assert_eq!(
+            edge_handle_at(300.0, 107.0, rx, ry, rw, rh),
+            Some(Handle::N)
+        );
         // Deep inside the box or far outside → not a border grab.
         assert_eq!(edge_handle_at(300.0, 250.0, rx, ry, rw, rh), None);
         assert_eq!(edge_handle_at(300.0, 140.0, rx, ry, rw, rh), None);
@@ -1983,13 +2389,26 @@ mod tests {
     /// `clamp_crop` net from the panic fix applies to edge-grab drags too).
     #[test]
     fn edge_grab_at_bottom_edge_stays_in_frame() {
-        let mut c = NormalizedCrop { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
+        let mut c = NormalizedCrop {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
         // Simulate grabbing the bottom edge and dragging it down (ndy > 0 pushes
         // the rect past the frame; the writer must clamp it back).
         c = resize_crop(c, Handle::S, 0.0, 0.25);
-        assert!(c.y + c.height <= 1.0 + 1e-6 && c.height >= MIN_CROP, "{c:?}");
+        assert!(
+            c.y + c.height <= 1.0 + 1e-6 && c.height >= MIN_CROP,
+            "{c:?}"
+        );
         // Grabbing the top edge and dragging it up.
-        c = NormalizedCrop { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
+        c = NormalizedCrop {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
         c = resize_crop(c, Handle::N, 0.0, 0.3);
         assert!(c.y >= -1e-6 && c.height >= MIN_CROP, "{c:?}");
     }
@@ -2000,21 +2419,35 @@ mod tests {
     /// shrink (only corners, whose second axis is non-zero, could shrink).
     #[test]
     fn shift_center_side_handles_resize_both_directions() {
-        let c = NormalizedCrop { x: 0.25, y: 0.25, width: 0.5, height: 0.5 };
+        let c = NormalizedCrop {
+            x: 0.25,
+            y: 0.25,
+            width: 0.5,
+            height: 0.5,
+        };
         // Right edge outward → grows, center fixed, ratio kept.
         let grown = resize_crop_shift_center(c, Handle::E, 0.1, 0.0);
         assert!(grown.width > c.width, "right edge outward grows: {grown:?}");
-        assert!((grown.height / grown.width - 1.0).abs() < 1e-4, "ratio kept: {grown:?}");
+        assert!(
+            (grown.height / grown.width - 1.0).abs() < 1e-4,
+            "ratio kept: {grown:?}"
+        );
         assert!(
             (grown.x + grown.width / 2.0 - 0.5).abs() < 1e-4,
             "center x fixed: {grown:?}"
         );
         // Right edge inward → shrinks (was a no-op before the fix).
         let shrunk = resize_crop_shift_center(c, Handle::E, -0.1, 0.0);
-        assert!(shrunk.width < c.width, "right edge inward shrinks: {shrunk:?}");
+        assert!(
+            shrunk.width < c.width,
+            "right edge inward shrinks: {shrunk:?}"
+        );
         // Top edge inward (drag down) → shrinks too.
         let n_shrunk = resize_crop_shift_center(c, Handle::N, 0.0, 0.1);
-        assert!(n_shrunk.height < c.height, "top edge inward shrinks: {n_shrunk:?}");
+        assert!(
+            n_shrunk.height < c.height,
+            "top edge inward shrinks: {n_shrunk:?}"
+        );
     }
 
     /// `2·(1−cx)` bound dips a hair under MIN_CROP → `.clamp(MIN_CROP, bound)`
@@ -2022,14 +2455,28 @@ mod tests {
     #[test]
     fn center_resize_at_edge_never_panics() {
         // The exact failing input from the fuzz: right-edge crop, Ne grow, Alt.
-        let c = NormalizedCrop { x: 0.95, y: 0.0, width: 0.050000012, height: 0.82297975 };
+        let c = NormalizedCrop {
+            x: 0.95,
+            y: 0.0,
+            width: 0.050000012,
+            height: 0.82297975,
+        };
         let r = resize_crop_center(c, Handle::Ne, 0.529804707, 0.043798685);
-        assert!(r.x + r.width <= 1.0 + 1e-6 && r.width >= MIN_CROP, "in-frame: {r:?}");
+        assert!(
+            r.x + r.width <= 1.0 + 1e-6 && r.width >= MIN_CROP,
+            "in-frame: {r:?}"
+        );
         // Same shape via the shift-center and plain-shift paths.
         let r2 = resize_crop_shift_center(c, Handle::Ne, 0.5, 0.0);
-        assert!(r2.x + r2.width <= 1.0 + 1e-6 && r2.width >= MIN_CROP, "in-frame: {r2:?}");
+        assert!(
+            r2.x + r2.width <= 1.0 + 1e-6 && r2.width >= MIN_CROP,
+            "in-frame: {r2:?}"
+        );
         let r3 = resize_crop_shift(c, Handle::Ne, 0.5, 0.0);
-        assert!(r3.x + r3.width <= 1.0 + 1e-6 && r3.width >= MIN_CROP, "in-frame: {r3:?}");
+        assert!(
+            r3.x + r3.width <= 1.0 + 1e-6 && r3.width >= MIN_CROP,
+            "in-frame: {r3:?}"
+        );
     }
 
     /// Fuzz: a chain of random drags (like a real user edit session) must never
@@ -2048,7 +2495,12 @@ mod tests {
             (seed as f64 / u64::MAX as f64) as f32
         };
         let (w, h) = (3680u32, 2456u32);
-        let mut c = NormalizedCrop { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
+        let mut c = NormalizedCrop {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
         for step in 0..200_000 {
             let r = crop_to_pixels(&c, w, h);
             assert!(
@@ -2058,8 +2510,14 @@ mod tests {
             );
             // random drag
             let handle = match (rnd() * 8.0) as usize {
-                0 => Handle::N, 1 => Handle::S, 2 => Handle::E, 3 => Handle::W,
-                4 => Handle::Ne, 5 => Handle::Nw, 6 => Handle::Se, _ => Handle::Sw,
+                0 => Handle::N,
+                1 => Handle::S,
+                2 => Handle::E,
+                3 => Handle::W,
+                4 => Handle::Ne,
+                5 => Handle::Nw,
+                6 => Handle::Se,
+                _ => Handle::Sw,
             };
             let alt = rnd() < 0.3;
             let shift = rnd() < 0.3;

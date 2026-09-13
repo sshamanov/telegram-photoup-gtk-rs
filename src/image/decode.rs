@@ -61,7 +61,23 @@ pub fn decode_raw(data: &[u8], opts: &RawDecodeOpts) -> Result<DecodedRaw> {
     raw.open_buffer(data)?;
     raw.unpack()?;
     raw.process()?;
-    raw.make_mem_image()
+    let mut decoded = raw.make_mem_image()?;
+    // Interactive RAW development intentionally uses LibRaw's half-size buffer.
+    // Its pixels are exactly 1/2 width and height of the developed export, but
+    // the editor's source/output labels and Pix crop geometry must describe the
+    // full-resolution result. Keep the two coordinate spaces explicit here.
+    decoded.developed_size = if opts.full_size {
+        Size {
+            width: decoded.width,
+            height: decoded.height,
+        }
+    } else {
+        Size {
+            width: decoded.width * 2,
+            height: decoded.height * 2,
+        }
+    };
+    Ok(decoded)
 }
 
 pub struct RawDecodeOpts {

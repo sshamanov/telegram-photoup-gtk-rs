@@ -8,26 +8,26 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, RwLock};
 
-use gtk4::prelude::*;
 use gtk4::gio;
+use gtk4::prelude::*;
 
-use crate::image::decode::{decode_jpeg, decode_raw, RawDecodeOpts};
-use crate::image::encode::{encode_jpeg_444_adaptive, MAX_PHOTO_BYTES};
+use crate::image::decode::{RawDecodeOpts, decode_jpeg, decode_raw};
+use crate::image::encode::{MAX_PHOTO_BYTES, encode_jpeg_444_adaptive};
 use crate::image::math::fit_within;
 use crate::image::pool::ImagePool;
 use crate::image::process::{
-    compute_histogram_rgb, crop_rect, export_dimensions, rotate_dims, Base, JpegBase, RawBase,
-    RotatedBase,
+    Base, JpegBase, RawBase, RotatedBase, compute_histogram_rgb, crop_rect, export_dimensions,
+    rotate_dims,
 };
 use crate::image::srgb::export_wb_mul;
 use crate::image::types::{Adjustments, ExposureMode, Size, SourceType};
 use crate::state::{
-    reduce, AppEvent, AppState, AuthEvent, AuthStatus, PhotoState, PhotoStatus, UsageStats,
+    AppEvent, AppState, AuthEvent, AuthStatus, PhotoState, PhotoStatus, UsageStats, reduce,
 };
-use crate::telegram::{worker::TelegramWorkerConfig, AuthStep, DialogInfo, TCommand, TEvent};
+use crate::telegram::{AuthStep, DialogInfo, TCommand, TEvent, worker::TelegramWorkerConfig};
 use crate::ui::editor::EditorScreen;
 use crate::ui::grid::PhotoRow;
 use crate::ui::login::LoginScreen;
@@ -369,8 +369,7 @@ impl AppController {
             let Some(file_list) = value.get::<gtk4::gdk::FileList>().ok() else {
                 return false;
             };
-            let paths: Vec<PathBuf> =
-                file_list.files().iter().filter_map(|f| f.path()).collect();
+            let paths: Vec<PathBuf> = file_list.files().iter().filter_map(|f| f.path()).collect();
             if paths.is_empty() {
                 return false;
             }
@@ -445,7 +444,11 @@ impl AppController {
     /// Dispatch a window key press to the matching action. Returns Stop for the
     /// keys this controller handles, Proceed otherwise (let GTK / child widgets
     /// keep unclaimed keys).
-    fn on_key(&mut self, keyval: gtk4::gdk::Key, state: gtk4::gdk::ModifierType) -> glib::Propagation {
+    fn on_key(
+        &mut self,
+        keyval: gtk4::gdk::Key,
+        state: gtk4::gdk::ModifierType,
+    ) -> glib::Propagation {
         use gtk4::gdk::{Key, ModifierType};
         // Focus guard: a focused text entry / text view / other editable keeps
         // its keys (Ctrl+A = select-all-text, arrows = caret movement). The login
@@ -499,10 +502,20 @@ impl AppController {
             // Z/X tint (Ctrl+A select-all is caught above; plain A is warmth-down).
             k if matches!(
                 k,
-                Key::q | Key::Q | Key::w | Key::W
-                    | Key::a | Key::A | Key::s | Key::S
-                    | Key::z | Key::Z | Key::x | Key::X
-            ) => {
+                Key::q
+                    | Key::Q
+                    | Key::w
+                    | Key::W
+                    | Key::a
+                    | Key::A
+                    | Key::s
+                    | Key::S
+                    | Key::z
+                    | Key::Z
+                    | Key::x
+                    | Key::X
+            ) =>
+            {
                 if self.on_fine_tune(keyval) {
                     glib::Propagation::Stop
                 } else {
@@ -572,13 +585,19 @@ impl AppController {
     fn handle_app_event(&mut self, ev: AppEvent) {
         match &ev {
             AppEvent::Auth(AuthEvent::PhoneRequested { phone }) => {
-                let _ = self.telegram_cmd.send(TCommand::RequestCode { phone: phone.clone() });
+                let _ = self.telegram_cmd.send(TCommand::RequestCode {
+                    phone: phone.clone(),
+                });
             }
             AppEvent::Auth(AuthEvent::CodeEntered { code }) => {
-                let _ = self.telegram_cmd.send(TCommand::SubmitCode { code: code.clone() });
+                let _ = self
+                    .telegram_cmd
+                    .send(TCommand::SubmitCode { code: code.clone() });
             }
             AppEvent::Auth(AuthEvent::PasswordEntered { password }) => {
-                let _ = self.telegram_cmd.send(TCommand::SubmitPassword { password: password.clone() });
+                let _ = self.telegram_cmd.send(TCommand::SubmitPassword {
+                    password: password.clone(),
+                });
             }
             AppEvent::PhotoEdit { id, adjustments } => {
                 self.schedule_preview(*id);
@@ -624,7 +643,10 @@ impl AppController {
         match ev {
             TEvent::AuthStep(AuthStep::Ready) => {
                 log::info!("telegram: authenticated — loading dialogs");
-                reduce(&mut *self.state.write().unwrap(), AppEvent::Auth(AuthEvent::Success));
+                reduce(
+                    &mut *self.state.write().unwrap(),
+                    AppEvent::Auth(AuthEvent::Success),
+                );
                 let _ = self.telegram_cmd.send(TCommand::LoadDialogs);
             }
             TEvent::AuthStep(_) => {}
@@ -632,14 +654,18 @@ impl AppController {
                 log::info!("telegram: login code requested");
                 reduce(
                     &mut *self.state.write().unwrap(),
-                    AppEvent::Auth(AuthEvent::PhoneRequested { phone: String::new() }),
+                    AppEvent::Auth(AuthEvent::PhoneRequested {
+                        phone: String::new(),
+                    }),
                 );
             }
             TEvent::PasswordRequired { hint } => {
                 log::info!("telegram: 2FA password required");
                 reduce(
                     &mut *self.state.write().unwrap(),
-                    AppEvent::Auth(AuthEvent::CodeEntered { code: String::new() }),
+                    AppEvent::Auth(AuthEvent::CodeEntered {
+                        code: String::new(),
+                    }),
                 );
                 if let Some(h) = hint {
                     self.toast.show(&format!("2FA password required: {h}"));
@@ -687,7 +713,15 @@ impl AppController {
 
     fn handle_ui_event(&mut self, ev: UiEvent) {
         match ev {
-            UiEvent::ThumbReady { id, rgba, size, full, auto_ev, histogram, cam_mul } => {
+            UiEvent::ThumbReady {
+                id,
+                rgba,
+                size,
+                full,
+                auto_ev,
+                histogram,
+                cam_mul,
+            } => {
                 self.cam_mul.insert(id, cam_mul);
                 let e = AppEvent::PhotoThumbReady {
                     id,
@@ -722,7 +756,18 @@ impl AppController {
                     self.editor.set_ev(self.effective_ev_for(id, auto_ev));
                 }
             }
-            UiEvent::PreviewReady { id, rgba, size, full, auto_ev, histogram, cam_mul, cam_matrix, base, preview_gen } => {
+            UiEvent::PreviewReady {
+                id,
+                rgba,
+                size,
+                full,
+                auto_ev,
+                histogram,
+                cam_mul,
+                cam_matrix,
+                base,
+                preview_gen,
+            } => {
                 if preview_gen != self.render_gen {
                     return; // superseded by a newer edit — drop the stale render
                 }
@@ -754,15 +799,14 @@ impl AppController {
                 // the pre-tone base, not the tone-processed preview). Re-submitted
                 // only on a decode/re-cache — a re-cache happens on photo switch,
                 // so this never spams during slider drags.
-                if is_active
-                    && let Some(arc) = base
-                {
+                if is_active && let Some(arc) = base {
                     // The WB sample must be DISPLAY-oriented (so the editor's
                     // click→sample mapping stays direct); wrap the raw base with the
                     // photo's current rotation when sampling.
                     let rotation = {
                         let st = self.state.read().unwrap();
-                        idx.and_then(|i| st.photos.get(i)).map_or(0, |p| p.adjustments.rotation)
+                        idx.and_then(|i| st.photos.get(i))
+                            .map_or(0, |p| p.adjustments.rotation)
                     };
                     let arc_job = Arc::clone(&arc);
                     let tx = self.ui_events_sender.clone();
@@ -772,16 +816,15 @@ impl AppController {
                     });
                     self.active_base = Some((id, arc));
                     self.last_wb_rotation = Some((id, rotation));
-                } else if is_active
-                    && let Some((cid, arc)) = self.active_base.take()
-                {
+                } else if is_active && let Some((cid, arc)) = self.active_base.take() {
                     if cid == id {
                         // Render-only job (no re-decode): re-kick the WB sample only
                         // if the photo's rotation changed since the last sample — the
                         // cached base doesn't move, but its DISPLAY orientation does.
                         let rotation = {
                             let st = self.state.read().unwrap();
-                            idx.and_then(|i| st.photos.get(i)).map_or(0, |p| p.adjustments.rotation)
+                            idx.and_then(|i| st.photos.get(i))
+                                .map_or(0, |p| p.adjustments.rotation)
                         };
                         if self.last_wb_rotation != Some((id, rotation)) {
                             self.active_base = Some((id, Arc::clone(&arc)));
@@ -800,11 +843,12 @@ impl AppController {
                     // drop it (active_base stays None, like the submit_preview path).
                 }
                 if is_active {
-                    self.editor.set_preview(Some(&crate::ui::util::rgba_to_texture(
-                        &rgba,
-                        size.0 as i32,
-                        size.1 as i32,
-                    )));
+                    self.editor
+                        .set_preview(Some(&crate::ui::util::rgba_to_texture(
+                            &rgba,
+                            size.0 as i32,
+                            size.1 as i32,
+                        )));
                     self.editor.set_full_size(full);
                     self.editor.set_histogram(&histogram);
                     self.editor.set_ev(self.effective_ev_for(id, auto_ev));
@@ -850,7 +894,10 @@ impl AppController {
             UiEvent::JobFailed { id, msg } => {
                 reduce(
                     &mut *self.state.write().unwrap(),
-                    AppEvent::PhotoFailed { id, msg: msg.clone() },
+                    AppEvent::PhotoFailed {
+                        id,
+                        msg: msg.clone(),
+                    },
                 );
                 self.cam_mul.remove(&id);
                 // Mark the grid cell with the error badge (red outline + disabled
@@ -875,7 +922,11 @@ impl AppController {
         let st = self.state.read().unwrap();
         let target = match &st.telegram.status {
             AuthStatus::Authenticated => {
-                if st.active_photo.is_some() { "editor" } else { "main" }
+                if st.active_photo.is_some() {
+                    "editor"
+                } else {
+                    "main"
+                }
             }
             _ => "login",
         };
@@ -996,7 +1047,10 @@ impl AppController {
         self.main_screen.group_dropdown.set_model(Some(&model));
         if !self.dialogs.is_empty() {
             // Pre-select the persisted target group if it's still in the dialog list.
-            let idx = self.dialogs.iter().position(|d| Some(d.id) == self.config.target_peer_id);
+            let idx = self
+                .dialogs
+                .iter()
+                .position(|d| Some(d.id) == self.config.target_peer_id);
             match idx {
                 Some(i) => self.main_screen.group_dropdown.set_selected(i as u32),
                 None => self.main_screen.group_dropdown.set_selected(0),
@@ -1025,21 +1079,17 @@ impl AppController {
         let Some(w) = self.ctl.as_ref().and_then(|w| w.upgrade()) else {
             return;
         };
-        dialog.open_multiple(
-            Some(&self.window),
-            None::<&gio::Cancellable>,
-            move |res| {
-                let Ok(model) = res else { return }; // cancelled
-                let mut ctl = w.borrow_mut();
-                for i in 0..model.n_items() {
-                    if let Some(file) = model.item(i).and_then(|o| o.downcast::<gio::File>().ok()) {
-                        if let Some(path) = file.path() {
-                            ctl.add_photo(path);
-                        }
+        dialog.open_multiple(Some(&self.window), None::<&gio::Cancellable>, move |res| {
+            let Ok(model) = res else { return }; // cancelled
+            let mut ctl = w.borrow_mut();
+            for i in 0..model.n_items() {
+                if let Some(file) = model.item(i).and_then(|o| o.downcast::<gio::File>().ok()) {
+                    if let Some(path) = file.path() {
+                        ctl.add_photo(path);
                     }
                 }
-            },
-        );
+            }
+        });
     }
 
     /// Add photos from arbitrary paths, silently dropping any that aren't an
@@ -1126,7 +1176,10 @@ impl AppController {
             status: PhotoStatus::Queued,
             selected: true, // photoup defaults checkboxes to checked
         };
-        reduce(&mut *self.state.write().unwrap(), AppEvent::PhotosAdded(vec![photo]));
+        reduce(
+            &mut *self.state.write().unwrap(),
+            AppEvent::PhotosAdded(vec![photo]),
+        );
         let row = PhotoRow::new(id);
         // The grid's checkbox renders from the ROW's `selected` property (not the
         // state's), so mirror the state default (checked) or the check lies until
@@ -1200,21 +1253,33 @@ impl AppController {
             return; // a newer edit superseded this timer
         }
         self.render_debounce = None;
-        let (id, source_type, adjustments, path) = {
+        let (id, source_type, adjustments, path, developed_full) = {
             let st = self.state.read().unwrap();
             let Some(i) = st.active_photo else { return };
             let Some(p) = st.photos.get(i) else { return };
-            (p.id, p.source_type, p.adjustments, p.path.clone())
+            (
+                p.id,
+                p.source_type,
+                p.adjustments,
+                p.path.clone(),
+                p.full_size,
+            )
         };
         // Effective-edit log: only when the settled adjustments actually changed
         // (this is the debounced render that hits the image — slider drags coalesce
         // to one commit here, not one log per tick).
         let name = crate::ui::util::file_name(&path);
-        let changed = self.last_edit_log.get(&id).map_or(true, |last| *last != adjustments);
+        let changed = self
+            .last_edit_log
+            .get(&id)
+            .map_or(true, |last| *last != adjustments);
         if changed {
             log::info!(
                 "action: edit {name} → mode={:?} EV={:+.2} wb={:+.2} hue={:+.2}",
-                adjustments.exposure_mode, adjustments.exposure_ev, adjustments.wb_offset, adjustments.hue
+                adjustments.exposure_mode,
+                adjustments.exposure_ev,
+                adjustments.wb_offset,
+                adjustments.hue
             );
             self.last_edit_log.insert(id, adjustments);
         }
@@ -1227,7 +1292,7 @@ impl AppController {
                 self.active_base = Some((cached_id, Arc::clone(&base)));
                 self.pool.submit(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run_render_job(base, &adjustments, LIVE_EDGE)
+                        run_render_job(base, &adjustments, LIVE_EDGE, developed_full)
                     }))
                     .unwrap_or_else(|_| Err("preview render panicked".to_string()));
                     let _ = tx.send(match result {
@@ -1306,13 +1371,15 @@ impl AppController {
         if preview_gen != self.render_gen {
             return; // a newer edit superseded this settle
         }
-        let (id, adjustments) = {
+        let (id, adjustments, developed_full) = {
             let st = self.state.read().unwrap();
             let Some(i) = st.active_photo else { return };
             let Some(p) = st.photos.get(i) else { return };
-            (p.id, p.adjustments)
+            (p.id, p.adjustments, p.full_size)
         };
-        let Some((cached_id, base)) = self.active_base.take() else { return };
+        let Some((cached_id, base)) = self.active_base.take() else {
+            return;
+        };
         if cached_id != id {
             self.active_base = None;
             return;
@@ -1321,7 +1388,7 @@ impl AppController {
         let tx = self.ui_events_sender.clone();
         self.pool.submit(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_render_job(base, &adjustments, FINAL_EDGE)
+                run_render_job(base, &adjustments, FINAL_EDGE, developed_full)
             }))
             .unwrap_or_else(|_| Err("settle render panicked".to_string()));
             let _ = tx.send(match result {
@@ -1360,7 +1427,12 @@ impl AppController {
             }))
             .unwrap_or_else(|_| Err("export job panicked".to_string()));
             let _ = tx.send(match result {
-                Ok((jpeg, width, height)) => UiEvent::ExportReady { id, jpeg, width, height },
+                Ok((jpeg, width, height)) => UiEvent::ExportReady {
+                    id,
+                    jpeg,
+                    width,
+                    height,
+                },
                 Err(msg) => UiEvent::JobFailed { id, msg },
             });
         });
@@ -1421,7 +1493,11 @@ impl AppController {
             self.toast.show("No exportable photos selected");
             return;
         }
-        log::info!("send: exporting {} selected photos → {}", jobs.len(), peer.title);
+        log::info!(
+            "send: exporting {} selected photos → {}",
+            jobs.len(),
+            peer.title
+        );
 
         // Reset the footer bookkeeping for the new batch.
         self.send_jobs = jobs
@@ -1448,13 +1524,16 @@ impl AppController {
             return;
         }
         // Fire once every selected photo is accounted for (exported OR failed).
-        let all_accounted = self.send_pending.iter().all(|id| {
-            self.pending_exports.contains_key(id) || self.send_failed.contains(id)
-        });
+        let all_accounted = self
+            .send_pending
+            .iter()
+            .all(|id| self.pending_exports.contains_key(id) || self.send_failed.contains(id));
         if !all_accounted {
             return;
         }
-        let Some(peer) = self.send_peer.take() else { return };
+        let Some(peer) = self.send_peer.take() else {
+            return;
+        };
         let pending = std::mem::take(&mut self.send_pending);
         self.send_failed.clear();
 
@@ -1515,7 +1594,10 @@ impl AppController {
         };
         reduce(
             &mut *self.state.write().unwrap(),
-            AppEvent::Usage(UsageStats { sent, ..Default::default() }),
+            AppEvent::Usage(UsageStats {
+                sent,
+                ..Default::default()
+            }),
         );
         // On success the temp files were uploaded — delete them. On failure, keep
         // the exported JPEGs so nothing is lost (the user can re-send from the
@@ -1531,7 +1613,8 @@ impl AppController {
                     .map(|d| d.display().to_string())
                     .unwrap_or_default();
                 log::warn!("send failed — {} exported JPEGs kept in {dir}", kept.len());
-                self.toast.show(&format!("Send failed — {} JPEGs kept in {dir}", kept.len()));
+                self.toast
+                    .show(&format!("Send failed — {} JPEGs kept in {dir}", kept.len()));
             }
         }
 
@@ -1568,7 +1651,8 @@ impl AppController {
             self.toast.show(&format!("Sent {ok} photos"));
         } else {
             self.send_failed_backoff();
-            self.toast.show(&format!("Send failed: {}", result.unwrap_err()));
+            self.toast
+                .show(&format!("Send failed: {}", result.unwrap_err()));
         }
         self.refresh_screens();
     }
@@ -1600,14 +1684,11 @@ impl AppController {
         let Some(w) = self.ctl.as_ref().and_then(|w| w.upgrade()) else {
             return;
         };
-        let src = glib::timeout_add_local_once(
-            std::time::Duration::from_secs(2),
-            move || {
-                let mut ctl = w.borrow_mut();
-                ctl.send_backoff = None;
-                ctl.main_screen.send_button.set_sensitive(true);
-            },
-        );
+        let src = glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
+            let mut ctl = w.borrow_mut();
+            ctl.send_backoff = None;
+            ctl.main_screen.send_button.set_sensitive(true);
+        });
         self.send_backoff = Some(src);
     }
 
@@ -1623,7 +1704,12 @@ impl AppController {
     // ---- Helpers ----------------------------------------------------------
 
     fn index_of(&self, id: u64) -> Option<usize> {
-        self.state.read().unwrap().photos.iter().position(|p| p.id == id)
+        self.state
+            .read()
+            .unwrap()
+            .photos
+            .iter()
+            .position(|p| p.id == id)
     }
 
     /// The EV the editor's indicator should show after a render of `id`: the
@@ -1735,11 +1821,18 @@ impl AppController {
         for id in &ids {
             self.cam_mul.remove(id);
             self.cam_matrix.remove(id);
-            if self.active_base.as_ref().map_or(false, |(cid, _)| cid == id) {
+            if self
+                .active_base
+                .as_ref()
+                .map_or(false, |(cid, _)| cid == id)
+            {
                 self.active_base = None;
             }
         }
-        reduce(&mut *self.state.write().unwrap(), AppEvent::PhotosRemoved(ids));
+        reduce(
+            &mut *self.state.write().unwrap(),
+            AppEvent::PhotosRemoved(ids),
+        );
     }
 
     /// Ctrl+A / Cmd+A: toggle select-all on the grid (photoup `selectAll(!allSelected)`):
@@ -1758,7 +1851,13 @@ impl AppController {
         let target = !all_selected;
         let mut st = self.state.write().unwrap();
         for id in ids {
-            reduce(&mut st, AppEvent::PhotoSelected { id, selected: target });
+            reduce(
+                &mut st,
+                AppEvent::PhotoSelected {
+                    id,
+                    selected: target,
+                },
+            );
         }
         drop(st);
         for row in self.row_map.values() {
@@ -1844,7 +1943,9 @@ impl AppController {
         }
         reduce(
             &mut *self.state.write().unwrap(),
-            AppEvent::ActivePhoto { index: Some(target) },
+            AppEvent::ActivePhoto {
+                index: Some(target),
+            },
         );
         self.open_editor_for_active();
         self.refresh_screens();
@@ -1855,7 +1956,9 @@ impl AppController {
     fn handle_reject(&mut self) {
         let active = {
             let st = self.state.read().unwrap();
-            st.active_photo.and_then(|i| st.photos.get(i)).map(|p| (p.id, crate::ui::util::file_name(&p.path)))
+            st.active_photo
+                .and_then(|i| st.photos.get(i))
+                .map(|p| (p.id, crate::ui::util::file_name(&p.path)))
         };
         if let Some((id, name)) = active {
             log::info!("action: reject {name}");
@@ -1892,7 +1995,11 @@ impl AppController {
         // A different photo is now active: the previous one's decoded base is
         // useless — drop it (returns its memory) and let the next preview decode
         // re-cache under the new id.
-        if self.active_base.as_ref().map_or(true, |(cid, _)| *cid != active.0) {
+        if self
+            .active_base
+            .as_ref()
+            .map_or(true, |(cid, _)| *cid != active.0)
+        {
             self.active_base = None;
         }
         self.editor
@@ -1929,42 +2036,82 @@ fn decode_base(
     source_type: SourceType,
     full_size: bool,
     user_mul: Option<[f32; 4]>,
-) -> Result<(Box<dyn Base>, Option<[f32; 4]>, Option<[[f32; 4]; 3]>), String> {
+) -> Result<
+    (
+        Box<dyn Base>,
+        (u32, u32),
+        Option<[f32; 4]>,
+        Option<[[f32; 4]; 3]>,
+    ),
+    String,
+> {
     match source_type {
         SourceType::Jpeg => {
             let (size, rgba) = decode_jpeg(data).map_err(|e| e.to_string())?;
-            Ok((Box::new(JpegBase::new(size.width, size.height, rgba)), None, None))
+            Ok((
+                Box::new(JpegBase::new(size.width, size.height, rgba)),
+                (size.width, size.height),
+                None,
+                None,
+            ))
         }
         SourceType::Raw => {
-            let dr = decode_raw(data, &RawDecodeOpts { full_size, user_mul })
-                .map_err(|e| e.to_string())?;
+            let dr = decode_raw(
+                data,
+                &RawDecodeOpts {
+                    full_size,
+                    user_mul,
+                },
+            )
+            .map_err(|e| e.to_string())?;
             let cam = dr.cam_mul;
             let cam_matrix = dr.cam_matrix;
-            Ok((Box::new(RawBase::new(dr)), cam, cam_matrix))
+            let developed = (dr.developed_size.width, dr.developed_size.height);
+            Ok((Box::new(RawBase::new(dr)), developed, cam, cam_matrix))
         }
     }
 }
 
 /// Decode + render a ≤512 thumbnail. Runs on a pool worker. The returned `full`
-/// is the decoded source size (JPEG: native; RAW: half-resolution decode).
+/// is the source's full developed size (JPEG: native; RAW: the half-resolution
+/// interactive decode's dimensions multiplied by two).
 fn run_thumb_job(
     path: &Path,
     source_type: SourceType,
-) -> Result<(Vec<u8>, (u32, u32), (u32, u32), f32, Vec<u32>, Option<[f32; 4]>), String> {
+) -> Result<
+    (
+        Vec<u8>,
+        (u32, u32),
+        (u32, u32),
+        f32,
+        Vec<u32>,
+        Option<[f32; 4]>,
+    ),
+    String,
+> {
     let t0 = std::time::Instant::now();
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     let t_read = t0.elapsed();
-    let (base, cam, _cam_matrix) = decode_base(&data, source_type, false, None)?;
+    let (base, full, cam, _cam_matrix) = decode_base(&data, source_type, false, None)?;
     let t_decode = t0.elapsed();
-    let full = (base.width(), base.height());
     let (w, h) = fit_within(base.width(), base.height(), 512);
-    let r = base.render(None, Size { width: w, height: h }, &Adjustments::default());
+    let r = base.render(
+        None,
+        Size {
+            width: w,
+            height: h,
+        },
+        &Adjustments::default(),
+    );
     let t_render = t0.elapsed();
     let hist = compute_histogram_rgb(&r.rgba);
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
     log::info!(
         "[timing] thumb {name} {source_type:?} read {:.3}s decode {:.3}s render {:.3}s total {:.3}s",
-        t_read.as_secs_f64(), t_decode.as_secs_f64(), t_render.as_secs_f64(), t_render.as_secs_f64()
+        t_read.as_secs_f64(),
+        t_decode.as_secs_f64(),
+        t_render.as_secs_f64(),
+        t_render.as_secs_f64()
     );
     Ok((r.rgba, (w, h), full, r.auto_ev, hist, cam))
 }
@@ -1997,25 +2144,45 @@ fn run_preview_job(
 > {
     let t0 = std::time::Instant::now();
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
-    let (base, cam, cam_matrix) = decode_base(&data, source_type, false, None)?;
+    let (base, developed_full, cam, cam_matrix) = decode_base(&data, source_type, false, None)?;
     let t_decode = t0.elapsed();
     // The preview renders in DISPLAY space: `full` carries the rotated dims and
     // the target size is aspect-matched to them; the base itself stays unrotated
     // so it can be cached and re-wrapped as rotation changes.
     let arc_base: Arc<dyn Base> = Arc::from(base);
-    let full = rotate_dims(arc_base.width(), arc_base.height(), adjustments.rotation);
-    let (w, h) = fit_within(full.0, full.1, FINAL_EDGE);
+    let preview_full = rotate_dims(arc_base.width(), arc_base.height(), adjustments.rotation);
+    let full = rotate_dims(developed_full.0, developed_full.1, adjustments.rotation);
+    let (w, h) = fit_within(preview_full.0, preview_full.1, FINAL_EDGE);
     let wrapped = RotatedBase::new(Arc::clone(&arc_base), adjustments.rotation);
     let ev_override = crop_aware_auto_ev(&wrapped, adjustments);
-    let r = wrapped.render_with_ev(None, Size { width: w, height: h }, adjustments, ev_override);
+    let r = wrapped.render_with_ev(
+        None,
+        Size {
+            width: w,
+            height: h,
+        },
+        adjustments,
+        ev_override,
+    );
     let t_render = t0.elapsed();
     let hist = compute_histogram_rgb(&r.rgba);
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
     log::info!(
         "[timing] preview {name} {source_type:?} read+decode {:.3}s render {:.3}s total {:.3}s",
-        t_decode.as_secs_f64(), t_render.as_secs_f64(), t_render.as_secs_f64()
+        t_decode.as_secs_f64(),
+        t_render.as_secs_f64(),
+        t_render.as_secs_f64()
     );
-    Ok((r.rgba, (w, h), full, r.auto_ev, hist, cam, cam_matrix, arc_base))
+    Ok((
+        r.rgba,
+        (w, h),
+        full,
+        r.auto_ev,
+        hist,
+        cam,
+        cam_matrix,
+        arc_base,
+    ))
 }
 
 /// The auto-exposure EV computed over the CROP region, so the preview's exposure
@@ -2030,7 +2197,10 @@ fn crop_aware_auto_ev(base: &dyn Base, adjustments: &Adjustments) -> Option<f32>
     let tiny = fit_within(rect.width, rect.height, 128);
     let r = base.render(
         Some(&crop),
-        Size { width: tiny.0, height: tiny.1 },
+        Size {
+            width: tiny.0,
+            height: tiny.1,
+        },
         adjustments,
     );
     Some(r.auto_ev)
@@ -2045,18 +2215,33 @@ fn run_render_job(
     base: Arc<dyn Base>,
     adjustments: &Adjustments,
     edge: u32,
+    developed_full: Option<(u32, u32)>,
 ) -> Result<(Vec<u8>, (u32, u32), (u32, u32), f32, Vec<u32>), String> {
     let t0 = std::time::Instant::now();
-    let full = rotate_dims(base.width(), base.height(), adjustments.rotation);
-    let (w, h) = fit_within(full.0, full.1, edge);
+    let render_full = rotate_dims(base.width(), base.height(), adjustments.rotation);
+    let full = rotate_dims(
+        developed_full.unwrap_or((base.width(), base.height())).0,
+        developed_full.unwrap_or((base.width(), base.height())).1,
+        adjustments.rotation,
+    );
+    let (w, h) = fit_within(render_full.0, render_full.1, edge);
     let wrapped = RotatedBase::new(base, adjustments.rotation);
     let ev_override = crop_aware_auto_ev(&wrapped, adjustments);
-    let r = wrapped.render_with_ev(None, Size { width: w, height: h }, adjustments, ev_override);
+    let r = wrapped.render_with_ev(
+        None,
+        Size {
+            width: w,
+            height: h,
+        },
+        adjustments,
+        ev_override,
+    );
     let t_render = t0.elapsed();
     let hist = compute_histogram_rgb(&r.rgba);
     log::info!(
         "[timing] preview (cached base) render {:.3}s total {:.3}s",
-        t_render.as_secs_f64(), t_render.as_secs_f64()
+        t_render.as_secs_f64(),
+        t_render.as_secs_f64()
     );
     Ok((r.rgba, (w, h), full, r.auto_ev, hist))
 }
@@ -2070,7 +2255,10 @@ fn run_wb_sample_job(base: Arc<dyn Base>, rotation: u8) -> (Vec<f32>, u32, u32) 
     let (dw, dh) = rotate_dims(base.width(), base.height(), rotation);
     let (w, h) = fit_within(dw, dh, WB_SAMPLE_EDGE);
     let wrapped = RotatedBase::new(base, rotation);
-    let rgba = wrapped.linear_sample(Size { width: w, height: h });
+    let rgba = wrapped.linear_sample(Size {
+        width: w,
+        height: h,
+    });
     (rgba, w, h)
 }
 
@@ -2085,7 +2273,11 @@ fn export_render_adjustments(
     adjustments: &Adjustments,
 ) -> Adjustments {
     if source_type == SourceType::Raw && user_mul.is_some() {
-        Adjustments { wb_offset: 0.0, hue: 0.0, ..*adjustments }
+        Adjustments {
+            wb_offset: 0.0,
+            hue: 0.0,
+            ..*adjustments
+        }
     } else {
         *adjustments
     }
@@ -2107,7 +2299,7 @@ fn run_export_job(
         SourceType::Raw => cam_mul.map(|m| export_wb_mul(m, adjustments)),
         SourceType::Jpeg => None,
     };
-    let (base, _, _) = decode_base(&data, source_type, true, user_mul)?;
+    let (base, _, _, _) = decode_base(&data, source_type, true, user_mul)?;
     let t_decode = t0.elapsed();
     // Exports render in DISPLAY space too: fit the rotated dims, wrap the base so
     // the crop (normalized, display-space) and rotation apply together.
@@ -2134,8 +2326,13 @@ fn run_export_job(
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
     log::info!(
         "[timing] export {name} {source_type:?} full_size=({}x{}) read {:.3}s decode {:.3}s render {:.3}s encode {:.3}s total {:.3}s -> {} bytes",
-        size.width, size.height,
-        t_read.as_secs_f64(), t_decode.as_secs_f64(), t_render.as_secs_f64(), t_encode.as_secs_f64(), t_encode.as_secs_f64(),
+        size.width,
+        size.height,
+        t_read.as_secs_f64(),
+        t_decode.as_secs_f64(),
+        t_render.as_secs_f64(),
+        t_encode.as_secs_f64(),
+        t_encode.as_secs_f64(),
         jpeg.len()
     );
     Ok((jpeg, size.width, size.height))
@@ -2176,12 +2373,7 @@ mod tests {
         let path = dir.join(format!("gradient-{w}x{h}.jpg"));
         let mut buf = Vec::new();
         image::codecs::jpeg::JpegEncoder::new(&mut buf)
-            .write_image(
-                img.as_raw(),
-                w,
-                h,
-                image::ExtendedColorType::Rgb8,
-            )
+            .write_image(img.as_raw(), w, h, image::ExtendedColorType::Rgb8)
             .expect("encode jpeg");
         std::fs::write(&path, &buf).unwrap();
         path
@@ -2226,7 +2418,9 @@ mod tests {
 
     #[test]
     fn missing_file_surfaces_error() {
-        let bogus = std::env::temp_dir().join("photoup2-app-test").join("nope.jpg");
+        let bogus = std::env::temp_dir()
+            .join("photoup2-app-test")
+            .join("nope.jpg");
         let err = run_thumb_job(&bogus, SourceType::Jpeg).unwrap_err();
         assert!(!err.is_empty());
     }
@@ -2240,8 +2434,20 @@ mod tests {
 
     #[test]
     fn image_extension_filter_rejects_other_files() {
-        for name in ["a.txt", "a.png.txt", "a.jpeg.bak", "notes", "", ".jpg", "a.svg", "a.gif"] {
-            assert!(!is_image_path(Path::new(name)), "{name:?} should be rejected");
+        for name in [
+            "a.txt",
+            "a.png.txt",
+            "a.jpeg.bak",
+            "notes",
+            "",
+            ".jpg",
+            "a.svg",
+            "a.gif",
+        ] {
+            assert!(
+                !is_image_path(Path::new(name)),
+                "{name:?} should be rejected"
+            );
         }
     }
 
@@ -2285,4 +2491,3 @@ mod tests {
         assert_eq!(unbaked.hue, -0.3);
     }
 }
-

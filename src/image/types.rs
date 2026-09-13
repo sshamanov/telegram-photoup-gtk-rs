@@ -66,6 +66,9 @@ impl Default for Adjustments {
 /// Camera-WB, sRGB-primaries, LINEAR (gamma-decoded) planar RGB.
 /// `r/g/b` are `width * height` f32 linear values, matching photoup's DecodedRaw.
 pub struct DecodedRaw {
+    /// Dimensions LibRaw will develop at full resolution. These intentionally
+    /// differ from `width`/`height` for an interactive `half_size` decode.
+    pub developed_size: Size,
     pub width: u32,
     pub height: u32,
     pub r: Vec<f32>,
