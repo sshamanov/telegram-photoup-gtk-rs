@@ -59,6 +59,57 @@ fn output_line(full: (u32, u32), crop: Option<NormalizedCrop>) -> String {
     format!("output {} × {} px", out.width, out.height)
 }
 
+/// Convert a crop drawn over the rotated preview into the unrotated source
+/// coordinates stored in `Adjustments`. Rotation is clockwise by quarter turns.
+fn display_to_source_crop(c: NormalizedCrop, rotation: u8) -> NormalizedCrop {
+    match rotation % 4 {
+        0 => c,
+        1 => NormalizedCrop {
+            x: c.y,
+            y: 1.0 - c.x - c.width,
+            width: c.height,
+            height: c.width,
+        },
+        2 => NormalizedCrop {
+            x: 1.0 - c.x - c.width,
+            y: 1.0 - c.y - c.height,
+            width: c.width,
+            height: c.height,
+        },
+        _ => NormalizedCrop {
+            x: 1.0 - c.y - c.height,
+            y: c.x,
+            width: c.height,
+            height: c.width,
+        },
+    }
+}
+
+/// Project the source crop stored in `Adjustments` onto the rotated preview.
+fn source_to_display_crop(c: NormalizedCrop, rotation: u8) -> NormalizedCrop {
+    match rotation % 4 {
+        0 => c,
+        1 => NormalizedCrop {
+            x: 1.0 - c.y - c.height,
+            y: c.x,
+            width: c.height,
+            height: c.width,
+        },
+        2 => NormalizedCrop {
+            x: 1.0 - c.x - c.width,
+            y: 1.0 - c.y - c.height,
+            width: c.width,
+            height: c.height,
+        },
+        _ => NormalizedCrop {
+            x: c.y,
+            y: 1.0 - c.x - c.width,
+            width: c.height,
+            height: c.width,
+        },
+    }
+}
+
 /// The camera→sRGB matrix is carried as libraw's `rgb_cam[3][4]` (4 columns, 3
 /// used); the WB math needs the 3×3 part.
 fn cam_matrix3x3(m: Option<[[f32; 4]; 3]>) -> Option<[[f32; 3]; 3]> {
@@ -793,7 +844,7 @@ fn apply_crop_ratio(
     *crop_cell.borrow_mut() = Some(crop);
     crop_area.queue_draw();
     let mut adj = current_adjustments(&state.read().unwrap(), id);
-    adj.crop = Some(crop);
+    adj.crop = Some(display_to_source_crop(crop, adj.rotation));
     info2.set_text(&output_line(full, Some(crop)));
     on_event(AppEvent::PhotoEdit {
         id,
@@ -858,6 +909,7 @@ fn rotate_handler(
     state: Arc<RwLock<AppState>>,
     on_event: Arc<dyn Fn(AppEvent) + Send + Sync + 'static>,
     full_size: Rc<Cell<Option<(u32, u32)>>>,
+    crop_cell: Rc<RefCell<Option<NormalizedCrop>>>,
     crop_area: DrawingArea,
     info1: Label,
     info2: Label,
@@ -871,9 +923,11 @@ fn rotate_handler(
             // rotate_dims(display, delta): odd deltas swap W/H, even keep them.
             let (nfw, nfh) = if delta % 2 == 1 { (fh, fw) } else { (fw, fh) };
             full_size.set(Some((nfw, nfh)));
+            let display_crop = adj.crop.map(|c| source_to_display_crop(c, adj.rotation));
+            *crop_cell.borrow_mut() = display_crop;
             let src = if is_raw.get() { "RAW" } else { "JPEG" };
             info1.set_text(&format!("{src} · {} × {}", nfw, nfh));
-            info2.set_text(&output_line((nfw, nfh), adj.crop));
+            info2.set_text(&output_line((nfw, nfh), display_crop));
         }
         crop_area.queue_draw();
         on_event(AppEvent::PhotoEdit {
@@ -1250,7 +1304,11 @@ impl EditorScreen {
         self.is_raw.set(is_raw);
         self.current_mode.set(adjustments.exposure_mode);
         self.full_size.set(full_size);
-        self.crop.replace(adjustments.crop);
+        self.crop.replace(
+            adjustments
+                .crop
+                .map(|c| source_to_display_crop(c, adjustments.rotation)),
+        );
         // New photo: drop the previous photo's per-photo data (linear WB sample,
         // camera matrix).
         self.wb_sample.borrow_mut().take();
@@ -1403,7 +1461,10 @@ impl EditorScreen {
                 self.info1
                     .set_text(&format!("{src} · {} × {}", full.0, full.1));
                 let adj = current_adjustments(&self.state.read().unwrap(), id);
-                self.info2.set_text(&output_line(full, adj.crop));
+                self.info2.set_text(&output_line(
+                    full,
+                    adj.crop.map(|c| source_to_display_crop(c, adj.rotation)),
+                ));
             }
             _ => {
                 self.info1.set_text("");
@@ -1618,7 +1679,7 @@ impl EditorScreen {
             let Some(c) = new_crop else { return };
             let Some(id) = id_end.get() else { return };
             let mut adj = current_adjustments(&state_end.read().unwrap(), id);
-            adj.crop = Some(c);
+            adj.crop = Some(display_to_source_crop(c, adj.rotation));
             on_end(AppEvent::PhotoEdit {
                 id,
                 adjustments: adj,
@@ -1935,7 +1996,7 @@ impl EditorScreen {
             *crop.borrow_mut() = Some(new_crop);
             area.queue_draw();
             let mut adj = current_adjustments(&st.read().unwrap(), id);
-            adj.crop = Some(new_crop);
+            adj.crop = Some(display_to_source_crop(new_crop, adj.rotation));
             i2.set_text(&output_line(full, Some(new_crop)));
             o(AppEvent::PhotoEdit {
                 id,
@@ -1975,6 +2036,7 @@ impl EditorScreen {
             Arc::clone(&state),
             Arc::clone(&on_event),
             Rc::clone(&full_size),
+            Rc::clone(&self.crop),
             self.crop_area.clone(),
             self.info1.clone(),
             self.info2.clone(),
@@ -1986,6 +2048,7 @@ impl EditorScreen {
             Arc::clone(&state),
             Arc::clone(&on_event),
             Rc::clone(&full_size),
+            Rc::clone(&self.crop),
             self.crop_area.clone(),
             self.info1.clone(),
             self.info2.clone(),
@@ -2069,6 +2132,22 @@ mod tests {
         let rect = crop_to_pixels(&edge, 4_000, 4_000);
         assert_eq!((rect.width, rect.height), (2560, 2560));
         assert_eq!((rect.x, rect.y), (1440, 1440));
+    }
+
+    #[test]
+    fn rotated_pix_roundtrips_between_display_and_source_coordinates() {
+        // A 6000×4000 source displayed after 90° CW is 4000×6000. Pix chooses
+        // a portrait 1707×2560 overlay, which must become the corresponding
+        // 2560×1707 source crop before the renderer/export sees it.
+        let display = pix_crop((4_000, 6_000), None).expect("fits");
+        assert_eq!(crop_to_pixels(&display, 4_000, 6_000).width, 1707);
+        assert_eq!(crop_to_pixels(&display, 4_000, 6_000).height, 2560);
+        let source = display_to_source_crop(display, 1);
+        let source_rect = crop_to_pixels(&source, 6_000, 4_000);
+        assert_eq!((source_rect.width, source_rect.height), (2560, 1707));
+        let display_again = source_to_display_crop(source, 1);
+        let rect_again = crop_to_pixels(&display_again, 4_000, 6_000);
+        assert_eq!(rect_again, crop_to_pixels(&display, 4_000, 6_000));
     }
 
     #[test]

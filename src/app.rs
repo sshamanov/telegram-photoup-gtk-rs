@@ -2301,10 +2301,19 @@ fn run_export_job(
     };
     let (base, _, _, _) = decode_base(&data, source_type, true, user_mul)?;
     let t_decode = t0.elapsed();
-    // Exports render in DISPLAY space too: fit the rotated dims, wrap the base so
-    // the crop (normalized, display-space) and rotation apply together.
-    let full = rotate_dims(base.width(), base.height(), adjustments.rotation);
-    let size = export_dimensions(full.0, full.1, adjustments.crop.as_ref(), EXPORT_EDGE);
+    // Crop state is unrotated source space. Size it there first, then rotate the
+    // output dimensions for the display/export orientation.
+    let source_size = export_dimensions(
+        base.width(),
+        base.height(),
+        adjustments.crop.as_ref(),
+        EXPORT_EDGE,
+    );
+    let (out_w, out_h) = rotate_dims(source_size.width, source_size.height, adjustments.rotation);
+    let size = Size {
+        width: out_w,
+        height: out_h,
+    };
     let render_adj = export_render_adjustments(source_type, user_mul, adjustments);
     let wrapped = RotatedBase::new(Arc::from(base), adjustments.rotation);
     let r = wrapped.render(render_adj.crop.as_ref(), size, &render_adj);
