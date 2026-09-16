@@ -899,37 +899,24 @@ fn pix_crop(full: (u32, u32), current: Option<NormalizedCrop>) -> Option<Normali
 }
 
 /// A rotate-button handler: adds `delta` quarter-turns CW (1 = 90° CW, 3 = 90°
-/// CCW) to the photo's rotation. Rotation swaps the display dims for odd deltas,
-/// so the Image section and the crop overlay must re-project against the new
-/// dims immediately — the controller re-renders the preview, but the editor's
-/// `full_size` cell is only refreshed here (set_photo runs once per photo).
+/// CCW) to the photo's rotation. Geometry is intentionally NOT changed here:
+/// the old preview and old overlay remain coherent until the rotated preview
+/// lands, when `set_full_size` updates texture/geometry in the same GTK tick.
 fn rotate_handler(
     delta: u8,
     active_id: Rc<Cell<Option<u64>>>,
     state: Arc<RwLock<AppState>>,
     on_event: Arc<dyn Fn(AppEvent) + Send + Sync + 'static>,
-    full_size: Rc<Cell<Option<(u32, u32)>>>,
-    crop_cell: Rc<RefCell<Option<NormalizedCrop>>>,
     crop_area: DrawingArea,
-    info1: Label,
-    info2: Label,
-    is_raw: Rc<Cell<bool>>,
 ) -> impl Fn(&Button) + 'static {
     move |_| {
         let Some(id) = active_id.get() else { return };
         let mut adj = current_adjustments(&state.read().unwrap(), id);
         adj.rotation = (adj.rotation + delta) % 4;
-        if let Some((fw, fh)) = full_size.get() {
-            // rotate_dims(display, delta): odd deltas swap W/H, even keep them.
-            let (nfw, nfh) = if delta % 2 == 1 { (fh, fw) } else { (fw, fh) };
-            full_size.set(Some((nfw, nfh)));
-            let display_crop = adj.crop.map(|c| source_to_display_crop(c, adj.rotation));
-            *crop_cell.borrow_mut() = display_crop;
-            let src = if is_raw.get() { "RAW" } else { "JPEG" };
-            info1.set_text(&format!("{src} · {} × {}", nfw, nfh));
-            info2.set_text(&output_line((nfw, nfh), display_crop));
-        }
-        crop_area.queue_draw();
+        // Until the new texture arrives, the visible preview still has the old
+        // orientation while state already has the new one. Do not let a crop
+        // drag start in that mixed-coordinate interval.
+        crop_area.set_sensitive(false);
         on_event(AppEvent::PhotoEdit {
             id,
             adjustments: adj,
@@ -1340,7 +1327,24 @@ impl EditorScreen {
     /// finished decoding gets filled here once the preview render lands.
     pub fn set_full_size(&self, dims: (u32, u32)) {
         self.full_size.set(Some(dims));
+        if let Some(id) = self.active_id.get() {
+            let adj = current_adjustments(&self.state.read().unwrap(), id);
+            let display_crop = adj.crop.map(|c| source_to_display_crop(c, adj.rotation));
+            self.crop.replace(display_crop);
+            let src = if self.is_raw.get() { "RAW" } else { "JPEG" };
+            self.info1
+                .set_text(&format!("{src} · {} × {}", dims.0, dims.1));
+            self.info2.set_text(&output_line(dims, display_crop));
+        }
+        // `set_preview` and this geometry update are called from the same
+        // PreviewReady dispatch, so crop interaction is safe again now.
+        self.crop_area.set_sensitive(true);
         self.crop_area.queue_draw();
+    }
+
+    /// Restore crop interaction if a preview render failed after rotation.
+    pub fn set_crop_interaction_enabled(&self, enabled: bool) {
+        self.crop_area.set_sensitive(enabled);
     }
 
     /// Fine-tune the exposure EV slider (keyboard Q/W). Moving the slider fires its
@@ -2035,24 +2039,14 @@ impl EditorScreen {
             Rc::clone(&active_id),
             Arc::clone(&state),
             Arc::clone(&on_event),
-            Rc::clone(&full_size),
-            Rc::clone(&self.crop),
             self.crop_area.clone(),
-            self.info1.clone(),
-            self.info2.clone(),
-            Rc::clone(&self.is_raw),
         ));
         self.rotate_cw.connect_clicked(rotate_handler(
             1,
             Rc::clone(&active_id),
             Arc::clone(&state),
             Arc::clone(&on_event),
-            Rc::clone(&full_size),
-            Rc::clone(&self.crop),
             self.crop_area.clone(),
-            self.info1.clone(),
-            self.info2.clone(),
-            Rc::clone(&self.is_raw),
         ));
 
         // Nav.
@@ -2205,7 +2199,7 @@ mod tests {
         }
 
         // EV indicator: formatted + fixed-width label.
-        let (mut editor, _events) = test_editor();
+        let (mut editor, events) = test_editor();
         editor.set_photo(
             1,
             "test.jpg",
@@ -2220,6 +2214,17 @@ mod tests {
         assert_eq!(editor.ev_value.text(), "-0.35 EV");
         editor.set_ev(4.0);
         assert_eq!(editor.ev_value.text(), "+4.00 EV");
+
+        // Rotate keeps the old preview geometry intact and blocks crop input
+        // until PreviewReady installs the new texture + dimensions together.
+        editor.rotate_cw.emit_clicked();
+        assert_eq!(editor.full_size.get(), Some((800, 600)));
+        assert!(!editor.crop_area.is_sensitive());
+        let adj = find_photo_edit(&events, 1).expect("rotate PhotoEdit");
+        assert_eq!(adj.rotation, 1);
+        editor.set_full_size((600, 800));
+        assert_eq!(editor.full_size.get(), Some((600, 800)));
+        assert!(editor.crop_area.is_sensitive());
 
         // AUTO (clinical) on a neutral gray image (linear 0.2159) → no change;
         // AUTO2 (warm) → the fixed +0.15 warm bias, no tint.
