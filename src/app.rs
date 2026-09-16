@@ -915,15 +915,12 @@ impl AppController {
                 if let Some(row) = self.row_map.get(&id) {
                     row.set_error(true);
                 }
-                // Rotation temporarily blocks crop input so the old preview
-                // cannot be edited with new-orientation coordinates. A failed
-                // render has no PreviewReady to unblock it.
                 let is_active = {
                     let st = self.state.read().unwrap();
                     st.active_photo == self.index_of(id)
                 };
                 if is_active {
-                    self.editor.set_crop_interaction_enabled(true);
+                    self.editor.cancel_pending_rotation();
                 }
                 // If this photo was part of an in-flight send, account for the
                 // failure so the send can proceed with the remaining photos.

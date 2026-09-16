@@ -908,6 +908,7 @@ fn rotate_handler(
     state: Arc<RwLock<AppState>>,
     on_event: Arc<dyn Fn(AppEvent) + Send + Sync + 'static>,
     crop_area: DrawingArea,
+    rotation_pending: Rc<Cell<bool>>,
 ) -> impl Fn(&Button) + 'static {
     move |_| {
         let Some(id) = active_id.get() else { return };
@@ -916,6 +917,7 @@ fn rotate_handler(
         // Until the new texture arrives, the visible preview still has the old
         // orientation while state already has the new one. Do not let a crop
         // drag start in that mixed-coordinate interval.
+        rotation_pending.set(true);
         crop_area.set_sensitive(false);
         on_event(AppEvent::PhotoEdit {
             id,
@@ -963,6 +965,10 @@ pub struct EditorScreen {
     /// The active crop selection, mirrored from the photo's adjustments and
     /// updated live by presets / drags; the overlay draws from this.
     crop: Rc<RefCell<Option<NormalizedCrop>>>,
+    /// True between a rotate click and the matching rotated PreviewReady. Only
+    /// that preview may re-project the source crop into display coordinates;
+    /// later settle-quality previews must not overwrite an in-progress drag.
+    rotation_pending: Rc<Cell<bool>>,
     /// The active photo's LINEAR (0..1) pre-tone RGB sample (≤96px edge), pushed
     /// by the controller on decode; the WB Auto / neutral-picker sample from it.
     /// Sampling the processed preview would distort the R/B ratio (auto-exposure,
@@ -1258,6 +1264,7 @@ impl EditorScreen {
             active_id: Rc::new(Cell::new(None)),
             full_size: Rc::new(Cell::new(None)),
             crop,
+            rotation_pending: Rc::new(Cell::new(false)),
             wb_sample: Rc::new(RefCell::new(None)),
             picker_active: Rc::new(Cell::new(false)),
             cam_matrix: Rc::new(RefCell::new(None)),
@@ -1291,6 +1298,8 @@ impl EditorScreen {
         self.is_raw.set(is_raw);
         self.current_mode.set(adjustments.exposure_mode);
         self.full_size.set(full_size);
+        self.rotation_pending.set(false);
+        self.crop_area.set_sensitive(true);
         self.crop.replace(
             adjustments
                 .crop
@@ -1327,10 +1336,25 @@ impl EditorScreen {
     /// finished decoding gets filled here once the preview render lands.
     pub fn set_full_size(&self, dims: (u32, u32)) {
         self.full_size.set(Some(dims));
-        if let Some(id) = self.active_id.get() {
+        // One logical edit produces two PreviewReady events: a fast 512px render
+        // and a delayed 1024px settle render. Re-project only when the first
+        // accepted result completes an actual rotation. Re-projecting on the
+        // settle event can clobber the crop cell while a drag is in progress,
+        // making the rectangle jump between the old and live crop.
+        let display_crop = if self.rotation_pending.replace(false) {
+            let Some(id) = self.active_id.get() else {
+                self.crop_area.set_sensitive(true);
+                self.crop_area.queue_draw();
+                return;
+            };
             let adj = current_adjustments(&self.state.read().unwrap(), id);
             let display_crop = adj.crop.map(|c| source_to_display_crop(c, adj.rotation));
             self.crop.replace(display_crop);
+            display_crop
+        } else {
+            *self.crop.borrow()
+        };
+        if self.active_id.get().is_some() {
             let src = if self.is_raw.get() { "RAW" } else { "JPEG" };
             self.info1
                 .set_text(&format!("{src} · {} × {}", dims.0, dims.1));
@@ -1342,9 +1366,12 @@ impl EditorScreen {
         self.crop_area.queue_draw();
     }
 
-    /// Restore crop interaction if a preview render failed after rotation.
-    pub fn set_crop_interaction_enabled(&self, enabled: bool) {
-        self.crop_area.set_sensitive(enabled);
+    /// A failed preview has no later `set_full_size` call to finish a pending
+    /// orientation transition, so do not leave the crop overlay permanently
+    /// insensitive. The existing texture and overlay remain paired.
+    pub fn cancel_pending_rotation(&self) {
+        self.rotation_pending.set(false);
+        self.crop_area.set_sensitive(true);
     }
 
     /// Fine-tune the exposure EV slider (keyboard Q/W). Moving the slider fires its
@@ -2040,6 +2067,7 @@ impl EditorScreen {
             Arc::clone(&state),
             Arc::clone(&on_event),
             self.crop_area.clone(),
+            Rc::clone(&self.rotation_pending),
         ));
         self.rotate_cw.connect_clicked(rotate_handler(
             1,
@@ -2047,6 +2075,7 @@ impl EditorScreen {
             Arc::clone(&state),
             Arc::clone(&on_event),
             self.crop_area.clone(),
+            Rc::clone(&self.rotation_pending),
         ));
 
         // Nav.
@@ -2225,6 +2254,17 @@ mod tests {
         editor.set_full_size((600, 800));
         assert_eq!(editor.full_size.get(), Some((600, 800)));
         assert!(editor.crop_area.is_sensitive());
+        // The delayed sharp-preview result for the same rotation must preserve
+        // a crop being edited after the fast preview enabled interaction.
+        let live_drag_crop = NormalizedCrop {
+            x: 0.1,
+            y: 0.2,
+            width: 0.6,
+            height: 0.4,
+        };
+        editor.crop.replace(Some(live_drag_crop));
+        editor.set_full_size((600, 800));
+        assert_eq!(*editor.crop.borrow(), Some(live_drag_crop));
 
         // AUTO (clinical) on a neutral gray image (linear 0.2159) → no change;
         // AUTO2 (warm) → the fixed +0.15 warm bias, no tint.
