@@ -583,6 +583,14 @@ impl AppController {
     }
 
     fn handle_app_event(&mut self, ev: AppEvent) {
+        // A render must be scheduled only after the reducer stores an edit.
+        // Otherwise a rotate/crop event submits a job with the PREVIOUS
+        // adjustments; its late result can then overwrite the editor's new
+        // display dimensions and make the crop overlay appear split-brained.
+        let edited_id = match &ev {
+            AppEvent::PhotoEdit { id, .. } => Some(*id),
+            _ => None,
+        };
         match &ev {
             AppEvent::Auth(AuthEvent::PhoneRequested { phone }) => {
                 let _ = self.telegram_cmd.send(TCommand::RequestCode {
@@ -600,7 +608,6 @@ impl AppController {
                 });
             }
             AppEvent::PhotoEdit { id, adjustments } => {
-                self.schedule_preview(*id);
                 // Keep the grid's EV badge in sync (auto → autoEV, else manual EV).
                 if let Some(row) = self.row_map.get(id) {
                     let ev = match adjustments.exposure_mode {
@@ -637,6 +644,9 @@ impl AppController {
             _ => {}
         }
         reduce(&mut *self.state.write().unwrap(), ev);
+        if let Some(id) = edited_id {
+            self.schedule_preview(id);
+        }
     }
 
     fn handle_telegram_event(&mut self, ev: TEvent) {
