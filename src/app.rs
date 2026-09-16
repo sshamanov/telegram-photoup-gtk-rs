@@ -1270,17 +1270,11 @@ impl AppController {
             return; // a newer edit superseded this timer
         }
         self.render_debounce = None;
-        let (id, source_type, adjustments, path, developed_full) = {
+        let (id, source_type, adjustments, path) = {
             let st = self.state.read().unwrap();
             let Some(i) = st.active_photo else { return };
             let Some(p) = st.photos.get(i) else { return };
-            (
-                p.id,
-                p.source_type,
-                p.adjustments,
-                p.path.clone(),
-                p.full_size,
-            )
+            (p.id, p.source_type, p.adjustments, p.path.clone())
         };
         // Effective-edit log: only when the settled adjustments actually changed
         // (this is the debounced render that hits the image — slider drags coalesce
@@ -1309,7 +1303,7 @@ impl AppController {
                 self.active_base = Some((cached_id, Arc::clone(&base)));
                 self.pool.submit(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run_render_job(base, &adjustments, LIVE_EDGE, developed_full)
+                        run_render_job(base, &adjustments, LIVE_EDGE, source_type)
                     }))
                     .unwrap_or_else(|_| Err("preview render panicked".to_string()));
                     let _ = tx.send(match result {
@@ -1388,11 +1382,11 @@ impl AppController {
         if preview_gen != self.render_gen {
             return; // a newer edit superseded this settle
         }
-        let (id, adjustments, developed_full) = {
+        let (id, adjustments, source_type) = {
             let st = self.state.read().unwrap();
             let Some(i) = st.active_photo else { return };
             let Some(p) = st.photos.get(i) else { return };
-            (p.id, p.adjustments, p.full_size)
+            (p.id, p.adjustments, p.source_type)
         };
         let Some((cached_id, base)) = self.active_base.take() else {
             return;
@@ -1405,7 +1399,7 @@ impl AppController {
         let tx = self.ui_events_sender.clone();
         self.pool.submit(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_render_job(base, &adjustments, FINAL_EDGE, developed_full)
+                run_render_job(base, &adjustments, FINAL_EDGE, source_type)
             }))
             .unwrap_or_else(|_| Err("settle render panicked".to_string()));
             let _ = tx.send(match result {
@@ -2232,15 +2226,17 @@ fn run_render_job(
     base: Arc<dyn Base>,
     adjustments: &Adjustments,
     edge: u32,
-    developed_full: Option<(u32, u32)>,
+    source_type: SourceType,
 ) -> Result<(Vec<u8>, (u32, u32), (u32, u32), f32, Vec<u32>), String> {
     let t0 = std::time::Instant::now();
     let render_full = rotate_dims(base.width(), base.height(), adjustments.rotation);
-    let full = rotate_dims(
-        developed_full.unwrap_or((base.width(), base.height())).0,
-        developed_full.unwrap_or((base.width(), base.height())).1,
-        adjustments.rotation,
-    );
+    // The cached base never has user rotation applied. Interactive RAW bases
+    // are half-size (decode_base uses full_size=false); JPEG bases are native.
+    // Derive geometry from that immutable source, never PhotoState.full_size:
+    // that field already contains DISPLAY dimensions from the previous render,
+    // so rotating it again flips the overlay on every edit/settle at 90°/270°.
+    let pixel_scale = if source_type == SourceType::Raw { 2 } else { 1 };
+    let full = (render_full.0 * pixel_scale, render_full.1 * pixel_scale);
     let (w, h) = fit_within(render_full.0, render_full.1, edge);
     let wrapped = RotatedBase::new(base, adjustments.rotation);
     let ev_override = crop_aware_auto_ev(&wrapped, adjustments);
@@ -2429,6 +2425,33 @@ mod tests {
         assert!(size.0 <= FINAL_EDGE && size.1 <= FINAL_EDGE);
         assert_eq!(rgba.len(), (size.0 * size.1 * 4) as usize);
         assert_eq!(full, (800, 600));
+    }
+
+    #[test]
+    fn cached_rotated_preview_dimensions_stay_stable_after_resize() {
+        let base: Arc<dyn Base> = Arc::new(JpegBase::new(120, 80, vec![128; 120 * 80 * 4]));
+        for (source_type, scale) in [(SourceType::Jpeg, 1), (SourceType::Raw, 2)] {
+            for rotation in 0..4 {
+                let mut adj = Adjustments::default();
+                adj.rotation = rotation;
+                adj.exposure_mode = ExposureMode::Manual;
+                let expected = rotate_dims(120 * scale, 80 * scale, rotation);
+                // Fast preview, settle, crop edit, settle. RAW uses a synthetic
+                // half-size buffer: its geometry must still report full pixels.
+                for edge in [60, 120, 60, 120] {
+                    let (_, size, full, _, _) =
+                        run_render_job(Arc::clone(&base), &adj, edge, source_type).unwrap();
+                    assert_eq!(full, expected, "rotation {rotation}, edge {edge}");
+                    assert_eq!(size.0 * full.1, size.1 * full.0);
+                    adj.crop = Some(crate::image::types::NormalizedCrop {
+                        x: 0.1,
+                        y: 0.2,
+                        width: 0.7,
+                        height: 0.6,
+                    });
+                }
+            }
+        }
     }
 
     #[test]
