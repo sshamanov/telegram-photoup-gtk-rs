@@ -88,6 +88,11 @@ point.
      shrinks it.
 6. Section "**Rotate**":
    - **↺ CCW** | **↻ CW** (90° steps; applied on top of the EXIF orientation).
+   - Preview and crop-overlay dimensions must stay in the same orientation
+     through resizing, Pix, and delayed preview upgrades. Derive them from the
+     unrotated decoded base on every render (×2 for half-resolution RAW), then
+     apply the current rotation once. Never rotate a previous render's already
+     rotated dimensions again.
 7. Section "**Image**":
    - EXIF lines: camera, lens, `shutter · aperture · ISO`, date.
    - `RAW · 7360 × 4912` (source type + full dimensions).
