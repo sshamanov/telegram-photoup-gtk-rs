@@ -78,6 +78,82 @@ pub fn filter_photo_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths.into_iter().filter(|p| is_image_path(p)).collect()
 }
 
+/// One rule of the file dialog's "Photos" filter.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FilterRule {
+    /// A **bare** suffix (`"jpg"`). GTK prepends `*.` itself, so a dotted
+    /// `".jpg"` asks for `*..jpg` — a glob that matches nothing.
+    Suffix(String),
+    /// A literal glob, matched case-sensitively.
+    Glob(String),
+    /// A content type (matched by sniffing the file, not its name).
+    Mime(&'static str),
+}
+
+/// The rules behind the dialog's "Photos" filter.
+///
+/// Kept pure (no `GtkFileFilter`, no display) so the *shape* of the filter can
+/// be asserted in tests — the filter is what the file dialog goes by, and every
+/// rule here was silently dead the last time it broke.
+///
+/// Three rule kinds, because the dialog has two implementations: GTK's own
+/// chooser matches suffix rules case-insensitively, while the **system** dialog
+/// (the portal, what actually opens on Wayland/GNOME) is handed the filter as
+/// serialized globs — suffix rules arrive there as bracket-class globs like
+/// `*.[jJ][pP][gG]`, which the portal backend's `GPatternSpec` matcher cannot
+/// read (it knows only `*` and `?`). The explicit `*.ext` / `*.EXT` pair is the
+/// spelling that works in both; the mime types catch a JPEG/PNG whose extension
+/// is spelled some other way.
+pub fn photo_filter_rules() -> Vec<FilterRule> {
+    let mut rules = Vec::new();
+    for ext in IMAGE_EXTS {
+        // `add_suffix` is case-insensitive in GTK's own chooser.
+        rules.push(FilterRule::Suffix(ext.to_string()));
+        // Literal globs: patterns are case-sensitive, and real camera files are
+        // uppercase (`DSC_4858.NEF`, `IMG_7833.CR2`) while phone/browser files
+        // are lowercase, so both spellings are needed.
+        rules.push(FilterRule::Glob(format!("*.{ext}")));
+        rules.push(FilterRule::Glob(format!("*.{}", ext.to_ascii_uppercase())));
+    }
+    rules.push(FilterRule::Mime("image/jpeg"));
+    rules.push(FilterRule::Mime("image/png"));
+    rules
+}
+
+/// Assert the serialized form of `photo_filter()` — the exact bytes GTK hands
+/// the **system** dialog, and so the ground truth for what it can match. Needs
+/// GTK initialised, so it is called from the one GTK-initialising test
+/// (`ui::editor::tests::editor_widgets_work`) rather than being a `#[test]` of
+/// its own: a second `gtk4::init()` on another thread panics the harness.
+#[cfg(test)]
+pub fn assert_photo_filter_serializes_matchable_globs() {
+    let text = photo_filter().to_gvariant().print(true);
+    assert!(!text.contains("*.."), "double-dotted glob in {text}");
+    for ext in IMAGE_EXTS {
+        assert!(text.contains(&format!("'*.{ext}'")), "{ext} missing in {text}");
+        assert!(
+            text.contains(&format!("'*.{}'", ext.to_ascii_uppercase())),
+            "{ext} uppercase missing in {text}"
+        );
+    }
+    assert!(text.contains("image/jpeg"), "{text}");
+}
+
+/// The dialog's "Photos" filter: the rules above, applied to a real
+/// `GtkFileFilter`. Needs GTK initialised (a display), unlike the rule list.
+pub fn photo_filter() -> gtk4::FileFilter {
+    let filter = gtk4::FileFilter::new();
+    for rule in photo_filter_rules() {
+        match rule {
+            FilterRule::Suffix(s) => filter.add_suffix(&s),
+            FilterRule::Glob(g) => filter.add_pattern(&g),
+            FilterRule::Mime(m) => filter.add_mime_type(m),
+        }
+    }
+    filter.set_name(Some("Photos"));
+    filter
+}
+
 /// Pool job results, carried back to the UI thread.
 pub enum UiEvent {
     ThumbReady {
@@ -1107,14 +1183,7 @@ impl AppController {
     // ---- File loading -----------------------------------------------------
 
     fn on_load(&mut self) {
-        let filter = gtk4::FileFilter::new();
-        // `add_suffix` matches case-insensitively — real camera files are
-        // uppercase (`DSC_4858.NEF`, `IMG_7833.CR2`), and pattern globs are
-        // case-sensitive, which hid RAW files from the dialog before.
-        for ext in IMAGE_EXTS {
-            filter.add_suffix(&format!(".{ext}"));
-        }
-        filter.set_name(Some("Photos"));
+        let filter = photo_filter();
         let filters = gtk4::gio::ListStore::new::<gtk4::FileFilter>();
         filters.append(&filter);
 
@@ -2582,6 +2651,38 @@ mod tests {
         assert_eq!(source_type_for(Path::new("/x/a.jpg")), SourceType::Jpeg);
     }
 
+    /// The dialog's filter must offer a rule the *system* dialog can match. A
+    /// suffix-only filter is a trap: GTK's own chooser matches it, but the
+    /// portal receives it as a bracket-class glob and matches nothing, and a
+    /// dotted suffix (`".jpg"` → `*..jpg`) matches nothing anywhere — either
+    /// way the dialog shows "Photos" and then an empty file list.
+    #[test]
+    fn photo_filter_has_glob_rules_for_every_extension() {
+        let rules = photo_filter_rules();
+        for ext in IMAGE_EXTS {
+            let upper = ext.to_ascii_uppercase();
+            for want in [
+                FilterRule::Suffix(ext.to_string()),
+                FilterRule::Glob(format!("*.{ext}")),
+                FilterRule::Glob(format!("*.{upper}")),
+            ] {
+                assert!(rules.contains(&want), "{want:?} missing: {rules:?}");
+            }
+        }
+        assert!(rules.contains(&FilterRule::Mime("image/jpeg")));
+        assert!(rules.contains(&FilterRule::Mime("image/png")));
+
+        // Suffixes are bare: GTK prepends "*." and a leading dot asks for a
+        // double-dotted glob that no filename ends with.
+        for rule in &rules {
+            let FilterRule::Suffix(s) = rule else { continue };
+            assert!(
+                !s.starts_with('.') && !s.contains('*') && !s.contains('.'),
+                "{s:?} is not a bare suffix"
+            );
+        }
+    }
+
     #[test]
     fn image_extension_filter_rejects_other_files() {
         for name in [
@@ -2642,3 +2743,4 @@ mod tests {
         assert_eq!(unbaked.hue, -0.3);
     }
 }
+

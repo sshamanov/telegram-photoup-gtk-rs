@@ -2431,6 +2431,9 @@ mod tests {
             eprintln!("skipping: no display");
             return;
         }
+        // The one GTK-initialised assertion that isn't about the editor: the
+        // file dialog's filter, which is only checkable once GTK is up.
+        crate::app::assert_photo_filter_serializes_matchable_globs();
 
         // EV indicator: formatted + fixed-width label.
         let (mut editor, events) = test_editor();
