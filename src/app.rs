@@ -86,6 +86,8 @@ pub enum UiEvent {
         size: (u32, u32),
         full: (u32, u32),
         auto_ev: f32,
+        /// Effective black point this render used (auto-derived or manual).
+        black_point: f32,
         histogram: Vec<u32>,
         cam_mul: Option<[f32; 4]>,
         /// EXIF capture metadata read during this decode, forwarded to state.
@@ -97,6 +99,8 @@ pub enum UiEvent {
         size: (u32, u32),
         full: (u32, u32),
         auto_ev: f32,
+        /// Effective black point this render used (auto-derived or manual).
+        black_point: f32,
         histogram: Vec<u32>,
         cam_mul: Option<[f32; 4]>,
         cam_matrix: Option<[[f32; 4]; 3]>,
@@ -744,6 +748,7 @@ impl AppController {
                 size,
                 full,
                 auto_ev,
+                black_point,
                 histogram,
                 cam_mul,
                 meta,
@@ -781,6 +786,7 @@ impl AppController {
                 };
                 if is_active {
                     self.editor.set_ev(self.effective_ev_for(id, auto_ev));
+                    self.editor.set_black_point(black_point);
                     // The editor may have opened before this photo finished its
                     // first decode, so the Image section's EXIF lines land here.
                     self.editor.set_meta(&meta);
@@ -792,6 +798,7 @@ impl AppController {
                 size,
                 full,
                 auto_ev,
+                black_point,
                 histogram,
                 cam_mul,
                 cam_matrix,
@@ -883,6 +890,7 @@ impl AppController {
                     self.editor.set_full_size(full);
                     self.editor.set_histogram(&histogram);
                     self.editor.set_ev(self.effective_ev_for(id, auto_ev));
+                    self.editor.set_black_point(black_point);
                     // The decode path carries the camera matrix the editor's WB
                     // Auto/Pick need; render-only jobs keep the previously-set one.
                     if decoded {
@@ -1240,12 +1248,13 @@ impl AppController {
             }))
             .unwrap_or_else(|_| Err("thumbnail job panicked".to_string()));
             let _ = tx.send(match result {
-                Ok((rgba, size, full, auto_ev, hist, cam, meta)) => UiEvent::ThumbReady {
+                Ok((rgba, size, full, auto_ev, black_point, hist, cam, meta)) => UiEvent::ThumbReady {
                     id,
                     rgba,
                     size,
                     full,
                     auto_ev,
+                    black_point,
                     histogram: hist,
                     cam_mul: cam,
                     meta,
@@ -1304,11 +1313,17 @@ impl AppController {
             .map_or(true, |last| *last != adjustments);
         if changed {
             log::info!(
-                "action: edit {name} → mode={:?} EV={:+.2} wb={:+.2} hue={:+.2}",
+                "action: edit {name} → mode={:?} EV={:+.2} wb={:+.2} hue={:+.2} sat={:+.2} bp={:+.2}{}",
                 adjustments.exposure_mode,
                 adjustments.exposure_ev,
                 adjustments.wb_offset,
-                adjustments.hue
+                adjustments.hue,
+                adjustments.saturation,
+                adjustments.black_point,
+                // The black point is only the slider's value while it is manual;
+                // in auto modes the render derives it (and `set_black_point`
+                // shows the derived value in the panel).
+                if adjustments.black_point_auto { " (auto)" } else { "" }
             );
             self.last_edit_log.insert(id, adjustments);
         }
@@ -1325,12 +1340,13 @@ impl AppController {
                     }))
                     .unwrap_or_else(|_| Err("preview render panicked".to_string()));
                     let _ = tx.send(match result {
-                        Ok((rgba, size, full, auto_ev, hist)) => UiEvent::PreviewReady {
+                        Ok((rgba, size, full, auto_ev, black_point, hist)) => UiEvent::PreviewReady {
                             id,
                             rgba,
                             size,
                             full,
                             auto_ev,
+                            black_point,
                             histogram: hist,
                             cam_mul: None,
                             cam_matrix: None,
@@ -1374,13 +1390,14 @@ impl AppController {
             }))
             .unwrap_or_else(|_| Err("preview job panicked".to_string()));
             let _ = tx.send(match result {
-                Ok((rgba, size, full, auto_ev, hist, cam, cam_matrix, base)) => {
+                Ok((rgba, size, full, auto_ev, black_point, hist, cam, cam_matrix, base)) => {
                     UiEvent::PreviewReady {
                         id,
                         rgba,
                         size,
                         full,
                         auto_ev,
+                        black_point,
                         histogram: hist,
                         cam_mul: cam,
                         cam_matrix,
@@ -1421,12 +1438,13 @@ impl AppController {
             }))
             .unwrap_or_else(|_| Err("settle render panicked".to_string()));
             let _ = tx.send(match result {
-                Ok((rgba, size, full, auto_ev, hist)) => UiEvent::PreviewReady {
+                Ok((rgba, size, full, auto_ev, black_point, hist)) => UiEvent::PreviewReady {
                     id,
                     rgba,
                     size,
                     full,
                     auto_ev,
+                    black_point,
                     histogram: hist,
                     cam_mul: None,
                     cam_matrix: None,
@@ -2127,6 +2145,7 @@ fn run_thumb_job(
         (u32, u32),
         (u32, u32),
         f32,
+        f32,
         Vec<u32>,
         Option<[f32; 4]>,
         PhotoMeta,
@@ -2159,7 +2178,7 @@ fn run_thumb_job(
         t_render.as_secs_f64(),
         t_render.as_secs_f64()
     );
-    Ok((r.rgba, (w, h), full, r.auto_ev, hist, cam, meta))
+    Ok((r.rgba, (w, h), full, r.auto_ev, r.black_point, hist, cam, meta))
 }
 
 /// Decode + render a ≤1024 preview with the photo's current adjustments. Also
@@ -2180,6 +2199,7 @@ fn run_preview_job(
         Vec<u8>,
         (u32, u32),
         (u32, u32),
+        f32,
         f32,
         Vec<u32>,
         Option<[f32; 4]>,
@@ -2202,8 +2222,8 @@ fn run_preview_job(
     let full = rotate_dims(developed_full.0, developed_full.1, adjustments.rotation);
     let (w, h) = fit_within(preview_full.0, preview_full.1, FINAL_EDGE);
     let wrapped = RotatedBase::new(Arc::clone(&arc_base), adjustments.rotation);
-    let ev_override = crop_aware_auto_ev(&wrapped, adjustments);
-    let r = wrapped.render_with_ev(
+    let (ev_override, bp_override) = crop_aware_autos(&wrapped, adjustments);
+    let r = wrapped.render_with_overrides(
         None,
         Size {
             width: w,
@@ -2211,6 +2231,7 @@ fn run_preview_job(
         },
         adjustments,
         ev_override,
+        bp_override,
     );
     let t_render = t0.elapsed();
     let hist = compute_histogram_rgb(&r.rgba);
@@ -2226,6 +2247,7 @@ fn run_preview_job(
         (w, h),
         full,
         r.auto_ev,
+        r.black_point,
         hist,
         cam,
         cam_matrix,
@@ -2233,14 +2255,15 @@ fn run_preview_job(
     ))
 }
 
-/// The auto-exposure EV computed over the CROP region, so the preview's exposure
-/// reacts to what's actually in the frame after cropping. `None` in Manual mode
-/// (the user's EV is theirs) or when no crop is set (auto over the full frame).
-fn crop_aware_auto_ev(base: &dyn Base, adjustments: &Adjustments) -> Option<f32> {
-    if adjustments.exposure_mode == ExposureMode::Manual {
-        return None;
-    }
-    let crop = adjustments.crop?;
+/// The auto-exposure EV and auto black point computed over the CROP region, so
+/// the preview reacts to what is actually in the frame after cropping — and ends
+/// up identical to the export, which renders the crop itself. Each is `None`
+/// when its own mode is manual, or when no crop is set (auto over the full frame
+/// is then the same thing).
+fn crop_aware_autos(base: &dyn Base, adjustments: &Adjustments) -> (Option<f32>, Option<f32>) {
+    let Some(crop) = adjustments.crop else {
+        return (None, None);
+    };
     let rect = crop_rect(base.width(), base.height(), Some(&crop));
     let tiny = fit_within(rect.width, rect.height, 128);
     let r = base.render(
@@ -2251,7 +2274,11 @@ fn crop_aware_auto_ev(base: &dyn Base, adjustments: &Adjustments) -> Option<f32>
         },
         adjustments,
     );
-    Some(r.auto_ev)
+    // Only the auto modes own these; in Manual (or once the slider took the black
+    // point over) the render's own local values stand.
+    let ev = (adjustments.exposure_mode != ExposureMode::Manual).then_some(r.auto_ev);
+    let bp = adjustments.black_point_auto.then_some(r.black_point);
+    (ev, bp)
 }
 
 /// Render a preview from an already-decoded base — no re-decode, so slider edits
@@ -2264,7 +2291,7 @@ fn run_render_job(
     adjustments: &Adjustments,
     edge: u32,
     source_type: SourceType,
-) -> Result<(Vec<u8>, (u32, u32), (u32, u32), f32, Vec<u32>), String> {
+) -> Result<(Vec<u8>, (u32, u32), (u32, u32), f32, f32, Vec<u32>), String> {
     let t0 = std::time::Instant::now();
     let render_full = rotate_dims(base.width(), base.height(), adjustments.rotation);
     // The cached base never has user rotation applied. Interactive RAW bases
@@ -2276,8 +2303,8 @@ fn run_render_job(
     let full = (render_full.0 * pixel_scale, render_full.1 * pixel_scale);
     let (w, h) = fit_within(render_full.0, render_full.1, edge);
     let wrapped = RotatedBase::new(base, adjustments.rotation);
-    let ev_override = crop_aware_auto_ev(&wrapped, adjustments);
-    let r = wrapped.render_with_ev(
+    let (ev_override, bp_override) = crop_aware_autos(&wrapped, adjustments);
+    let r = wrapped.render_with_overrides(
         None,
         Size {
             width: w,
@@ -2285,6 +2312,7 @@ fn run_render_job(
         },
         adjustments,
         ev_override,
+        bp_override,
     );
     let t_render = t0.elapsed();
     let hist = compute_histogram_rgb(&r.rgba);
@@ -2293,7 +2321,7 @@ fn run_render_job(
         t_render.as_secs_f64(),
         t_render.as_secs_f64()
     );
-    Ok((r.rgba, (w, h), full, r.auto_ev, hist))
+    Ok((r.rgba, (w, h), full, r.auto_ev, r.black_point, hist))
 }
 
 /// Downscale the active photo's decoded base to a ≤96px LINEAR (0..1) RGB sample
@@ -2441,7 +2469,8 @@ mod tests {
     #[test]
     fn thumb_job_renders_small_preview() {
         let path = make_jpeg_file(2048, 1024);
-        let (rgba, size, full, _ev, hist, cam, meta) = run_thumb_job(&path, SourceType::Jpeg).unwrap();
+        let (rgba, size, full, _ev, _bp, hist, cam, meta) =
+            run_thumb_job(&path, SourceType::Jpeg).unwrap();
         assert!(size.0 <= 512 && size.1 <= 512, "size {size:?}");
         assert_eq!(rgba.len(), (size.0 * size.1 * 4) as usize);
         // RGB histogram: 768 bins, and every pixel lands in R, G, AND B → 3×.
@@ -2459,7 +2488,7 @@ mod tests {
         let mut adj = Adjustments::default();
         adj.exposure_mode = ExposureMode::Manual;
         adj.exposure_ev = -2.0;
-        let (rgba, size, full, _ev, _hist, _cam, _cam_matrix, _base) =
+        let (rgba, size, full, _ev, _bp, _hist, _cam, _cam_matrix, _base) =
             run_preview_job(&path, SourceType::Jpeg, &adj).unwrap();
         assert!(size.0 <= FINAL_EDGE && size.1 <= FINAL_EDGE);
         assert_eq!(rgba.len(), (size.0 * size.1 * 4) as usize);
@@ -2478,7 +2507,7 @@ mod tests {
                 // Fast preview, settle, crop edit, settle. RAW uses a synthetic
                 // half-size buffer: its geometry must still report full pixels.
                 for edge in [60, 120, 60, 120] {
-                    let (_, size, full, _, _) =
+                    let (_, size, full, _, _, _) =
                         run_render_job(Arc::clone(&base), &adj, edge, source_type).unwrap();
                     assert_eq!(full, expected, "rotation {rotation}, edge {edge}");
                     assert_eq!(size.0 * full.1, size.1 * full.0);

@@ -416,8 +416,8 @@ mod tests {
                     exposure_ev: 0.0,
                     wb_offset: off,
                     hue,
-                    crop: None,
-                    rotation: 0,
+                    ..Default::default()
+
                 };
                 let r = base.render_with_ev(None, Size { width: rw, height: rh }, &adj, None);
                 let fname = outdir.join(format!("{stem}-{tag}.png"));
@@ -518,8 +518,8 @@ mod tests {
                     exposure_ev: 0.0,
                     wb_offset: 0.0,
                     hue: 0.0,
-                    crop: None,
-                    rotation: 0,
+                    ..Default::default()
+
                 };
                 let (pw, ph) = fit_within(base.width(), base.height(), 1024);
                 let (xw, xh) = fit_within(base.width(), base.height(), 2560);
@@ -562,6 +562,100 @@ mod tests {
             .write_image(&img, w, h, image::ExtendedColorType::Rgba8)
             .expect("encode png");
         buf
+    }
+
+    /// Debug renderer for the black point + saturation controls: for every
+    /// sample it prints the tone-mapped luminance percentiles the auto black
+    /// point derives from and writes one PNG per variant to `out/levels/` —
+    /// `-auto` (exposure Auto + the derived black point), `-bp0` (black point
+    /// off), `-bp20` / `-bpm20` (manual crush / lift), `-sat-1` / `-sat+1`.
+    /// Opt-in: `PHOTOUP2_DEBUG_LEVELS=1 cargo test --lib levels_debug_render -- --nocapture`.
+    #[test]
+    fn levels_debug_render() {
+        use crate::image::math::{auto_black_point, fit_within, histogram_percentile};
+        use crate::image::process::{compute_histogram, Base, JpegBase, RawBase};
+        use crate::image::types::{Adjustments, ExposureMode};
+
+        if std::env::var_os("PHOTOUP2_DEBUG_LEVELS").is_none() {
+            eprintln!("skipping levels_debug_render — set PHOTOUP2_DEBUG_LEVELS=1");
+            return;
+        }
+        let outdir = std::path::Path::new("out").join("levels");
+        std::fs::create_dir_all(&outdir).ok();
+        for path in sample_files(&["dng", "nef", "cr2", "jpg", "jpeg"]) {
+            let Ok(data) = std::fs::read(&path) else { continue };
+            let ext = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let base: Box<dyn Base> = if is_raw_ext(&ext) {
+                let Ok(d) = decode_raw(
+                    &data,
+                    &RawDecodeOpts {
+                        full_size: false,
+                        user_mul: None,
+                    },
+                ) else {
+                    continue;
+                };
+                Box::new(RawBase::new(d))
+            } else if let Ok((size, rgba, _)) = decode_jpeg(&data) {
+                Box::new(JpegBase::new(size.width, size.height, rgba))
+            } else {
+                continue;
+            };
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("photo");
+            let (rw, rh) = fit_within(base.width(), base.height(), 640);
+            let size = Size {
+                width: rw,
+                height: rh,
+            };
+            // Each variant isolates one control: the black point ones keep the
+            // default Auto exposure, the saturation ones switch the (otherwise
+            // re-derived) black point off so only saturation differs.
+            let manual = |f: &dyn Fn(&mut Adjustments)| {
+                let mut adj = Adjustments {
+                    exposure_mode: ExposureMode::Auto,
+                    black_point_auto: false,
+                    ..Default::default()
+                };
+                f(&mut adj);
+                adj
+            };
+            let variants = [
+                ("auto", Adjustments::default()),
+                ("bp0", manual(&|_| {})),
+                ("bp20", manual(&|a| a.black_point = 0.2)),
+                ("bpm20", manual(&|a| a.black_point = -0.2)),
+                ("sat-1", manual(&|a| a.saturation = -1.0)),
+                ("sat+1", manual(&|a| a.saturation = 1.0)),
+            ];
+            for (tag, adj) in variants {
+                let r = base.render(None, size, &adj);
+                let hist: [u32; 256] = compute_histogram(&r.rgba)
+                    .try_into()
+                    .expect("256-bin luminance histogram");
+                println!(
+                    "{stem} {tag:>6}: ev={:+.2} bp={:+.3} | p0.1={:.3} p1={:.3} p50={:.3} \
+                     p99={:.3} | auto_bp={:.3}",
+                    r.auto_ev,
+                    r.black_point,
+                    histogram_percentile(&hist, 0.001),
+                    histogram_percentile(&hist, 0.01),
+                    histogram_percentile(&hist, 0.5),
+                    histogram_percentile(&hist, 0.99),
+                    auto_black_point(&hist, 0.001),
+                );
+                let fname = outdir.join(format!("{stem}-{tag}.png"));
+                if let Ok(f) = std::fs::File::create(&fname) {
+                    let mut w = std::io::BufWriter::new(f);
+                    image::codecs::png::PngEncoder::new(&mut w)
+                        .write_image(&r.rgba, rw, rh, image::ExtendedColorType::Rgba8)
+                        .expect("write png");
+                }
+            }
+        }
     }
 
     #[test]

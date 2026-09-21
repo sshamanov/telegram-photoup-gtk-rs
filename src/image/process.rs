@@ -1,4 +1,7 @@
-use crate::image::math::{AutoExpOpts, auto_exposure_ev, crop_to_pixels, fit_within};
+use crate::image::math::{
+    AutoExpOpts, auto_black_point, auto_exposure_ev, black_point_lut, crop_to_pixels, fit_within,
+    saturate, saturation_factor,
+};
 use crate::image::resize::{downscale_crop, downscale_plane, downscale_rgba};
 use crate::image::srgb::{
     gain_coefficients, jpeg_tone_lut, linear_to_srgb_byte, raw_tone_lut, srgb_to_linear,
@@ -11,24 +14,38 @@ use std::sync::Arc;
 pub trait Base: Send + Sync {
     fn width(&self) -> u32;
     fn height(&self) -> u32;
-    /// Apply exposure/WB/rolloff and return sRGB RGBA8 + the auto-exposure EV.
+    /// Apply exposure/WB/rolloff + saturation + the black point, returning sRGB
+    /// RGBA8, the auto-exposure EV and the black point actually used.
     fn render(
         &self,
         crop: Option<&NormalizedCrop>,
         size: Size,
         adjustments: &Adjustments,
     ) -> RenderResult {
-        self.render_with_ev(crop, size, adjustments, None)
+        self.render_with_overrides(crop, size, adjustments, None, None)
     }
-    /// Like `render`, but `ev` overrides the effective exposure EV. The editor's
-    /// preview uses this to apply a crop-aware auto-EV (computed over the cropped
-    /// region) while still displaying the full frame under the crop overlay.
+    /// Like `render`, but `ev` overrides the effective exposure EV.
     fn render_with_ev(
         &self,
         crop: Option<&NormalizedCrop>,
         size: Size,
         adjustments: &Adjustments,
         ev: Option<f32>,
+    ) -> RenderResult {
+        self.render_with_overrides(crop, size, adjustments, ev, None)
+    }
+    /// Like `render`, with either auto value overridden. The editor's preview
+    /// uses this to apply crop-aware autos (computed over the cropped region
+    /// while still displaying the full frame under the crop overlay): the
+    /// overrides only replace the values, so the picture is identical to the one
+    /// the export renders from the crop itself.
+    fn render_with_overrides(
+        &self,
+        crop: Option<&NormalizedCrop>,
+        size: Size,
+        adjustments: &Adjustments,
+        ev: Option<f32>,
+        black_point: Option<f32>,
     ) -> RenderResult;
     /// Downscaled LINEAR (0..1) RGB of the full frame — before exposure/WB/tone.
     /// Used by the WB pick/auto so the measured cast is the true sensor cast, not
@@ -39,6 +56,10 @@ pub trait Base: Send + Sync {
 pub struct RenderResult {
     pub rgba: Vec<u8>,
     pub auto_ev: f32,
+    /// The black point this render actually used — the derived value in the
+    /// Auto/Burn modes, the slider's value otherwise. The editor shows it on the
+    /// black-point slider (like `auto_ev` on the EV slider).
+    pub black_point: f32,
 }
 
 pub fn crop_rect(width: u32, height: u32, crop: Option<&NormalizedCrop>) -> Rect {
@@ -145,21 +166,26 @@ impl Base for RotatedBase {
         rotate_dims(self.inner.width(), self.inner.height(), self.quarters).1
     }
 
-    fn render_with_ev(
+    fn render_with_overrides(
         &self,
         crop: Option<&NormalizedCrop>,
         size: Size,
         adjustments: &Adjustments,
         ev_override: Option<f32>,
+        black_point: Option<f32>,
     ) -> RenderResult {
         let q = self.quarters;
         if q == 0 {
-            return self
-                .inner
-                .render_with_ev(crop, size, adjustments, ev_override);
+            return self.inner.render_with_overrides(
+                crop,
+                size,
+                adjustments,
+                ev_override,
+                black_point,
+            );
         }
         let (iw, ih) = rotate_dims(size.width, size.height, (4 - q) & 3);
-        let inner = self.inner.render_with_ev(
+        let inner = self.inner.render_with_overrides(
             crop,
             Size {
                 width: iw,
@@ -167,11 +193,13 @@ impl Base for RotatedBase {
             },
             adjustments,
             ev_override,
+            black_point,
         );
         let (rgba, _ow, _oh) = rotate_rgba(&inner.rgba, iw, ih, q);
         RenderResult {
             rgba,
             auto_ev: inner.auto_ev,
+            black_point: inner.black_point,
         }
     }
 
@@ -204,6 +232,60 @@ fn sample_luminances_rgba(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
     lums
 }
 
+/// Luminance bytes for the black-point percentile: a strided sample of the
+/// cropped source's RAW pixels.
+///
+/// Deliberately not `sample_luminances_rgba`: that one box-averages down to
+/// ≤128px, which is right for the exposure solve (averaging barely moves a
+/// quantile of the bulk) and wrong for a 0.1% floor — averaging mixes the dark
+/// tail into its neighbours and lifts the measured floor by tens of levels
+/// (on DSC_5155 the frame's floor is 2/255 while the averaged sample said
+/// 38/255). Striding instead of averaging keeps the tail: a uniform subsample
+/// preserves quantiles.
+///
+/// The sample depends only on the source and the crop — never on the render
+/// size — so the preview and the export derive the same black point.
+fn floor_luminances_rgba(rgba: &[u8]) -> Vec<u8> {
+    let n = rgba.len() / 4;
+    if n == 0 {
+        return Vec::new();
+    }
+    // ~16k samples keeps the scan cheap even on a 45MP export; the stride is odd
+    // so a constant step cannot lock onto one column of a striped frame.
+    let step = ((n / 16_384).max(1)) | 1;
+    let mut lums = Vec::with_capacity(n / step + 1);
+    for i in (0..n).step_by(step) {
+        let px = &rgba[i * 4..i * 4 + 3];
+        lums.push(
+            (0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32).round() as u8,
+        );
+    }
+    lums
+}
+
+/// RAW twin of `floor_luminances_rgba`: the same strided raw-pixel sample, taken
+/// from the linear planes (RAW keeps them separate) instead of an RGBA buffer.
+/// Striding over the crop's own rows is what keeps the dark tail intact — the
+/// averaged `luminance_sample` the exposure solve uses does not have one.
+fn floor_luminances_linear(r: &[f32], g: &[f32], b: &[f32], img_w: u32, rect: &Rect) -> Vec<u8> {
+    let n = (rect.width * rect.height) as usize;
+    if n == 0 {
+        return Vec::new();
+    }
+    let step = ((n / 16_384).max(1)) | 1;
+    let mut lums = Vec::with_capacity(n / step + 1);
+    for i in (0..n).step_by(step) {
+        let y = (i / rect.width as usize) as u32;
+        let x = (i % rect.width as usize) as u32;
+        let off = ((rect.y + y) * img_w + rect.x + x) as usize;
+        let sr = linear_to_srgb_byte(r[off]) as f32;
+        let sg = linear_to_srgb_byte(g[off]) as f32;
+        let sb = linear_to_srgb_byte(b[off]) as f32;
+        lums.push((0.2126 * sr + 0.7152 * sg + 0.0722 * sb).round() as u8);
+    }
+    lums
+}
+
 fn auto_ev_for(lums: &[u8], burn: bool) -> f32 {
     // Both modes anchor the midtones (p50 → 128), solved in linear space so the
     // anchor lands exactly on the target after the tone LUT. The modes differ
@@ -230,6 +312,54 @@ fn effective_ev(mode: ExposureMode, manual_ev: f32, auto_ev: f32) -> f32 {
     } else {
         auto_ev
     }
+}
+
+/// The black point Auto/Burn derive from the tone-mapped luma distribution.
+///
+/// `lums` is a strided raw-pixel luminance sample of the cropped source
+/// (`floor_luminances_rgba`), `lut` this path's tone curve and `luma_gain` the
+/// luminance-weighted exposure/WB gain — so the result depends only on the
+/// source and the crop, never on the render size, and the preview and the export
+/// derive the same black point.
+fn auto_black_point_for(lums: &[u8], lut: &[u8], luma_gain: f32) -> f32 {
+    let s2l = srgb_to_linear();
+    let mut hist = [0u32; 256];
+    for l in lums {
+        hist[lut[tone_index(s2l[*l as usize] * luma_gain)] as usize] += 1;
+    }
+    // p0.1: the floor of the distribution, ignoring a handful of stuck pixels.
+    auto_black_point(&hist, 0.001)
+}
+
+/// The black point this render uses: the derived one while exposure Auto/Burn
+/// own it, the slider's value otherwise. A `None` derivation (no luminance
+/// sample) falls back to the slider.
+fn effective_black_point(adjustments: &Adjustments, derived: Option<f32>) -> f32 {
+    match derived {
+        Some(bp) if adjustments.black_point_auto => bp,
+        _ => adjustments.black_point.clamp(-0.5, 0.5),
+    }
+}
+
+/// Saturation on a tone-mapped byte triple, returning the bytes the levels LUT
+/// indexes. Exactly the identity at factor 1 (an untouched slider) — the render
+/// loops branch on that and keep the un-saturated hot path.
+fn post_tone(r: u8, g: u8, b: u8, sat: f32) -> (u8, u8, u8) {
+    if sat == 1.0 {
+        return (r, g, b);
+    }
+    let (r, g, b) = saturate(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, sat);
+    (
+        (r * 255.0).round() as u8,
+        (g * 255.0).round() as u8,
+        (b * 255.0).round() as u8,
+    )
+}
+
+/// Luminance-weighted gain for `gain_coefficients`' per-channel gains — the
+/// scalar the black-point percentile is measured with.
+fn luma_gain(gr: f32, gg: f32, gb: f32) -> f32 {
+    0.2126 * gr + 0.7152 * gg + 0.0722 * gb
 }
 
 /// JPEG path: downscale in sRGB space, then apply exposure/WB/rolloff per pixel
@@ -259,12 +389,13 @@ impl Base for JpegBase {
         self.height
     }
 
-    fn render_with_ev(
+    fn render_with_overrides(
         &self,
         crop: Option<&NormalizedCrop>,
         size: Size,
         adjustments: &Adjustments,
         ev_override: Option<f32>,
+        black_point: Option<f32>,
     ) -> RenderResult {
         let rect = crop_rect(self.width, self.height, crop);
         let burn = adjustments.exposure_mode == ExposureMode::Burn;
@@ -302,19 +433,54 @@ impl Base for JpegBase {
         let lut = jpeg_tone_lut(false); // highlight rolloff applies in Auto AND burn; JPEG never gets the RAW S-curve
         let (gr, gg, gb) = gain_coefficients(ev, adjustments.wb_offset, adjustments.hue);
         let s2l = srgb_to_linear();
+
+        // Saturation and the black point both work on the tone curve's OWN
+        // output: the derived black point is a percentile of that distribution,
+        // and the levels LUT indexes those bytes. Both stay size-independent
+        // because the percentile comes from a strided raw-pixel sample of the
+        // cropped source, never from this render's own pixels.
+        let bp = effective_black_point(
+            adjustments,
+            black_point.or_else(|| {
+                adjustments.black_point_auto.then(|| {
+                    auto_black_point_for(&floor_luminances_rgba(src), &lut, luma_gain(gr, gg, gb))
+                })
+            }),
+        );
+        let levels = black_point_lut(bp);
+        let sat = saturation_factor(adjustments.saturation);
+
         let mut rgba = vec![0u8; (size.width * size.height * 4) as usize];
-        for px in down.chunks_exact_mut(4).zip(rgba.chunks_exact_mut(4)) {
-            let (spx, dst) = (px.0, px.1);
-            let r = s2l[spx[0] as usize] * gr;
-            let g = s2l[spx[1] as usize] * gg;
-            let b = s2l[spx[2] as usize] * gb;
-            dst[0] = lut[tone_index(r)];
-            dst[1] = lut[tone_index(g)];
-            dst[2] = lut[tone_index(b)];
-            dst[3] = 255;
+        if sat == 1.0 {
+            // No saturation: the hot path is tone LUT → levels LUT per channel.
+            for px in down.chunks_exact_mut(4).zip(rgba.chunks_exact_mut(4)) {
+                let (spx, dst) = (px.0, px.1);
+                dst[0] = levels[lut[tone_index(s2l[spx[0] as usize] * gr)] as usize];
+                dst[1] = levels[lut[tone_index(s2l[spx[1] as usize] * gg)] as usize];
+                dst[2] = levels[lut[tone_index(s2l[spx[2] as usize] * gb)] as usize];
+                dst[3] = 255;
+            }
+        } else {
+            for px in down.chunks_exact_mut(4).zip(rgba.chunks_exact_mut(4)) {
+                let (spx, dst) = (px.0, px.1);
+                let (r, g, b) = post_tone(
+                    lut[tone_index(s2l[spx[0] as usize] * gr)],
+                    lut[tone_index(s2l[spx[1] as usize] * gg)],
+                    lut[tone_index(s2l[spx[2] as usize] * gb)],
+                    sat,
+                );
+                dst[0] = levels[r as usize];
+                dst[1] = levels[g as usize];
+                dst[2] = levels[b as usize];
+                dst[3] = 255;
+            }
         }
 
-        RenderResult { rgba, auto_ev }
+        RenderResult {
+            rgba,
+            auto_ev,
+            black_point: bp,
+        }
     }
 
     fn linear_sample(&self, size: Size) -> Vec<f32> {
@@ -406,12 +572,13 @@ impl Base for RawBase {
         self.height
     }
 
-    fn render_with_ev(
+    fn render_with_overrides(
         &self,
         crop: Option<&NormalizedCrop>,
         size: Size,
         adjustments: &Adjustments,
         ev_override: Option<f32>,
+        black_point: Option<f32>,
     ) -> RenderResult {
         let rect = crop_rect(self.width, self.height, crop);
         let burn = adjustments.exposure_mode == ExposureMode::Burn;
@@ -465,6 +632,35 @@ impl Base for RawBase {
             .as_ref()
             .and_then(|m| wb_transform3x3(m, (wr, wg, wb)));
 
+        // Same post-tone saturation + levels as the JPEG path; the scalar the
+        // derived black point is measured with is the luminance-weighted gain
+        // (through the matrix the WB rotation is near-luma-neutral, so that is
+        // just `gain`).
+        let bp = effective_black_point(
+            adjustments,
+            black_point.or_else(|| {
+                adjustments.black_point_auto.then(|| {
+                    auto_black_point_for(
+                        &floor_luminances_linear(
+                            &self.full.r,
+                            &self.full.g,
+                            &self.full.b,
+                            self.full.width,
+                            &rect,
+                        ),
+                        &lut,
+                        if t.is_some() {
+                            gain
+                        } else {
+                            gain * luma_gain(wr, wg, wb)
+                        },
+                    )
+                })
+            }),
+        );
+        let levels = black_point_lut(bp);
+        let sat = saturation_factor(adjustments.saturation);
+
         let n = (size.width * size.height) as usize;
         if let Some(t) = t {
             for i in 0..n {
@@ -472,22 +668,33 @@ impl Base for RawBase {
                 let r1 = (t[0] * r[i] + t[1] * g[i] + t[2] * b[i]) * gain;
                 let g1 = (t[3] * r[i] + t[4] * g[i] + t[5] * b[i]) * gain;
                 let b1 = (t[6] * r[i] + t[7] * g[i] + t[8] * b[i]) * gain;
-                rgba[o] = lut[tone_index(r1)];
-                rgba[o + 1] = lut[tone_index(g1)];
-                rgba[o + 2] = lut[tone_index(b1)];
+                let (r1, g1, b1) = post_tone(lut[tone_index(r1)], lut[tone_index(g1)], lut[tone_index(b1)], sat);
+                rgba[o] = levels[r1 as usize];
+                rgba[o + 1] = levels[g1 as usize];
+                rgba[o + 2] = levels[b1 as usize];
                 rgba[o + 3] = 255;
             }
         } else {
             for i in 0..n {
                 let o = i * 4;
-                rgba[o] = lut[tone_index(r[i] * gain * wr)];
-                rgba[o + 1] = lut[tone_index(g[i] * gain * wg)];
-                rgba[o + 2] = lut[tone_index(b[i] * gain * wb)];
+                let (r1, g1, b1) = post_tone(
+                    lut[tone_index(r[i] * gain * wr)],
+                    lut[tone_index(g[i] * gain * wg)],
+                    lut[tone_index(b[i] * gain * wb)],
+                    sat,
+                );
+                rgba[o] = levels[r1 as usize];
+                rgba[o + 1] = levels[g1 as usize];
+                rgba[o + 2] = levels[b1 as usize];
                 rgba[o + 3] = 255;
             }
         }
 
-        RenderResult { rgba, auto_ev }
+        RenderResult {
+            rgba,
+            auto_ev,
+            black_point: bp,
+        }
     }
 
     fn linear_sample(&self, size: Size) -> Vec<f32> {
@@ -580,6 +787,93 @@ mod tests {
         // Auto-exposed 0.08 linear lands ~sRGB 117 → well above the unexposed ~80.
         let mid = out.rgba[0];
         assert!(mid > 110, "mid {} too dark", mid);
+    }
+
+    /// A frame with a lifted floor: most of it mid-tone, a thin band near-black.
+    fn lifted_floor_base() -> JpegBase {
+        let (w, h) = (256u32, 256u32);
+        let mid = gray_linear(0.35);
+        let dark = gray_linear(0.01);
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for _ in 0..w {
+                // 5% of the rows are the band: a floor below a mid-tone bulk.
+                let byte = if y < h / 20 { dark } else { mid };
+                rgba.extend_from_slice(&[byte, byte, byte, 255]);
+            }
+        }
+        JpegBase::new(w, h, rgba)
+    }
+
+    #[test]
+    fn auto_black_point_is_size_independent_and_lifts_a_banded_floor() {
+        // The percentile comes from a strided sample of the SOURCE, never from
+        // the rendered pixels — so a 64px live preview and a 2560px export must
+        // derive the same black point (else the preview lies about the export).
+        let base = lifted_floor_base();
+        let small = base.render(
+            None,
+            Size {
+                width: 64,
+                height: 64,
+            },
+            &Adjustments::default(),
+        );
+        let large = base.render(
+            None,
+            Size {
+                width: 512,
+                height: 512,
+            },
+            &Adjustments::default(),
+        );
+        assert!(
+            (small.black_point - large.black_point).abs() < 1e-6,
+            "preview {} vs export {}",
+            small.black_point,
+            large.black_point
+        );
+        // The band's floor is the derived point: it lands the band on black
+        // instead of leaving it a haze.
+        let floor = gray_linear(0.01) as f32 / 255.0;
+        assert!(
+            (small.black_point - floor).abs() < 0.02,
+            "bp {} vs floor {}",
+            small.black_point,
+            floor
+        );
+        assert!(small.rgba[0] <= 2, "band {} not crushed", small.rgba[0]);
+        // The mid-tone bulk (the frame's bottom half) is left in the light:
+        // the levels curve pivots at white, not on the bulk.
+        let tail = small.rgba.len() - 4;
+        assert!(small.rgba[tail] > 140, "bulk {} darkened", small.rgba[tail]);
+
+        // Manual: the slider's value is used as-is, and negative is allowed.
+        let adj = Adjustments {
+            black_point_auto: false,
+            black_point: -0.25,
+            ..Default::default()
+        };
+        let out = base.render(
+            None,
+            Size {
+                width: 64,
+                height: 64,
+            },
+            &adj,
+        );
+        assert!(
+            (out.black_point + 0.25).abs() < 1e-6,
+            "bp {}",
+            out.black_point
+        );
+        // A lifted (matte) floor brightens the frame instead of darkening it.
+        assert!(
+            out.rgba[0] >= small.rgba[0],
+            "matte {} vs crushed {}",
+            out.rgba[0],
+            small.rgba[0]
+        );
     }
 
     #[test]

@@ -13,7 +13,8 @@ pub fn process_jpeg_to_export(
     let (size, rgba, _meta) = decode_jpeg(data)?;
     let base = JpegBase::new(size.width, size.height, rgba);
     let export = export_dimensions(base.width(), base.height(), adjustments.crop.as_ref(), 2560);
-    let RenderResult { rgba: export_rgba, auto_ev } = base.render(adjustments.crop.as_ref(), export, adjustments);
+    let RenderResult { rgba: export_rgba, auto_ev, .. } =
+        base.render(adjustments.crop.as_ref(), export, adjustments);
     let (w, h) = (export.width as usize, export.height as usize);
     // RGBA → RGB for the encoder.
     let mut rgb = Vec::with_capacity(w * h * 3);

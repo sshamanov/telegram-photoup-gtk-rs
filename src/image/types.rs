@@ -44,6 +44,20 @@ pub struct Adjustments {
     pub wb_offset: f32,
     /// Hue (green↔magenta) tint, -1..+1, 0 = neutral.
     pub hue: f32,
+    /// Saturation, -1..+1: 0 = unchanged, -1 = fully gray, +1 = double. Applied
+    /// after the tone curve, in display space, preserving luma.
+    pub saturation: f32,
+    /// Black point, -0.5..+0.5, applied LAST in display space as
+    /// `x' = (x - b) / (1 - b)`: positive crushes the floor to black (more
+    /// contrast), negative lifts it (faded/matte). `black_point_auto` photos
+    /// only ever derive this from ≥ 0 — see the field below.
+    pub black_point: f32,
+    /// True while exposure Auto/Burn own the black point: they derive it on
+    /// every render from the crop's tone-mapped histogram, clamped to ≥ 0 so
+    /// auto only ever pulls a lifted floor to 0 (stretches) and never fades.
+    /// Dragging the black-point slider clears it (the manual value is used from
+    /// then on); pressing Auto/Burn again re-arms it.
+    pub black_point_auto: bool,
     pub crop: Option<NormalizedCrop>,
     /// User rotation in clockwise quarter-turns (0..3). 0 = none, 1 = 90° CW,
     /// 2 = 180°, 3 = 270° CW (90° CCW). Applied on top of any EXIF orientation.
@@ -57,6 +71,9 @@ impl Default for Adjustments {
             exposure_ev: 0.0,
             wb_offset: 0.0,
             hue: 0.0,
+            saturation: 0.0,
+            black_point: 0.0,
+            black_point_auto: true,
             crop: None,
             rotation: 0,
         }
