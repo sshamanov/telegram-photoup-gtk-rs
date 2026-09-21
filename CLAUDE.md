@@ -3,9 +3,9 @@
 ## What this project is
 
 A native GTK4/libadwaita desktop app that fixes dark or monochrome-cast photos
-(NEF/CR2/JPEG/PNG) and uploads them to a Telegram group as **inline ≤2560px,
-4:4:4 mozjpeg JPEGs at Q100**, quality lowered adaptively only to stay under
-Telegram's ~10 MB photo limit (`MAX_PHOTO_BYTES = 10_000_000`).
+(NEF/CR2/DNG/JPEG/PNG) and uploads them to a Telegram group as **inline
+≤2560px, 4:4:4 mozjpeg JPEGs at Q100**, quality lowered adaptively only to stay
+under Telegram's ~10 MB photo limit (`MAX_PHOTO_BYTES = 10_000_000`).
 
 It is a native Rust + GTK app with real parallelism: photos are decoded,
 auto-exposed, white-balanced and tone-mapped across a worker pool, and the
@@ -17,28 +17,40 @@ Implementation plan: `docs/superpowers/plans/2026-08-19-photoup2.md`
 ## System boundaries
 
 - **THIS project CAN install system packages** — it is a native app compiling
-  against system GTK4/libadwaita/libraw.
-- Dev is Ubuntu 24.04, prod is Arch. The **same `Cargo.toml` builds on both**:
-  `libadwaita` is pinned to feature `v1_5` (Ubuntu ships 1.5.0; Arch's newer
-  libadwaita is backward-compatible). **Do NOT bump `adw` to `v1_7`+** — it
-  would not build on the dev host.
-- `libraw-rs-sys` statically vendors LibRaw, so RAW support needs no separate
-  runtime dep from the OS package manager.
+  against system GTK4/libadwaita and a C/C++ toolchain.
+- Two build targets, one `Cargo.toml`: **Ubuntu 24.04** and **Arch**. Both must
+  keep building from the same manifest: `libadwaita` is pinned to feature
+  `v1_5` (Ubuntu 24.04 ships 1.5.0; Arch's newer libadwaita is backward
+  compatible). **Do NOT bump `adw` to `v1_7`+** — it would not build on Ubuntu.
+- `libraw-rs-sys` statically vendors LibRaw (compiled from source by `cc`), so
+  RAW support needs **no** `libraw-dev` package and no runtime RAW dependency —
+  but it does need a working C++ compiler.
+- The **dev instance itself is Arch + Wayland (Hyprland), headless**, not
+  Ubuntu — the Ubuntu target is the user's own machine. Do not assume the dev
+  host's package names or compositor in build instructions.
 
 ## Build / run / test
 
 - `cargo build`, `cargo test`, `cargo run` (debug). Release is `lto = true`.
-- System deps required: GTK4, libadwaita, and LibRaw (via `libraw-rs-sys`).
-- The RAW test in `src/image/decode.rs` decodes a real NEF/CR2 **only if** a
-  sample file exists in `./samples/` or `../photoup/samples/` (it skips
-  otherwise). Samples are gitignored and never committed.
+- System deps: GTK4 + libadwaita (dev headers) and gcc/clang. Arch:
+  `gtk4 libadwaita base-devel`. Ubuntu:
+  `libgtk-4-dev libadwaita-1-dev build-essential`. No `libraw-dev`.
+- RAW support is driven by one list: `image::decode::RAW_EXTS` (`nef`, `cr2`,
+  `dng`) with `is_raw_ext()`. `app::IMAGE_EXTS` (what the picker/drop/paste
+  accept) must contain every `RAW_EXTS` entry — `raw_exts_are_accepted_photos`
+  enforces it, so a new RAW format is added in both places or not at all.
+- RAW/PNG/JPEG tests in `src/image/decode.rs` decode a real sample **only if**
+  one exists in `./samples/` or `../photoup/samples/` (they skip otherwise).
+  Samples are gitignored and never committed.
 
 ## Debug & timing
 
 - `RUST_LOG=info cargo run` prints `[timing]` lines from the pipeline jobs in
-  `src/app.rs` (`run_thumb_job` / `run_preview_job` / `run_export_job`) with
-  read/decode/render/encode phase durations, plus a send-upload total on
-  `TEvent::Sent`. Use this to find bottlenecks; do not guess at performance.
+  `src/app.rs` with their real phases: thumb `read / decode / render / total`,
+  preview `read+decode / render / total` (a slider edit re-renders from the
+  cached base and logs `preview (cached base) render / total` instead), export
+  `read / decode / render / encode / total -> bytes`, and a send-batch
+  `upload_total`. Use these; do not guess at performance.
 - `PHOTOUP2_DEV=1 cargo run` skips Telegram auth and auto-loads `./samples/*`,
   so the grid/editor can be exercised headless without logging in.
 - **Always measure with `--release`.** The debug build runs the pure-Rust JPEG
@@ -46,8 +58,8 @@ Implementation plan: `docs/superpowers/plans/2026-08-19-photoup2.md`
   is compiled C++ and fast in both. Timings from a debug build are misleading.
 - UI flow: login → grid with default-checked thumbnails → editor → send-as-album
   — see the README "UI flow" section. Known gaps: no QR login (grammers 0.10
-  dropped it); the interactive crop drag is deferred (the crop presets and
-  overlay work).
+  dropped it); the grid's checkbox checkmark/selected-cell accent and the
+  editor's dimmed backdrop are deferred (marked in `docs/ui-spec.md`).
 
 ## Architecture
 
@@ -70,10 +82,13 @@ Three Kingdoms threading (borrowed from mpd-client), all in one Rust crate
 
 ### Adapter patterns
 
-- **`TelegramAdapter`** (`src/telegram/mod.rs`): `handle(cmd: TCommand) -> Vec<TEvent>`
-  is the contract the UI and tests both speak. Real impl is `GrammersSession`
-  (`src/telegram/grammers.rs`); **`MockAdapter`** (`src/telegram/mock.rs`) is the
-  deterministic mock used by integration tests in `tests/telegram_mock.rs`.
+- **`TelegramAdapter`** (`src/telegram/mod.rs`): `handle(cmd: TCommand) -> Vec<TEvent>`.
+  Only **`MockAdapter`** (`src/telegram/mock.rs`) implements it — it is the
+  deterministic contract the integration tests in `tests/telegram_mock.rs`
+  speak. The **real** path is not an adapter impl: `worker.rs` drives
+  `GrammersSession` (`src/telegram/grammers.rs`) through an inline
+  `match cmd` on the IO thread. Wire new Telegram commands into both, or the
+  tests will exercise a path the app does not run.
 - **Image pipeline** is photoup2's own linear-light implementation: per-pixel
   exposure + WB gains applied in linear space, a precomputed tone LUT (linear →
   sRGB with highlight rolloff; RAW also gets a camera-Standard S-curve), and
@@ -96,41 +111,82 @@ Three Kingdoms threading (borrowed from mpd-client), all in one Rust crate
   to `max_ev` 6.0 and highlights may clip to pure white. The difference between
   the two modes is therefore exactly clipping and white point.
 - Export format is **final, NOT tunable**: 4:4:4 mozjpeg Q100, adaptive quality
-  down to `MAX_PHOTO_BYTES`, longest edge ≤2560px (`EXPORT_EDGE`). Interactive
-  preview renders at `PREVIEW_EDGE = 1024`; grid thumbnails at ≤512px.
+  down to `MAX_PHOTO_BYTES`, longest edge ≤`EXPORT_EDGE` (2560). Grid thumbnails
+  are ≤512px. The editor preview is **two-stage**: live slider/drag edits render
+  at `LIVE_EDGE` (512, snappy), then the same edit is re-rendered at `FINAL_EDGE`
+  (1024) from the cached base once input goes quiet for `PREVIEW_DEBOUNCE_MS`
+  (150ms). There is no `PREVIEW_EDGE`.
 - RAW decodes with these LibRaw params (`src/image/decode.rs`):
   `use_camera_wb` (or `user_mul`), `use_camera_matrix=1`, `output_color=1`
   (sRGB primaries + gamma), `output_bps=16`, `no_auto_bright=1`, `half_size`
   (interactive only; exports pass `full_size`), `user_qual=3`.
+- **Capture metadata (EXIF) for the editor's Image section** comes from two
+  readers with one shared type (`PhotoMeta`, `src/image/types.rs`): RAW through
+  LibRaw (`Raw::meta()`, `src/image/rawffi.rs`) and JPEG/PNG through
+  `kamadak-exif` (`exif_meta()`, `src/image/decode.rs`). It travels with the
+  decode (`UiEvent::ThumbReady.meta`, `DecodedRaw.meta`), not with renders —
+  `AppEvent::PhotoThumbReady { meta: Option<PhotoMeta> }` is `None` on
+  render-only events so a slider edit cannot wipe the lines the decode filled.
+  Both readers must agree on the same display rules (`PhotoMeta::from_parts`:
+  drop empty/zero values, never repeat the maker). LibRaw's `other.timestamp`
+  is a **local-time** epoch, so it is rendered with `localtime_r`
+  (`format_epoch_local`) — rendering it as UTC shifts every displayed time by
+  the host's offset; the EXIF crate path reformats the stored string directly.
 
 ## Dev instance & delivery
 
-This repo is developed on a **headless dev instance** — an Xvfb display, but no
-physical screen/desktop for the user. The user's machine syncs this repo via
-git (`pull` from `origin/main`) and runs the app there. So the delivery loop is
-**commit → push → user pulls → user runs**; only commit once the visual check
-below passes.
+The dev instance is **headless** — no screen the user is looking at. The user's
+own machine syncs this repo via git (`pull` from `origin/main`) and runs the app
+there. So the delivery loop is **commit → push → user pulls → user runs**; only
+commit once the visual check below passes.
 
 ## Verification rule
 
-**Claude verifies visually with VLM.** When a change could visibly differ, take
-real screenshots or render before/after images and inspect them via the VLM
-before calling the change done — do not assert visual correctness without
-looking. (The `Read` tool may not display images on some model backends; the VLM
-endpoint always works.)
+**Claude verifies visually — Claude *is* the VLM.** When a change could visibly
+differ, render it and *look at the image yourself* before calling the change
+done; never assert visual correctness from the code alone. There is no external
+vision service; read the PNG with the `Read` tool.
 
-- **VLM** (dev-time only): OpenAI-compatible vision API
-  `https://<vlm-endpoint>/api/chat/completions`, `model: "qwen3-vl:30b-instruct"`,
-  `Authorization: Bearer sk-REDACTED`. Send the image as
-  `{"type":"image_url","image_url":{"url":"data:image/png;base64,<b64>"}}` in a
-  message, ask for per-image severity/neutrality ratings.
-- App screenshots: `PHOTOUP2_DEV=1 cargo run` on the Xvfb display, capture with
-  `import -window root out/x.png`. Renders of a sample photo with different WB
-  settings: `cargo test --lib wb_debug_render_before_after -- --nocapture` →
+- **Never screenshot the user's desktop.** This dev instance runs the user's real
+  Wayland session (Hyprland), and a full-screen grab exposes their terminal and
+  private files. Always capture the app window alone, and delete captures that
+  leak anything else.
+- App screenshots: the working recipe on this host is a **dedicated Xvfb display**
+  — `Xvfb :99 -screen 0 1600x1200x24`, then
+  `DISPLAY=:99 GDK_BACKEND=x11 PHOTOUP2_DEV=1 ./target/release/photoup2`, then
+  `DISPLAY=:99 import -window <id> out/x.png` (`xwininfo -root -tree` for the id).
+  On the Wayland session itself `import -window root` is black/rootless and
+  `grim -g` grabs whatever is stacked there — do not use them to inspect the app.
+- Driving the UI without a physical pointer: `python-xlib` is available, so
+  XTEST (`Xlib.ext.xtest.fake_input`) can click/type into the window on `:99`
+  (e.g. double-click a thumbnail to open the editor, drag inside the crop rect).
+  A cursor's own pixels never appear in `import -window` captures — assert
+  cursor behaviour in a test instead, and read the theme's cursor file
+  (`/usr/share/icons/<theme>/cursors/<name>`) when the shape itself matters.
+- Renders of a sample photo with different WB settings:
+  `cargo test --lib wb_debug_render_before_after -- --nocapture` →
   `out/wb_before_after/`.
 
-The user's real NEF/CR2/JPEG samples stay local in `./samples/` (gitignored)
+The user's real NEF/CR2/DNG/JPEG samples stay local in `./samples/` (gitignored)
 and are the source of truth for RAW output quality.
+
+## Docs and code stay in sync
+
+`docs/ui-spec.md` is the authority for UI behaviour; `CLAUDE.md`/`README.md` are
+the authority for architecture and workflow. They are living documents, not
+history:
+
+- **Docs follow code.** When a change makes any statement in these files false —
+  a constant, a phase name, a deferred feature that now works, a dependency, a
+  path — fix the doc in the same delivery. Stale "known gap" claims are the worst
+  kind: they cost a future reader real time.
+- **Code follows docs.** When the spec says the UI does something the code does
+  not, that is a defect in one of them: either implement it, or strike/defer it
+  in the spec explicitly (marked **deferred**, with the reason). Never leave the
+  spec describing behaviour that does not exist.
+- Before claiming a doc statement is wrong, **check the code** (or the running
+  app) — do not repeat a stale summary. And when a doc and the code disagree
+  about a *number*, the constant in the code wins.
 
 ## Commit discipline
 
