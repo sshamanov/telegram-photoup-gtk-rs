@@ -22,6 +22,19 @@ Implementation plan: `docs/superpowers/plans/2026-08-19-photoup2.md`
   keep building from the same manifest: `libadwaita` is pinned to feature
   `v1_5` (Ubuntu 24.04 ships 1.5.0; Arch's newer libadwaita is backward
   compatible). **Do NOT bump `adw` to `v1_7`+** — it would not build on Ubuntu.
+- The **file dialog filter** is `app::photo_filter()`, built from
+  `photo_filter_rules()` — keep it that way, because the dialog is not GTK's:
+  on Wayland/GNOME `GtkFileDialog` goes through **xdg-desktop-portal**, which is
+  handed the filter as *serialized globs*. Two traps, both of which show up as
+  "Photos" in the type dropdown and then an empty list: `add_suffix` takes a
+  **bare** suffix (GTK prepends `*.` itself, so `".jpg"` asks for `*..jpg`), and
+  a suffix rule arrives at the portal as a bracket-class glob
+  (`*.[jJ][pP][gG]`) that the backend's matcher cannot read. So the filter
+  carries bare suffixes *plus* literal `*.ext` / `*.EXT` globs (patterns are
+  case-sensitive; camera files are uppercase) and `image/jpeg`/`image/png` mime
+  types. `photo_filter_has_glob_rules_for_every_extension` asserts the rules
+  headless; the serialized form is asserted from the one GTK-initialising test
+  (`assert_photo_filter_serializes_matchable_globs`).
 - `libraw-rs-sys` statically vendors LibRaw (compiled from source by `cc`), so
   RAW support needs **no** `libraw-dev` package and no runtime RAW dependency —
   but it does need a working C++ compiler.

@@ -44,6 +44,12 @@ Layout top to bottom:
 2. **Upload zone**: a dashed box, "**Upload photos**" / "Drop JPEG / PNG / NEF /
    CR2 / DNG here, or press Ctrl+V to paste". Click opens a file picker;
    drag-drop and paste accepted.
+   - The picker carries one filter, named "**Photos**", covering exactly the six
+     types above, matched in **both cases** — cameras write `DSC_4858.NEF`,
+     phones write `IMG_1234.jpg`. The filter must survive the **system** dialog
+     (the portal, which is what opens on Wayland/GNOME and receives the filter as
+     serialized globs rather than as GTK rules): a filter the portal cannot match
+     shows "Photos" in the type dropdown and then an empty file list.
 3. **Usage indicator**: only while photos are being processed — an amber pulsing
    dot + "**Processing {name}**" and, if more than one is pending, "({n} queued)"
    counting the ones behind the current file. NOT a ready/sent counter, NOT a RAM
