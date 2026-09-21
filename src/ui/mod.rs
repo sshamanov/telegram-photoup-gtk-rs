@@ -18,8 +18,67 @@ pub mod util;
 
 const APP_ID: &str = "dev.shamanov.photoup2";
 
+/// Held for the process lifetime: the kernel releases the flock on exit, so a
+/// crashed instance never leaves the app unstartable.
+struct InstanceLock {
+    _file: std::fs::File,
+}
+
+/// Per-user single-instance lock. `Ok` = this process is the primary instance
+/// (hold it until `run()` returns); `Err(pid)` = another photoup2 is alive.
+///
+/// GApplication hands a second launch to the running instance and then exits
+/// without printing anything, which reads as "the app does not start" whenever
+/// that live instance has no window on screen. The lock lets the forwarded
+/// launch say what happened instead.
+fn instance_lock() -> Result<InstanceLock, Option<u32>> {
+    use std::io::Write;
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = dir.join("photoup2.lock");
+    // Deliberately no truncate: on the failure path the file still holds the
+    // live instance's pid.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|_| None)?;
+    // SAFETY: `file` keeps the fd open for the call; flock takes no pointers.
+    if unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        // Record who holds it — the lock, not the contents, is the truth.
+        let _ = file.set_len(0);
+        let _ = (&file).write_all(std::process::id().to_string().as_bytes());
+        return Ok(InstanceLock { _file: file });
+    }
+    let owner = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse().ok());
+    Err(owner)
+}
+
 pub fn run() -> glib::ExitCode {
     adw::init().expect("adw init");
+    match instance_lock() {
+        Ok(lock) => {
+            // Keep the lock alive for the whole `app.run()`.
+            let _lock = lock;
+            run_app()
+        }
+        Err(owner) => {
+            log::warn!(
+                "another photoup2 is already running{} — this launch is handed to it; it \
+                 exits as soon as that instance takes the activation. If no window appears, \
+                 `pgrep -x photoup2 | xargs -r kill` and start again.",
+                owner.map(|p| format!(" (pid {p})")).unwrap_or_default()
+            );
+            run_app()
+        }
+    }
+}
+
+fn run_app() -> glib::ExitCode {
+
     // Darkroom: force a dark base so every libadwaita widget renders dark
     // underneath our warm CSS palette (the CSS provider then adds the amber
     // accent + surfaces).
