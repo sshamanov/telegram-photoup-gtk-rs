@@ -89,12 +89,23 @@ turns the preview cursor into a **crosshair**.
 3. Section "**Exposure**":
    - EV slider, min −3, max +5, step **0.05**, zero-centered (drag updates live,
      release commits).
+   - **Black point** slider, **−0.5..+0.5**, step **0.01**, zero-centered,
+     in **display (0.0..1.0) units**. The caption doubles as the value readout
+     (`Black point +0.16`). Applied **last** in the pipeline — see "Black point
+     & saturation" below. Positive values crush the floor to black and keep
+     white at white (darkening everything between); **negative values are
+     allowed on the slider only** — they lift the floor to `|b|/(1+|b|)`, a
+     matte look no exposure gain can produce.
    - Row: **Auto** (auto-exposure) | **Burn** (aggressive) | **Rest** (reset
      exposure to 0) | the current EV value (e.g. `+2.7 EV`).
 4. Section "**White balance**":
    - Temperature (warmth) slider, **−4..+4**, step 0.05, zero-centered (the wider
      range covers images that need a strong cool shift).
    - Hue (tint) slider, **−1..+1**, step 0.01, zero-centered (fine-grained).
+   - **Saturation** slider, **−1..+1**, step **0.01**, zero-centered, caption
+     as the value readout (`Saturation +0.00`). `−1` is fully desaturated, `0`
+     leaves the photo unchanged, `+1` is 2× chroma. Luma-preserving
+     (Rec. 709 weights), so it changes colour without changing brightness.
    - Row: **Auto** (neutralize the warm/cool cast — clinical) | **Auto2**
      (neutralize but keep the warm ambience, Nikon AUTO2 style) | **Reset** |
      **Picker** | the current WB display (`+0.00 · +0.00`). **Picker** is a
@@ -126,6 +137,39 @@ turns the preview cursor into a **crosshair**.
 9. Fine-tune hint: "Fine-tune: Q/W exposure · A/S warmth · Z/X tint".
 10. Nav: **‹ Prev** | **Next ›** (disabled at ends).
 11. Bottom: **Reject** (remove this photo) | **Close** (back to grid).
+
+### Black point & saturation (weird-histogram photos)
+
+RAW histograms that start well above zero (haze, veiling flare, a flat
+moth-on-a-wall frame) cannot be fixed with exposure alone: an exposure gain is
+multiplicative, so it can never put the floor *on* black. These two controls
+are the additive/curve answer, and both act **after** exposure, white balance
+and the tone curve:
+
+1. **Saturation** — on the tone-mapped pixel, luma-preserving.
+2. **Black point** — levels, applied **last** (`out = clamp((x − b)/(1 − b))`),
+   so its white point and the exposure cap do not fight.
+
+**Auto** (armed by **Auto** and **Burn**, and re-armed by pressing either) owns
+the black point only while it is auto: it is derived **live on every render**
+from the cropped source, and the slider shows the derived value exactly like
+the EV badge shows the effective EV. The rules:
+
+- **Stretch only, never shrink**: the derived value is clamped to
+  `0.0 ..= 0.5`. Auto may pull a lifted floor down to black; it never lifts the
+  floor, and it never darkens an already-good photo. Pushing a floor *up* is
+  the slider's job (negative values), i.e. manual-only.
+- Derivation: a ~16k-sample strided **raw-pixel** luminance sample of the crop
+  (not a box average — averaging destroys the tail this percentile needs),
+  tone-mapped through the same LUT the render uses, then its **p0.1**
+  percentile is the floor.
+- **Flatness gate**: if `3 × floor > median` the frame has no dark tail worth
+  stretching (a wall, a sky, a product shot) and the derived point is `0`.
+- The sample comes from the **source plus the crop**, never from the rendered
+  pixels, so the 512px live preview and the 2560px export derive the same
+  value — the preview cannot lie about the export.
+- Dragging the black-point slider is a manual edit: it disarms auto and pins the
+  slider's value (the log line drops its `(auto)` marker). Auto re-arms.
 
 ## Keyboard
 
@@ -164,6 +208,7 @@ These are known gaps, deliberately deferred — do not treat them as bugs:
 - Keep the layout/captions/sections EXACTLY as above; do not rename buttons or
   sections. ("Exposure"/"White balance"/"Crop"/"Rotate"/"Image";
   Auto/Burn/Rest; Auto/Auto2/Reset/Picker; 1:1/2:3/3:2/Original/Pix; ↺ CCW/↻ CW;
+  Black point; Saturation;
   ‹ Prev/Next ›; Reject/Close; Reset/Logout; Send {n} selected;
   Preparing/Sending.)
 - The theme is a light-on-dark look with an amber accent and a display font;

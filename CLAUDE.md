@@ -91,9 +91,10 @@ Three Kingdoms threading (borrowed from mpd-client), all in one Rust crate
   tests will exercise a path the app does not run.
 - **Image pipeline** is photoup2's own linear-light implementation: per-pixel
   exposure + WB gains applied in linear space, a precomputed tone LUT (linear →
-  sRGB with highlight rolloff; RAW also gets a camera-Standard S-curve), and
-  4:4:4 mozjpeg Q100 encode. `AppController` (`src/app.rs`) owns the wiring:
-  screens, pool, and telegram worker.
+  sRGB with highlight rolloff; RAW also gets a camera-Standard S-curve),
+  luma-preserving saturation, a black-point levels LUT applied last, and 4:4:4
+  mozjpeg Q100 encode. `AppController` (`src/app.rs`) owns the wiring: screens,
+  pool, and telegram worker.
 
 ## Image pipeline
 
@@ -110,6 +111,27 @@ Three Kingdoms threading (borrowed from mpd-client), all in one Rust crate
   **Burn** drops the cap entirely — the median governs the lift up
   to `max_ev` 6.0 and highlights may clip to pure white. The difference between
   the two modes is therefore exactly clipping and white point.
+- **Render order** is fixed: exposure + WB in linear → tone LUT → **saturation**
+  (display space, luma-preserving, Rec. 709 weights: `−1` gray … `0` identity …
+  `+1` 2× chroma) → **black point** (levels, **applied last**:
+  `out = clamp((x − b)/(1 − b))`) → clamp. The levels curve is what an exposure
+  gain cannot do: `b > 0` puts a lifted floor on black while keeping white at
+  white, `b < 0` lifts the floor to `|b|/(1+|b|)` (a matte look) — negative is
+  **manual only**, never derived.
+- **Auto black point** (`auto_black_point`, `src/image/math.rs`; derived in
+  `auto_black_point_for`, `src/image/process.rs`): armed by **Auto** and
+  **Burn** and re-derived on every render, like the EV badge. It **stretches
+  only, never shrinks** — clamped to `0.0 ..= 0.5`, so it can pull a lifted
+  floor to black but never lift one or darken a good photo. The floor is the
+  **p0.1** percentile of a tone-mapped luma histogram of a ~16k-sample
+  **strided raw-pixel** luminance sample of the crop (`floor_luminances_rgba` /
+  `floor_luminances_linear`) — *not* a box average, which destroys the tail the
+  percentile needs. A **flatness gate** (`3 × floor > median → 0`) leaves
+  walls, skies and flat frames alone. The sample comes from the **source plus
+  the crop, never from the rendered pixels**, so the 512px live preview and the
+  2560px export derive the same value; `crop_aware_autos` feeds both the EV and
+  the black point from one tiny cropped render. Dragging the slider pins a
+  manual value and disarms auto (the `action: edit` line drops its `(auto)`).
 - Export format is **final, NOT tunable**: 4:4:4 mozjpeg Q100, adaptive quality
   down to `MAX_PHOTO_BYTES`, longest edge ≤`EXPORT_EDGE` (2560). Grid thumbnails
   are ≤512px. The editor preview is **two-stage**: live slider/drag edits render
@@ -166,6 +188,10 @@ vision service; read the PNG with the `Read` tool.
 - Renders of a sample photo with different WB settings:
   `cargo test --lib wb_debug_render_before_after -- --nocapture` →
   `out/wb_before_after/`.
+- Black point / saturation across every sample (prints `ev / bp / p0.1 / p1 /
+  p50 / p99 / auto_bp` per photo and writes the variants):
+  `PHOTOUP2_DEBUG_LEVELS=1 cargo test --release --lib levels_debug_render -- --nocapture`
+  → `out/levels/`.
 
 The user's real NEF/CR2/DNG/JPEG samples stay local in `./samples/` (gitignored)
 and are the source of truth for RAW output quality.

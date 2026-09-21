@@ -39,8 +39,11 @@ pipeline is photoup2's own linear-light implementation.
 
 **Pipeline:** decode once → cached linear base → re-render from the base on
 every edit (never cumulative) → ≤512px grid thumbnails / 512px live + 1024px
-settled editor preview / 2560px export at send. Export is fixed: 4:4:4 mozjpeg
-Q100, adaptive to fit ~10 MB — **not user-tunable by design**.
+settled editor preview / 2560px export at send. Each render applies, in a fixed
+order: exposure + white balance in linear → tone curve → luma-preserving
+saturation → **black point last** (levels, for the RAW frames whose histogram
+starts above zero). Export is fixed: 4:4:4 mozjpeg Q100, adaptive to fit ~10 MB
+— **not user-tunable by design**.
 
 ## Build / run
 
@@ -93,8 +96,9 @@ In short: Login (phone/code/2FA) → Main screen (header with group selector +
 **Reset** + **Logout**; upload zone; "Processing {name} (n queued)" usage
 indicator; a square-thumbnail grid with checkbox top-left, EV badge top-right,
 filename + RAW/JPG badge) → Editor (preview with crop overlay + right panel:
-RGB histogram, Exposure [Auto/Burn/Rest + EV], White balance
-[Auto/Auto2/Reset/Picker + temp/hue], Crop [1:1/2:3/3:2/Original/Pix], Rotate
+RGB histogram, Exposure [Auto/Burn/Rest + EV + Black point],
+White balance [Auto/Auto2/Reset/Picker + temp/hue + Saturation], Crop
+[1:1/2:3/3:2/Original/Pix], Rotate
 [↺ CCW/↻ CW], Image [camera / lens / shutter · aperture · ISO / date, then
 `RAW|JPEG · W × H` and `output W × H px`], Prev/Next, Reject/Close) → sticky
 **Send {n} selected** footer (Preparing/Sending progress; sent photos are
