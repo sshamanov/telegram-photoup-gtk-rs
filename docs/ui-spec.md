@@ -92,31 +92,38 @@ turns the preview cursor into a **crosshair**.
 2. **Histogram**: the RGB histogram (3 × 256 = 768 bins, R/G/B overlaid as
    translucent channels) drawn on a dark frame, 120px tall. The 256-bin
    luminance histogram is still computed by the pipeline but is not displayed.
-3. Section "**Exposure**":
+3. Section "**Exposure · Black point**" (the two tone controls, tone next to
+   tone):
    - EV slider, min −3, max +5, step **0.05**, zero-centered (drag updates live,
-     release commits).
-   - **Black point** slider, **−0.5..+0.5**, step **0.01**, zero-centered,
-     in **display (0.0..1.0) units**. The caption doubles as the value readout
-     (`Black point +0.16`). Applied **last** in the pipeline — see "Black point
-     & saturation" below. Positive values crush the floor to black and keep
-     white at white (darkening everything between); **negative values are
-     allowed on the slider only** — they lift the floor to `|b|/(1+|b|)`, a
-     matte look no exposure gain can produce.
-   - Row: **Auto** (auto-exposure) | **Burn** (aggressive) | **Rest** (reset
-     exposure to 0) | the current EV value (e.g. `+2.7 EV`).
-4. Section "**White balance**":
+     release commits). Its value sits at the **right end of its own track**
+     (`+1.28 EV`).
+   - **Black point** slider, **−0.5..+0.5**, step **0.01**, zero-centered, in
+     **display (0.0..1.0) units**, its value at the right end of its track
+     (`+0.00`). Applied **last** in the pipeline — see "Black point & saturation"
+     below. Positive values crush the floor to black and keep white at white
+     (darkening everything between); **negative values are allowed on the slider
+     only** — they lift the floor to `|b|/(1+|b|)`, a matte look no exposure gain
+     can produce. **Manual only**: nothing derives it, and pressing **Auto** /
+     **Burn** never moves it.
+   - Row (below the two sliders, no values): **Auto** (auto-exposure) | **Burn**
+     (aggressive) | **Rest** (reset **both** the exposure to 0 and the black
+     point to neutral).
+4. Section "**White balance · Tint · Saturation**" (the colour controls, colour
+   next to colour):
    - Temperature (warmth) slider, **−4..+4**, step 0.05, zero-centered (the wider
-     range covers images that need a strong cool shift).
-   - Hue (tint) slider, **−1..+1**, step 0.01, zero-centered (fine-grained).
-   - **Saturation** slider, **−1..+1**, step **0.01**, zero-centered, caption
-     as the value readout (`Saturation +0.00`). `−1` is fully desaturated, `0`
-     leaves the photo unchanged, `+1` is 2× chroma. Luma-preserving
-     (Rec. 709 weights), so it changes colour without changing brightness.
-   - Row: **Auto** (neutralize the warm/cool cast — clinical) | **Auto2**
-     (neutralize but keep the warm ambience, Nikon AUTO2 style) | **Reset** |
-     **Picker** | the current WB display (`+0.00 · +0.00`). **Picker** is a
-     visible toggle (amber while active). Both Auto buttons carry their
-     explanation as a tooltip.
+     range covers images that need a strong cool shift); value at the right end
+     of its track.
+   - Hue (tint) slider, **−1..+1**, step 0.01, zero-centered (fine-grained);
+     value at the right end of its track.
+   - **Saturation** slider, **−1..+1**, step **0.01**, zero-centered; value at
+     the right end of its track. `−1` is fully desaturated, `0` leaves the photo
+     unchanged, `+1` is 2× chroma. Luma-preserving (Rec. 709 weights), so it
+     changes colour without changing brightness.
+   - Row (below the three sliders, no values): **Auto** (neutralize the warm/cool
+     cast — clinical) | **Auto2** (neutralize but keep the warm ambience, Nikon
+     AUTO2 style) | **Reset** (warmth, tint **and** saturation to neutral) |
+     **Picker**. **Picker** is a visible toggle (amber while active). Both Auto
+     buttons carry their explanation as a tooltip.
 5. Section "**Crop**":
    - Presets: **1:1** | **2:3** | **3:2** | **Original** | **Pix**. **Pix** uses
      the current crop's center and nearest 1:1, 3:2, 16:9, or 2:1 aspect while
@@ -156,26 +163,17 @@ and the tone curve:
 2. **Black point** — levels, applied **last** (`out = clamp((x − b)/(1 − b))`),
    so its white point and the exposure cap do not fight.
 
-**Auto** (armed by **Auto** and **Burn**, and re-armed by pressing either) owns
-the black point only while it is auto: it is derived **live on every render**
-from the cropped source, and the slider shows the derived value exactly like
-the EV badge shows the effective EV. The rules:
+**The black point is manual-only.** It is the slider's value, nothing else:
+exposure **Auto** and **Burn** derive the EV and leave the black point exactly
+where the slider has it, so switching modes (or pressing Auto on a photo the
+user has already tuned) can never move it.
 
-- **Stretch only, never shrink**: the derived value is clamped to
-  `0.0 ..= 0.5`. Auto may pull a lifted floor down to black; it never lifts the
-  floor, and it never darkens an already-good photo. Pushing a floor *up* is
-  the slider's job (negative values), i.e. manual-only.
-- Derivation: a ~16k-sample strided **raw-pixel** luminance sample of the crop
-  (not a box average — averaging destroys the tail this percentile needs),
-  tone-mapped through the same LUT the render uses, then its **p0.1**
-  percentile is the floor.
-- **Flatness gate**: if `3 × floor > median` the frame has no dark tail worth
-  stretching (a wall, a sky, a product shot) and the derived point is `0`.
-- The sample comes from the **source plus the crop**, never from the rendered
-  pixels, so the 512px live preview and the 2560px export derive the same
-  value — the preview cannot lie about the export.
-- Dragging the black-point slider is a manual edit: it disarms auto and pins the
-  slider's value (the log line drops its `(auto)` marker). Auto re-arms.
+That is deliberate. A levels stretch that keeps white at white necessarily
+darkens everything between black and white (`out = (x − b)/(1 − b)`, fixed point
+at white), so a *derived* black point would quietly undo the auto exposure's
+median-on-128 promise — the picture would come back darker than the exposure
+solve had just made it. Leaving the stretch to the slider keeps the promise
+intact until the user asks for the crush.
 
 ## Keyboard
 
@@ -212,11 +210,15 @@ These are known gaps, deliberately deferred — do not treat them as bugs:
 ## Notes for the GTK implementation
 
 - Keep the layout/captions/sections EXACTLY as above; do not rename buttons or
-  sections. ("Exposure"/"White balance"/"Crop"/"Rotate"/"Image";
+  sections. ("Exposure · Black point"/"White balance · Tint ·
+  Saturation"/"Crop"/"Rotate"/"Image";
   Auto/Burn/Rest; Auto/Auto2/Reset/Picker; 1:1/2:3/3:2/Original/Pix; ↺ CCW/↻ CW;
   Black point; Saturation;
   ‹ Prev/Next ›; Reject/Close; Reset/Logout; Send {n} selected;
   Preparing/Sending.)
+- Every slider shows its value at the right end of its own track, and the
+  button rows below the sliders carry no values (the panel is one control per
+  line, so a readout is just the number — the section label names it).
 - The theme is a light-on-dark look with an amber accent and a display font;
   matching the exact theme is optional — matching the layout, labels, and
   interaction is required.

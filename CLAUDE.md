@@ -129,22 +129,17 @@ Three Kingdoms threading (borrowed from mpd-client), all in one Rust crate
   `+1` 2× chroma) → **black point** (levels, **applied last**:
   `out = clamp((x − b)/(1 − b))`) → clamp. The levels curve is what an exposure
   gain cannot do: `b > 0` puts a lifted floor on black while keeping white at
-  white, `b < 0` lifts the floor to `|b|/(1+|b|)` (a matte look) — negative is
-  **manual only**, never derived.
-- **Auto black point** (`auto_black_point`, `src/image/math.rs`; derived in
-  `auto_black_point_for`, `src/image/process.rs`): armed by **Auto** and
-  **Burn** and re-derived on every render, like the EV badge. It **stretches
-  only, never shrinks** — clamped to `0.0 ..= 0.5`, so it can pull a lifted
-  floor to black but never lift one or darken a good photo. The floor is the
-  **p0.1** percentile of a tone-mapped luma histogram of a ~16k-sample
-  **strided raw-pixel** luminance sample of the crop (`floor_luminances_rgba` /
-  `floor_luminances_linear`) — *not* a box average, which destroys the tail the
-  percentile needs. A **flatness gate** (`3 × floor > median → 0`) leaves
-  walls, skies and flat frames alone. The sample comes from the **source plus
-  the crop, never from the rendered pixels**, so the 512px live preview and the
-  2560px export derive the same value; `crop_aware_autos` feeds both the EV and
-  the black point from one tiny cropped render. Dragging the slider pins a
-  manual value and disarms auto (the `action: edit` line drops its `(auto)`).
+  white, `b < 0` lifts the floor to `|b|/(1+|b|)` (a matte look).
+- **The black point is MANUAL ONLY** (`adjustments.black_point`, applied in
+  `src/image/process.rs`). Exposure **Auto** and **Burn** set the EV and nothing
+  else, exactly as they did before this control existed — no auto derivation, no
+  `black_point_auto` field, and the `action: edit` log line has no `(auto)`
+  marker. This is deliberate: a levels stretch that keeps white at white
+  (`out = (x − b)/(1 − b)`, fixed point at white) necessarily darkens what lies
+  between, so a derived value would quietly undo the auto exposure's
+  median-on-128 promise. Pushing the stretch is the slider's job. (`crop_aware_autos`
+  in `src/app.rs` now feeds the EV override only; `RenderResult` carries
+  `rgba` + `auto_ev`.)
 - Export format is **final, NOT tunable**: 4:4:4 mozjpeg Q100, adaptive quality
   down to `MAX_PHOTO_BYTES`, longest edge ≤`EXPORT_EDGE` (2560). Grid thumbnails
   are ≤512px. The editor preview is **two-stage**: live slider/drag edits render
@@ -202,7 +197,8 @@ vision service; read the PNG with the `Read` tool.
   `cargo test --lib wb_debug_render_before_after -- --nocapture` →
   `out/wb_before_after/`.
 - Black point / saturation across every sample (prints `ev / bp / p0.1 / p1 /
-  p50 / p99 / auto_bp` per photo and writes the variants):
+  p50 / p99` per photo and writes the `-bp0` / `-bp20` / `-bpm20` / `-sat-1` /
+  `-sat+1` variants):
   `PHOTOUP2_DEBUG_LEVELS=1 cargo test --release --lib levels_debug_render -- --nocapture`
   → `out/levels/`.
 
