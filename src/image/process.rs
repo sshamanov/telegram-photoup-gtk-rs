@@ -862,7 +862,7 @@ mod rotation_tests {
 #[cfg(test)]
 mod raw_base_tests {
     use super::*;
-    use crate::image::types::DecodedRaw;
+    use crate::image::types::{DecodedRaw, PhotoMeta};
 
     fn synth_raw(w: u32, h: u32, value: f32) -> RawBase {
         let n = (w * h) as usize;
@@ -878,6 +878,7 @@ mod raw_base_tests {
             b: vec![value; n],
             cam_mul: None,
             cam_matrix: None,
+            meta: PhotoMeta::default(),
         };
         // give it a slight gradient so downscale is exercised
         for i in 0..n {
@@ -935,6 +936,7 @@ mod raw_base_tests {
             b: vec![0.080; n],
             cam_mul: None,
             cam_matrix: None,
+            meta: PhotoMeta::default(),
         };
         let base = RawBase::new(dr);
         let out = base.linear_sample(Size {
@@ -963,6 +965,7 @@ mod raw_base_tests {
             b: vec![value; n],
             cam_mul: None,
             cam_matrix: None,
+            meta: PhotoMeta::default(),
         }
     }
 

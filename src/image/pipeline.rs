@@ -10,7 +10,7 @@ pub fn process_jpeg_to_export(
     data: &[u8],
     adjustments: &Adjustments,
 ) -> Result<(Vec<u8>, f32)> {
-    let (size, rgba) = decode_jpeg(data)?;
+    let (size, rgba, _meta) = decode_jpeg(data)?;
     let base = JpegBase::new(size.width, size.height, rgba);
     let export = export_dimensions(base.width(), base.height(), adjustments.crop.as_ref(), 2560);
     let RenderResult { rgba: export_rgba, auto_ev } = base.render(adjustments.crop.as_ref(), export, adjustments);

@@ -1,6 +1,7 @@
 use crate::errors::{Error, Result};
 use crate::image::rawffi::Raw;
-use crate::image::types::{DecodedRaw, Size};
+use crate::image::types::{DecodedRaw, PhotoMeta, Size};
+use exif::{In, Tag, Value};
 use image::ImageDecoder;
 
 /// Decode JPEG/PNG to sRGB RGBA8 at full resolution (JPEG base), applying the
@@ -9,7 +10,9 @@ use image::ImageDecoder;
 /// so we must use `ImageReader` + `into_decoder().orientation()`.
 /// `image` crate output is already sRGB; photoup keeps JPEGs in sRGB space and
 /// applies exposure/WB/rolloff at render time.
-pub fn decode_jpeg(data: &[u8]) -> Result<(Size, Vec<u8>)> {
+///
+/// Also returns the EXIF capture metadata for the editor's Image section.
+pub fn decode_jpeg(data: &[u8]) -> Result<(Size, Vec<u8>, PhotoMeta)> {
     let reader = image::ImageReader::new(std::io::Cursor::new(data));
     let mut decoder = reader
         .with_guessed_format()
@@ -31,12 +34,127 @@ pub fn decode_jpeg(data: &[u8]) -> Result<(Size, Vec<u8>)> {
             height: h,
         },
         raw,
+        exif_meta(data),
     ))
 }
 
-/// Decode a camera RAW (NEF/CR2) to LINEAR float RGB (camera WB, sRGB primaries).
-/// Mirrors photoup `decodeRaw` options exactly. `half_size` keeps interactive
-/// decodes small; exports pass `false` and get full resolution.
+/// Read EXIF capture metadata from a JPEG/PNG container. Missing or
+/// malformed EXIF is not an error — a stripped JPEG is a normal photo, so this
+/// returns an all-`None` `PhotoMeta` rather than failing the decode.
+pub fn exif_meta(data: &[u8]) -> PhotoMeta {
+    let mut cursor = std::io::Cursor::new(data);
+    let Ok(exif) = exif::Reader::new().read_from_container(&mut cursor) else {
+        return PhotoMeta::default();
+    };
+    let ascii = |tag: Tag| -> String {
+        exif.get_field(tag, In::PRIMARY)
+            .and_then(|f| match &f.value {
+                Value::Ascii(v) => v.first().map(|b| {
+                    String::from_utf8_lossy(b.as_slice()).trim().to_string()
+                }),
+                _ => None,
+            })
+            .unwrap_or_default()
+    };
+    // Rationals (exposure time, f-number) and integers (ISO) both come back as
+    // "unknown" from the container in different ways; a 0 denominator or a 0
+    // value is treated as absent by `PhotoMeta::from_parts`.
+    let rational = |tag: Tag| -> f32 {
+        exif.get_field(tag, In::PRIMARY)
+            .and_then(|f| match f.value {
+                Value::Rational(ref v) => v.first().map(|r| {
+                    if r.denom == 0 {
+                        0.0
+                    } else {
+                        r.num as f32 / r.denom as f32
+                    }
+                }),
+                _ => None,
+            })
+            .unwrap_or(0.0)
+    };
+    let integer = |tag: Tag| -> f32 {
+        exif.get_field(tag, In::PRIMARY)
+            .and_then(|f| match f.value {
+                Value::Short(ref v) => v.first().map(|x| *x as f32),
+                Value::Long(ref v) => v.first().map(|x| *x as f32),
+                Value::Rational(ref v) => v.first().map(|r| {
+                    if r.denom == 0 {
+                        0.0
+                    } else {
+                        r.num as f32 / r.denom as f32
+                    }
+                }),
+                _ => None,
+            })
+            .unwrap_or(0.0)
+    };
+    // EXIF stores DateTimeOriginal as "YYYY:MM:DD HH:MM:SS"; show it with ISO
+    // date separators so it doesn't read as a time.
+    let date = {
+        let raw = ascii(Tag::DateTimeOriginal);
+        let raw = if raw.is_empty() { ascii(Tag::DateTime) } else { raw };
+        if raw.len() >= 10 && raw.as_bytes().get(4) == Some(&b':') {
+            Some(format!("{}-{}{}", &raw[0..4], &raw[5..7], &raw[7..]))
+        } else if raw.is_empty() {
+            None
+        } else {
+            Some(raw)
+        }
+    };
+    PhotoMeta::from_parts(
+        &ascii(Tag::Make),
+        &ascii(Tag::Model),
+        &ascii(Tag::LensModel),
+        rational(Tag::ExposureTime),
+        rational(Tag::FNumber),
+        // EXIF 2.2 called tag 0x8827 `ISOSpeedRatings`, EXIF 2.3 renamed it
+        // `PhotographicSensitivity` — same tag id, so one reader covers both and
+        // every camera's ISO lands here.
+        integer(Tag::PhotographicSensitivity),
+        date,
+    )
+}
+
+/// Extensions decoded as camera RAW through LibRaw. DNG is a TIFF-based RAW
+/// container (Adobe conversions, phone/camera DNGs such as the Canon PowerShot
+/// SX120 IS files in `./samples/`); LibRaw develops it like any other RAW, so it
+/// belongs with NEF/CR2 rather than with the `image`-crate JPEG/PNG path.
+pub const RAW_EXTS: [&str; 3] = ["nef", "cr2", "dng"];
+
+/// Is `ext` (no leading dot, any case) a camera RAW we develop with LibRaw?
+/// Single source of truth — `IMAGE_EXTS`, the source-type badge, the grid, and
+/// the sample-file filters all route through this so adding a RAW format cannot
+/// be picked up in one path and missed in another.
+pub fn is_raw_ext(ext: &str) -> bool {
+    RAW_EXTS.contains(&ext.to_ascii_lowercase().as_str())
+}
+
+/// Sample photos for the RAW/dev tests: the local `./samples/` (gitignored) and
+/// a sibling photoup checkout, filtered to `exts` (case-insensitive). Shared so
+/// every test sees the same sample set.
+#[cfg(test)]
+fn sample_files(exts: &[&str]) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    for dir in ["samples", "../photoup/samples"] {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                    if exts.iter().any(|x| ext.eq_ignore_ascii_case(x)) {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Decode a camera RAW (NEF/CR2/DNG) to LINEAR float RGB (camera WB, sRGB
+/// primaries). Mirrors photoup `decodeRaw` options exactly. `half_size` keeps
+/// interactive decodes small; exports pass `false` and get full resolution.
 pub fn decode_raw(data: &[u8], opts: &RawDecodeOpts) -> Result<DecodedRaw> {
     let mut raw = Raw::new()?;
     {
@@ -89,29 +207,15 @@ pub struct RawDecodeOpts {
 mod raw_tests {
     use super::*;
 
-    /// Decode a sample NEF/CR2 if one exists locally. Sample photos are never committed.
+    /// Decode a sample NEF/CR2/DNG if one exists locally. Sample photos are never committed.
     fn sample() -> Option<std::path::PathBuf> {
-        for dir in ["samples", "../photoup/samples"] {
-            let d = std::path::Path::new(dir);
-            if let Ok(rd) = std::fs::read_dir(d) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if matches!(
-                        p.extension().and_then(|s| s.to_str()),
-                        Some("NEF") | Some("nef") | Some("CR2") | Some("cr2")
-                    ) {
-                        return Some(p);
-                    }
-                }
-            }
-        }
-        None
+        super::sample_files(&super::RAW_EXTS).into_iter().next()
     }
 
     #[test]
     fn decodes_real_raw_if_sample_present() {
         let Some(path) = sample() else {
-            eprintln!("skipping: no NEF/CR2 sample found");
+            eprintln!("skipping: no NEF/CR2/DNG sample found");
             return;
         };
         let data = std::fs::read(&path).expect("read sample");
@@ -152,21 +256,7 @@ mod tests {
         use crate::image::process::{Base, RawBase};
         use crate::image::srgb::{auto_wb, wb_from_pick};
 
-        let mut files = Vec::new();
-        for dir in ["samples", "../photoup/samples"] {
-            if let Ok(rd) = std::fs::read_dir(dir) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if matches!(
-                        p.extension().and_then(|s| s.to_str()),
-                        Some("NEF") | Some("nef") | Some("CR2") | Some("cr2")
-                    ) {
-                        files.push(p);
-                    }
-                }
-            }
-        }
-        files.sort();
+        let files = sample_files(&RAW_EXTS);
         println!("[wb-debug] {} RAW sample(s)", files.len());
         for path in &files {
             let Ok(data) = std::fs::read(path) else { continue };
@@ -262,21 +352,7 @@ mod tests {
         use crate::image::srgb::wb_from_pick;
         use crate::image::types::Adjustments;
 
-        let mut files = Vec::new();
-        for dir in ["samples", "../photoup/samples"] {
-            if let Ok(rd) = std::fs::read_dir(dir) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if matches!(
-                        p.extension().and_then(|s| s.to_str()),
-                        Some("NEF") | Some("nef") | Some("CR2") | Some("cr2")
-                    ) {
-                        files.push(p);
-                    }
-                }
-            }
-        }
-        files.sort();
+        let files = sample_files(&RAW_EXTS);
         let outdir = std::path::Path::new("out").join("wb_before_after");
         std::fs::create_dir_all(&outdir).ok();
         for path in files {
@@ -359,7 +435,7 @@ mod tests {
     /// Diagnostic: render every sample in Manual0 / Auto / Burn at preview
     /// (1024) and export (2560) edge, print rendered-luminance percentiles and
     /// clip %, and the preview-vs-export tone diff at matched scale. Dumps the
-    /// 1024 renders to out/ev_curves/ for visual (VLM) inspection. Run with
+    /// 1024 renders to out/ev_curves/ for visual inspection. Run with
     /// `PHOTOUP2_DEBUG_CURVES=1 cargo test --lib ev_debug_curves -- --nocapture`.
     #[test]
     fn ev_debug_curves() {
@@ -399,20 +475,7 @@ mod tests {
             )
         }
 
-        let mut files = Vec::new();
-        for dir in ["samples", "../photoup/samples"] {
-            if let Ok(rd) = std::fs::read_dir(dir) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-                        if matches!(ext, "JPG" | "jpg" | "jpeg" | "NEF" | "nef" | "CR2" | "cr2") {
-                            files.push(p);
-                        }
-                    }
-                }
-            }
-        }
-        files.sort();
+        let files = sample_files(&["jpg", "jpeg", "nef", "cr2", "dng"]);
         let outdir = std::path::Path::new("out").join("ev_curves");
         std::fs::create_dir_all(&outdir).ok();
 
@@ -428,7 +491,7 @@ mod tests {
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_lowercase();
-            let is_raw = matches!(ext.as_str(), "nef" | "cr2");
+            let is_raw = is_raw_ext(&ext);
             let base: std::sync::Arc<dyn Base> = if is_raw {
                 let Ok(decoded) =
                     decode_raw(&data, &RawDecodeOpts { full_size: false, user_mul: None })
@@ -437,7 +500,7 @@ mod tests {
                 };
                 std::sync::Arc::new(RawBase::new(decoded))
             } else {
-                let Ok((size, rgba)) = decode_jpeg(&data) else { continue };
+                let Ok((size, rgba, _)) = decode_jpeg(&data) else { continue };
                 std::sync::Arc::new(JpegBase::new(size.width, size.height, rgba))
             };
             println!(
@@ -504,7 +567,7 @@ mod tests {
     #[test]
     fn decodes_png_dimensions_and_pixels() {
         let png = make_png_png(8, 8);
-        let (size, rgba) = decode_jpeg(&png).expect("decode");
+        let (size, rgba, _) = decode_jpeg(&png).expect("decode");
         assert_eq!(
             size,
             Size {

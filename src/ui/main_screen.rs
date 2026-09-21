@@ -69,7 +69,9 @@ impl MainScreen {
         zone_box.set_margin_bottom(16);
         let z1 = Label::new(Some("Upload photos"));
         z1.add_css_class("title-3");
-        let z2 = Label::new(Some("Drop JPEG / PNG / NEF / CR2 here, or press Ctrl+V to paste"));
+        let z2 = Label::new(Some(
+            "Drop JPEG / PNG / NEF / CR2 / DNG here, or press Ctrl+V to paste",
+        ));
         z2.add_css_class("dim-label");
         zone_box.append(&z1);
         zone_box.append(&z2);

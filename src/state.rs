@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use crate::image::types::{Adjustments, SourceType};
+use crate::image::types::{Adjustments, PhotoMeta, SourceType};
 
 /// State is only ever mutated through `reduce(state, event)` on the GTK main thread.
 #[derive(Debug, Default)]
@@ -45,6 +45,9 @@ pub struct PhotoState {
     /// Source dimensions at decode time (JPEG: native file size; RAW: decoded,
     /// half-resolution size). Used by the editor's Image section + crop presets.
     pub full_size: Option<(u32, u32)>,
+    /// EXIF capture metadata (camera/lens/exposure/date), filled by the thumb
+    /// decode and shown in the editor's Image section.
+    pub meta: PhotoMeta,
     pub thumb: Option<Vec<u8>>, // RGBA8 preview, ≤512 edge
     pub thumb_size: Option<(u32, u32)>,
     pub histogram: Option<Vec<u32>>,
@@ -73,7 +76,10 @@ pub struct UsageStats {
 pub enum AppEvent {
     Auth(AuthEvent),
     PhotosAdded(Vec<PhotoState>),
-    PhotoThumbReady { id: u64, rgba: Vec<u8>, size: (u32, u32), full: (u32, u32), auto_ev: f32, histogram: Vec<u32> },
+    /// `meta` is `Some` only on the decode path — render-only jobs pass `None` so
+    /// a slider edit cannot wipe the EXIF lines the thumb decode already filled
+    /// (same convention as the camera matrix on `PreviewReady`).
+    PhotoThumbReady { id: u64, rgba: Vec<u8>, size: (u32, u32), full: (u32, u32), auto_ev: f32, histogram: Vec<u32>, meta: Option<PhotoMeta> },
     PhotoFailed { id: u64, msg: String },
     PhotoEdit { id: u64, adjustments: Adjustments },
     PhotoSelected { id: u64, selected: bool },
@@ -114,13 +120,16 @@ pub fn reduce(state: &mut AppState, event: AppEvent) {
             state.usage.queued += photos.len();
             state.photos.extend(photos);
         }
-        AppEvent::PhotoThumbReady { id, rgba, size, full, auto_ev, histogram } => {
+        AppEvent::PhotoThumbReady { id, rgba, size, full, auto_ev, histogram, meta } => {
             if let Some(p) = state.photos.iter_mut().find(|p| p.id == id) {
                 p.thumb = Some(rgba);
                 p.thumb_size = Some(size);
                 p.full_size = Some(full);
                 p.auto_ev = auto_ev;
                 p.histogram = Some(histogram);
+                if let Some(m) = meta {
+                    p.meta = m;
+                }
                 p.status = PhotoStatus::Ready;
             }
         }
@@ -223,6 +232,7 @@ mod tests {
             adjustments: Adjustments::default(),
             auto_ev: 0.0,
             full_size: None,
+            meta: PhotoMeta::default(),
             thumb: None,
             thumb_size: None,
             histogram: None,
@@ -231,7 +241,7 @@ mod tests {
         };
         reduce(&mut s, AppEvent::PhotosAdded(vec![p]));
         assert_eq!(s.photos.len(), 1);
-        reduce(&mut s, AppEvent::PhotoThumbReady { id: 1, rgba: vec![0u8; 4], size: (1, 1), full: (2048, 1024), auto_ev: 0.5, histogram: vec![0; 256] });
+        reduce(&mut s, AppEvent::PhotoThumbReady { id: 1, rgba: vec![0u8; 4], size: (1, 1), full: (2048, 1024), auto_ev: 0.5, histogram: vec![0; 256], meta: None });
         assert_eq!(s.photos[0].status, PhotoStatus::Ready);
         assert_eq!(s.photos[0].auto_ev, 0.5);
         assert_eq!(s.photos[0].full_size, Some((2048, 1024)));
@@ -242,7 +252,7 @@ mod tests {
         let mut s = AppState::default();
         s.photos.push(PhotoState {
             id: 3, path: PathBuf::from("/x"), source_type: SourceType::Jpeg,
-            adjustments: Adjustments::default(), auto_ev: 0.0, full_size: None, thumb: None, thumb_size: None,
+            adjustments: Adjustments::default(), auto_ev: 0.0, full_size: None, meta: PhotoMeta::default(), thumb: None, thumb_size: None,
             histogram: None, status: PhotoStatus::Processing, selected: true,
         });
         reduce(&mut s, AppEvent::PhotoFailed { id: 3, msg: "decode boom".into() });
@@ -254,12 +264,12 @@ mod tests {
         let mut s = AppState::default();
         s.photos.push(PhotoState {
             id: 1, path: PathBuf::from("/x/ok.jpg"), source_type: SourceType::Jpeg,
-            adjustments: Adjustments::default(), auto_ev: 0.0, full_size: None, thumb: None, thumb_size: None,
+            adjustments: Adjustments::default(), auto_ev: 0.0, full_size: None, meta: PhotoMeta::default(), thumb: None, thumb_size: None,
             histogram: None, status: PhotoStatus::Ready, selected: true,
         });
         s.photos.push(PhotoState {
             id: 2, path: PathBuf::from("/x/bad.jpg"), source_type: SourceType::Jpeg,
-            adjustments: Adjustments::default(), auto_ev: 0.0, full_size: None, thumb: None, thumb_size: None,
+            adjustments: Adjustments::default(), auto_ev: 0.0, full_size: None, meta: PhotoMeta::default(), thumb: None, thumb_size: None,
             histogram: None, status: PhotoStatus::Error("boom".into()), selected: true,
         });
         reduce(&mut s, AppEvent::SendFinished(Ok(())));
@@ -274,7 +284,7 @@ mod tests {
         let mut s = AppState::default();
         s.photos.push(PhotoState {
             id: 7, path: PathBuf::from("/x"), source_type: SourceType::Jpeg,
-            adjustments: Adjustments::default(), auto_ev: 0.0, full_size: None, thumb: None, thumb_size: None,
+            adjustments: Adjustments::default(), auto_ev: 0.0, full_size: None, meta: PhotoMeta::default(), thumb: None, thumb_size: None,
             histogram: None, status: PhotoStatus::Ready, selected: true,
         });
         let mut adj = Adjustments::default();
@@ -290,7 +300,7 @@ mod tests {
         for (id, selected) in [(1, true), (2, true), (3, false)] {
             s.photos.push(PhotoState {
                 id, path: PathBuf::from("/x"), source_type: SourceType::Jpeg,
-                adjustments: Adjustments::default(), auto_ev: 0.0, full_size: None, thumb: None, thumb_size: None,
+                adjustments: Adjustments::default(), auto_ev: 0.0, full_size: None, meta: PhotoMeta::default(), thumb: None, thumb_size: None,
                 histogram: None, status: PhotoStatus::Ready, selected,
             });
         }

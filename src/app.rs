@@ -23,7 +23,7 @@ use crate::image::process::{
     rotate_dims,
 };
 use crate::image::srgb::export_wb_mul;
-use crate::image::types::{Adjustments, ExposureMode, Size, SourceType};
+use crate::image::types::{Adjustments, ExposureMode, PhotoMeta, Size, SourceType};
 use crate::state::{
     AppEvent, AppState, AuthEvent, AuthStatus, PhotoState, PhotoStatus, UsageStats, reduce,
 };
@@ -35,7 +35,8 @@ use crate::ui::main_screen::MainScreen;
 use crate::ui::toast::Toast;
 
 // Editor preview: live slider edits render at LIVE_EDGE (512px — snappy), then
-// upgrade to the sharp FINAL_EDGE (1024px) once the edit settles (~400ms idle).
+// upgrade to the sharp FINAL_EDGE (1024px) once the edit settles
+// (PREVIEW_DEBOUNCE_MS of quiet).
 const LIVE_EDGE: u32 = 512;
 const FINAL_EDGE: u32 = 1024;
 /// Longest edge of an export render (Telegram photo size cap).
@@ -47,8 +48,10 @@ const WB_SAMPLE_EDGE: u32 = 96;
 const PREVIEW_DEBOUNCE_MS: u64 = 150;
 /// Image extensions the upload zone accepts (drag-drop, Ctrl+V paste, and the
 /// file picker filter all funnel through this). photoup's `UploadZone` accepts
-/// `image/*` plus NEF/CR2; we pin the five the picker advertises.
-const IMAGE_EXTS: [&str; 5] = ["jpg", "jpeg", "png", "nef", "cr2"];
+/// `image/*` plus RAW; we pin the six the picker advertises. The RAW ones must
+/// stay in sync with `image::decode::RAW_EXTS` — `raw_exts_are_accepted_photos`
+/// enforces that.
+const IMAGE_EXTS: [&str; 6] = ["jpg", "jpeg", "png", "nef", "cr2", "dng"];
 
 /// Is `path` a photo we accept? Extension-only check, case-insensitive
 /// (photoup UploadZone `isPhoto`).
@@ -57,6 +60,16 @@ pub fn is_image_path(path: &Path) -> bool {
         .and_then(|s| s.to_str())
         .map(|s| IMAGE_EXTS.contains(&s.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+/// Which decoder a path gets: RAW formats (NEF/CR2/DNG) go through LibRaw, and
+/// everything else through the `image`-crate JPEG/PNG path. Drives both the
+/// decode dispatch and the grid's RAW/JPG badge.
+pub fn source_type_for(path: &Path) -> SourceType {
+    match path.extension().and_then(|s| s.to_str()) {
+        Some(e) if crate::image::decode::is_raw_ext(e) => SourceType::Raw,
+        _ => SourceType::Jpeg,
+    }
 }
 
 /// Keep only accepted photo paths. The drag-drop and Ctrl+V paste handlers funnel
@@ -75,6 +88,8 @@ pub enum UiEvent {
         auto_ev: f32,
         histogram: Vec<u32>,
         cam_mul: Option<[f32; 4]>,
+        /// EXIF capture metadata read during this decode, forwarded to state.
+        meta: PhotoMeta,
     },
     PreviewReady {
         id: u64,
@@ -731,6 +746,7 @@ impl AppController {
                 auto_ev,
                 histogram,
                 cam_mul,
+                meta,
             } => {
                 self.cam_mul.insert(id, cam_mul);
                 let e = AppEvent::PhotoThumbReady {
@@ -740,6 +756,7 @@ impl AppController {
                     full,
                     auto_ev,
                     histogram: histogram.clone(),
+                    meta: Some(meta.clone()),
                 };
                 reduce(&mut *self.state.write().unwrap(), e);
                 if let Some(row) = self.row_map.get(&id) {
@@ -764,6 +781,9 @@ impl AppController {
                 };
                 if is_active {
                     self.editor.set_ev(self.effective_ev_for(id, auto_ev));
+                    // The editor may have opened before this photo finished its
+                    // first decode, so the Image section's EXIF lines land here.
+                    self.editor.set_meta(&meta);
                 }
             }
             UiEvent::PreviewReady {
@@ -796,6 +816,7 @@ impl AppController {
                     full,
                     auto_ev,
                     histogram: histogram.clone(),
+                    meta: None, // render-only: keep the metadata from the decode
                 };
                 reduce(&mut *self.state.write().unwrap(), e);
                 let idx = self.index_of(id);
@@ -1172,12 +1193,7 @@ impl AppController {
     pub fn add_photo(&mut self, path: PathBuf) {
         let id = self.next_photo_id;
         self.next_photo_id += 1;
-        let source_type = match path.extension().and_then(|s| s.to_str()) {
-            Some(e) if e.eq_ignore_ascii_case("nef") || e.eq_ignore_ascii_case("cr2") => {
-                SourceType::Raw
-            }
-            _ => SourceType::Jpeg,
-        };
+        let source_type = source_type_for(&path);
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
         log::info!("photo added: id={id} {name} ({source_type:?})");
         let photo = PhotoState {
@@ -1187,6 +1203,7 @@ impl AppController {
             adjustments: Adjustments::default(),
             auto_ev: 0.0,
             full_size: None,
+            meta: PhotoMeta::default(),
             thumb: None,
             thumb_size: None,
             histogram: None,
@@ -1223,7 +1240,7 @@ impl AppController {
             }))
             .unwrap_or_else(|_| Err("thumbnail job panicked".to_string()));
             let _ = tx.send(match result {
-                Ok((rgba, size, full, auto_ev, hist, cam)) => UiEvent::ThumbReady {
+                Ok((rgba, size, full, auto_ev, hist, cam, meta)) => UiEvent::ThumbReady {
                     id,
                     rgba,
                     size,
@@ -1231,6 +1248,7 @@ impl AppController {
                     auto_ev,
                     histogram: hist,
                     cam_mul: cam,
+                    meta,
                 },
                 Err(msg) => UiEvent::JobFailed { id, msg },
             });
@@ -2038,33 +2056,39 @@ fn shown_ev(p: &PhotoState) -> f32 {
     }
 }
 
-/// Decode a file into a renderable base. For RAW, returns the camera as-shot WB
-/// multipliers (so exports can bake `export_wb_mul` into libraw's user_mul) and
-/// the camera→sRGB color matrix (so the editor's WB Auto/Pick can neutralize a
-/// picked pixel through the matrix). JPEG has neither (both `None`).
+/// A decoded photo: the renderable base plus everything the editor needs
+/// alongside the pixels.
+struct DecodedBase {
+    base: Box<dyn Base>,
+    /// Full developed dimensions (RAW interactive decodes are half-size, so this
+    /// is the doubled geometry, not the buffer's).
+    developed: (u32, u32),
+    /// Camera as-shot WB multipliers, so exports can bake `export_wb_mul` into
+    /// libraw's `user_mul`. `None` for JPEG.
+    cam_mul: Option<[f32; 4]>,
+    /// Camera→sRGB matrix, so the editor's WB Auto/Pick can neutralize a picked
+    /// pixel through the matrix. `None` for JPEG.
+    cam_matrix: Option<[[f32; 4]; 3]>,
+    meta: PhotoMeta,
+}
+
+/// Decode a file into a renderable base plus its camera metadata.
 fn decode_base(
     data: &[u8],
     source_type: SourceType,
     full_size: bool,
     user_mul: Option<[f32; 4]>,
-) -> Result<
-    (
-        Box<dyn Base>,
-        (u32, u32),
-        Option<[f32; 4]>,
-        Option<[[f32; 4]; 3]>,
-    ),
-    String,
-> {
+) -> Result<DecodedBase, String> {
     match source_type {
         SourceType::Jpeg => {
-            let (size, rgba) = decode_jpeg(data).map_err(|e| e.to_string())?;
-            Ok((
-                Box::new(JpegBase::new(size.width, size.height, rgba)),
-                (size.width, size.height),
-                None,
-                None,
-            ))
+            let (size, rgba, meta) = decode_jpeg(data).map_err(|e| e.to_string())?;
+            Ok(DecodedBase {
+                base: Box::new(JpegBase::new(size.width, size.height, rgba)),
+                developed: (size.width, size.height),
+                cam_mul: None,
+                cam_matrix: None,
+                meta,
+            })
         }
         SourceType::Raw => {
             let dr = decode_raw(
@@ -2078,7 +2102,15 @@ fn decode_base(
             let cam = dr.cam_mul;
             let cam_matrix = dr.cam_matrix;
             let developed = (dr.developed_size.width, dr.developed_size.height);
-            Ok((Box::new(RawBase::new(dr)), developed, cam, cam_matrix))
+            // `dr` is consumed by RawBase; take the metadata first.
+            let meta = dr.meta.clone();
+            Ok(DecodedBase {
+                base: Box::new(RawBase::new(dr)),
+                developed,
+                cam_mul: cam,
+                cam_matrix,
+                meta,
+            })
         }
     }
 }
@@ -2097,14 +2129,17 @@ fn run_thumb_job(
         f32,
         Vec<u32>,
         Option<[f32; 4]>,
+        PhotoMeta,
     ),
     String,
 > {
     let t0 = std::time::Instant::now();
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     let t_read = t0.elapsed();
-    let (base, full, cam, _cam_matrix) = decode_base(&data, source_type, false, None)?;
+    let decoded = decode_base(&data, source_type, false, None)?;
     let t_decode = t0.elapsed();
+    let (base, full, cam) = (decoded.base, decoded.developed, decoded.cam_mul);
+    let meta = decoded.meta;
     let (w, h) = fit_within(base.width(), base.height(), 512);
     let r = base.render(
         None,
@@ -2124,7 +2159,7 @@ fn run_thumb_job(
         t_render.as_secs_f64(),
         t_render.as_secs_f64()
     );
-    Ok((r.rgba, (w, h), full, r.auto_ev, hist, cam))
+    Ok((r.rgba, (w, h), full, r.auto_ev, hist, cam, meta))
 }
 
 /// Decode + render a ≤1024 preview with the photo's current adjustments. Also
@@ -2155,7 +2190,9 @@ fn run_preview_job(
 > {
     let t0 = std::time::Instant::now();
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
-    let (base, developed_full, cam, cam_matrix) = decode_base(&data, source_type, false, None)?;
+    let decoded = decode_base(&data, source_type, false, None)?;
+    let (base, developed_full, cam, cam_matrix) =
+        (decoded.base, decoded.developed, decoded.cam_mul, decoded.cam_matrix);
     let t_decode = t0.elapsed();
     // The preview renders in DISPLAY space: `full` carries the rotated dims and
     // the target size is aspect-matched to them; the base itself stays unrotated
@@ -2312,7 +2349,7 @@ fn run_export_job(
         SourceType::Raw => cam_mul.map(|m| export_wb_mul(m, adjustments)),
         SourceType::Jpeg => None,
     };
-    let (base, _, _, _) = decode_base(&data, source_type, true, user_mul)?;
+    let base = decode_base(&data, source_type, true, user_mul)?.base;
     let t_decode = t0.elapsed();
     // Crop state is unrotated source space. Size it there first, then rotate the
     // output dimensions for the display/export orientation.
@@ -2364,7 +2401,6 @@ fn run_export_job(
 mod tests {
     use super::*;
     use crate::image::types::ExposureMode;
-    use gtk4::prelude::*;
     use image::ImageEncoder;
 
     #[test]
@@ -2375,6 +2411,7 @@ mod tests {
         for p in [
             "/x/DSC_4858.NEF",
             "/x/IMG_7833.CR2",
+            "/x/CRW_0463.DNG",
             "/x/a.JPG",
             "/x/b.PNG",
             "/x/c.nef",
@@ -2404,7 +2441,7 @@ mod tests {
     #[test]
     fn thumb_job_renders_small_preview() {
         let path = make_jpeg_file(2048, 1024);
-        let (rgba, size, full, _ev, hist, cam) = run_thumb_job(&path, SourceType::Jpeg).unwrap();
+        let (rgba, size, full, _ev, hist, cam, meta) = run_thumb_job(&path, SourceType::Jpeg).unwrap();
         assert!(size.0 <= 512 && size.1 <= 512, "size {size:?}");
         assert_eq!(rgba.len(), (size.0 * size.1 * 4) as usize);
         // RGB histogram: 768 bins, and every pixel lands in R, G, AND B → 3×.
@@ -2412,6 +2449,8 @@ mod tests {
         assert_eq!(hist.iter().sum::<u32>(), size.0 * size.1 * 3);
         assert_eq!(cam, None);
         assert_eq!(full, (2048, 1024), "JPEG reports native dims");
+        // A synthetic JPEG carries no EXIF, so the metadata is empty (not an error).
+        assert!(meta.is_empty());
     }
 
     #[test]
@@ -2476,9 +2515,42 @@ mod tests {
 
     #[test]
     fn image_extension_filter_accepts_supported_types() {
-        for name in ["a.jpg", "a.jpeg", "a.JPG", "a.PnG", "A.NEF", "b.cr2"] {
+        for name in [
+            "a.jpg", "a.jpeg", "a.JPG", "a.PnG", "A.NEF", "b.cr2", "c.DNG", "d.dng",
+        ] {
             assert!(is_image_path(Path::new(name)), "{name} should be accepted");
         }
+    }
+
+    /// Every RAW extension must also be an accepted photo, and must be classified
+    /// as RAW (not JPEG) for the decode dispatch + the grid badge. Without this a
+    /// new RAW format can be decodable yet unreachable, or silently fed to the
+    /// JPEG decoder — exactly the state DNG was in.
+    #[test]
+    fn raw_exts_are_accepted_photos() {
+        use crate::image::decode::{RAW_EXTS, is_raw_ext};
+        for ext in RAW_EXTS {
+            assert!(
+                IMAGE_EXTS.contains(&ext),
+                "RAW ext {ext} missing from IMAGE_EXTS"
+            );
+            assert!(is_raw_ext(ext), "{ext} must classify as RAW");
+            assert!(
+                is_raw_ext(&ext.to_ascii_uppercase()),
+                "{ext} must classify as RAW in any case"
+            );
+            assert!(!is_raw_ext("jpg"), "jpg is not RAW");
+            assert!(!is_raw_ext("png"), "png is not RAW");
+        }
+    }
+
+    /// A DNG source must dispatch to the RAW path, not the JPEG one.
+    #[test]
+    fn dng_is_classified_as_raw() {
+        assert_eq!(source_type_for(Path::new("/x/CRW_0463.DNG")), SourceType::Raw);
+        assert_eq!(source_type_for(Path::new("/x/a.nef")), SourceType::Raw);
+        assert_eq!(source_type_for(Path::new("/x/a.cr2")), SourceType::Raw);
+        assert_eq!(source_type_for(Path::new("/x/a.jpg")), SourceType::Jpeg);
     }
 
     #[test]
@@ -2508,13 +2580,14 @@ mod tests {
             PathBuf::from("/tmp/c.NEF"),
             PathBuf::from("/tmp/no_ext"),
             PathBuf::from("/tmp/d.png"),
+            PathBuf::from("/tmp/e.DNG"),
         ];
         let kept = filter_photo_paths(mixed);
         let names: Vec<&str> = kept
             .iter()
             .filter_map(|p| p.file_name().and_then(|s| s.to_str()))
             .collect();
-        assert_eq!(names, ["a.jpg", "c.NEF", "d.png"]);
+        assert_eq!(names, ["a.jpg", "c.NEF", "d.png", "e.DNG"]);
     }
 
     #[test]

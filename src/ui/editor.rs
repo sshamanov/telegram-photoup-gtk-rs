@@ -15,7 +15,7 @@ use gtk4::{Box as GBox, Button, DrawingArea, Label, Orientation, Picture};
 use crate::image::math::{clamp_crop, crop_to_pixels};
 use crate::image::process::export_dimensions;
 use crate::image::srgb::{auto_wb, wb_from_pick};
-use crate::image::types::{Adjustments, ExposureMode, NormalizedCrop};
+use crate::image::types::{Adjustments, ExposureMode, NormalizedCrop, PhotoMeta};
 use crate::state::{AppEvent, AppState};
 use crate::ui::slider::FineSlider;
 
@@ -926,6 +926,19 @@ fn rotate_handler(
     }
 }
 
+/// Arm/disarm the crosshair over the preview area. The picker is a modal-ish
+/// mode that changes what a click on the image does, so the image itself must
+/// say so — the amber button alone is off to the side of where the click lands.
+fn apply_picker_cursor(area: &DrawingArea, active: bool) {
+    if active {
+        if let Some(cursor) = gdk4::Cursor::from_name("crosshair", None) {
+            area.set_cursor(Some(&cursor));
+        }
+    } else {
+        area.set_cursor(None);
+    }
+}
+
 pub struct EditorScreen {
     pub root: GBox,
     pub preview: Picture,
@@ -942,6 +955,9 @@ pub struct EditorScreen {
     wb_value: Label,
     info1: Label,
     info2: Label,
+    /// The Image section's four EXIF lines (camera, lens, exposure, date), in
+    /// that order.
+    meta_lines: Vec<Label>,
     auto_exposure_btn: Button,
     burn_exposure_btn: Button,
     rest_exposure_btn: Button,
@@ -1163,6 +1179,18 @@ impl EditorScreen {
         // ---- Image ----
         panel.append(&section_label("Image"));
         let info = GBox::new(Orientation::Vertical, 2);
+        // EXIF capture metadata: camera, lens, `shutter · aperture · ISO`, date.
+        // A line the file does not carry (stripped/synthetic JPEG) is hidden
+        // rather than left blank, so the section starts straight at the type line.
+        let mut meta_lines: Vec<Label> = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let l = Label::new(None);
+            l.add_css_class("editor-value");
+            l.set_halign(gtk4::Align::Start);
+            l.set_visible(false);
+            info.append(&l);
+            meta_lines.push(l);
+        }
         let info1 = Label::new(Some(""));
         info1.add_css_class("editor-value");
         info1.set_halign(gtk4::Align::Start);
@@ -1188,7 +1216,8 @@ impl EditorScreen {
         right_col.set_margin_start(4);
         right_col.append(&panel_scroll);
 
-        // Hint (crop-interaction hint; crop drag is deferred in the port).
+        // Hint for the crop overlay, which is live: handles resize, the inside
+        // moves, Shift keeps the ratio (`crop_area`'s drag handler).
         let hint = Label::new(Some(
             "Drag handles to resize · drag inside to move · Shift keeps ratio",
         ));
@@ -1245,6 +1274,7 @@ impl EditorScreen {
             wb_value,
             info1,
             info2,
+            meta_lines,
             auto_exposure_btn,
             burn_exposure_btn,
             rest_exposure_btn,
@@ -1311,6 +1341,7 @@ impl EditorScreen {
         self.cam_matrix.borrow_mut().take();
         self.picker_active.set(false);
         self.picker_wb_btn.remove_css_class("suggested-action");
+        apply_picker_cursor(&self.crop_area, false);
         self.crop_area.queue_draw();
         self.file_label.set_text(name);
         self.file_label.set_tooltip_text(Some(name));
@@ -1320,6 +1351,22 @@ impl EditorScreen {
         self.suppress.set(false);
         self.refresh_value_labels();
         self.refresh_image_info();
+    }
+
+    /// Fill the Image section's EXIF lines from the photo's capture metadata.
+    /// Lines with nothing to show are hidden — a JPEG whose EXIF was stripped
+    /// (or a synthetic one) must not leave four blank rows behind.
+    pub fn set_meta(&self, meta: &PhotoMeta) {
+        let lines = [
+            meta.camera.clone().unwrap_or_default(),
+            meta.lens.clone().unwrap_or_default(),
+            meta.exposure_line().unwrap_or_default(),
+            meta.date.clone().unwrap_or_default(),
+        ];
+        for (label, text) in self.meta_lines.iter().zip(lines) {
+            label.set_text(&text);
+            label.set_visible(!text.is_empty());
+        }
     }
 
     pub fn set_preview(&self, texture: Option<&gdk4::Texture>) {
@@ -1489,6 +1536,16 @@ impl EditorScreen {
         match (self.full_size.get(), self.active_id.get()) {
             (Some(full), Some(id)) => {
                 let src = if self.is_raw.get() { "RAW" } else { "JPEG" };
+                let meta = self
+                    .state
+                    .read()
+                    .unwrap()
+                    .photos
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| p.meta.clone())
+                    .unwrap_or_default();
+                self.set_meta(&meta);
                 self.info1
                     .set_text(&format!("{src} · {} × {}", full.0, full.1));
                 let adj = current_adjustments(&self.state.read().unwrap(), id);
@@ -1498,6 +1555,7 @@ impl EditorScreen {
                 ));
             }
             _ => {
+                self.set_meta(&PhotoMeta::default());
                 self.info1.set_text("");
                 self.info2.set_text("");
             }
@@ -1958,9 +2016,11 @@ impl EditorScreen {
         // edits while ordinary preview clicks are used for cropping/navigation.
         let picker_active = Rc::clone(&self.picker_active);
         let picker_button = self.picker_wb_btn.clone();
+        let picker_area = self.crop_area.clone();
         self.picker_wb_btn.connect_clicked(move |_| {
             let active = !picker_active.get();
             picker_active.set(active);
+            apply_picker_cursor(&picker_area, active);
             if active {
                 picker_button.add_css_class("suggested-action");
             } else {
@@ -2104,7 +2164,28 @@ fn section_label(text: &str) -> Label {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image::types::SourceType;
+    use crate::state::{PhotoState, PhotoStatus};
+    use std::path::PathBuf;
     use std::sync::Mutex;
+
+    /// A photo row carrying `meta`, for the Image-section assertions.
+    fn photo_with(id: u64, meta: PhotoMeta) -> PhotoState {
+        PhotoState {
+            id,
+            path: PathBuf::from("/x/photo.jpg"),
+            source_type: SourceType::Jpeg,
+            adjustments: Adjustments::default(),
+            auto_ev: 0.0,
+            full_size: None,
+            meta,
+            thumb: None,
+            thumb_size: None,
+            histogram: None,
+            status: PhotoStatus::Queued,
+            selected: true,
+        }
+    }
 
     fn linear_fill(w: u32, h: u32, rgb: [f32; 3]) -> Vec<f32> {
         let mut v = vec![0f32; (w * h * 3) as usize];
@@ -2326,6 +2407,91 @@ mod tests {
             adj.wb_offset
         );
         assert!((adj.hue - 0.002584).abs() < 1e-3, "hue {}", adj.hue);
+
+        // Image section: the EXIF lines come from the photo's metadata, and any
+        // line the file does not carry is hidden rather than left blank.
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let on_event: Arc<dyn Fn(AppEvent) + Send + Sync + 'static> = {
+            let events = Arc::clone(&events);
+            Arc::new(move |ev| events.lock().unwrap().push(ev))
+        };
+        let state = Arc::new(RwLock::new(AppState::default()));
+        state.write().unwrap().photos.push(photo_with(
+            11,
+            PhotoMeta::from_parts(
+                "NIKON CORPORATION",
+                "NIKON D810",
+                "NIKKOR 50mm f/1.8G",
+                0.002,
+                5.6,
+                400.0,
+                Some("2026-08-19 07:14:02".into()),
+            ),
+        ));
+        state
+            .write()
+            .unwrap()
+            .photos
+            .push(photo_with(12, PhotoMeta::default()));
+        let mut editor = EditorScreen::new(Arc::clone(&state), on_event);
+        editor.set_photo(
+            11,
+            "d810.jpg",
+            &Adjustments::default(),
+            0.0,
+            true,
+            Some((7360, 4912)),
+        );
+        let texts: Vec<String> = editor.meta_lines.iter().map(|l| l.text().to_string()).collect();
+        // Camera: the model already contains the make, so it is not repeated.
+        assert_eq!(texts[0], "NIKON D810");
+        assert_eq!(texts[1], "NIKKOR 50mm f/1.8G");
+        assert_eq!(texts[2], "1/500 · f/5.6 · ISO 400");
+        assert_eq!(texts[3], "2026-08-19 07:14:02");
+        assert!(editor.meta_lines.iter().all(|l| l.is_visible()));
+        // Opening a photo with no metadata clears the previous photo's lines.
+        editor.set_photo(
+            12,
+            "plain.jpg",
+            &Adjustments::default(),
+            0.0,
+            false,
+            Some((2048, 1024)),
+        );
+        assert!(editor.meta_lines.iter().all(|l| l.text().is_empty()));
+        assert!(editor.meta_lines.iter().all(|l| !l.is_visible()));
+
+        // Picker arms the crosshair over the preview (and only there, and only
+        // while armed), so the mode is visible where the click will land.
+        let (mut editor, _events) = test_editor();
+        editor.set_photo(
+            13,
+            "pick.jpg",
+            &Adjustments::default(),
+            0.0,
+            false,
+            Some((800, 600)),
+        );
+        assert!(editor.crop_area.cursor().is_none(), "no crosshair by default");
+        editor.picker_wb_btn.emit_clicked();
+        let armed = editor.crop_area.cursor().expect("picker arms a cursor");
+        assert_eq!(armed.name().as_deref(), Some("crosshair"));
+        assert!(editor.picker_active.get());
+        editor.picker_wb_btn.emit_clicked();
+        assert!(editor.crop_area.cursor().is_none(), "toggling off restores it");
+        // Switching photos disarms the picker, so the cursor goes with it.
+        editor.picker_wb_btn.emit_clicked();
+        assert!(editor.crop_area.cursor().is_some());
+        editor.set_photo(
+            14,
+            "other.jpg",
+            &Adjustments::default(),
+            0.0,
+            false,
+            Some((800, 600)),
+        );
+        assert!(!editor.picker_active.get());
+        assert!(editor.crop_area.cursor().is_none());
 
         // No wb sample → the handler must not emit anything or crash.
         let (mut editor, events) = test_editor();
