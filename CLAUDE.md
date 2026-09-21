@@ -150,6 +150,18 @@ Three Kingdoms threading (borrowed from mpd-client), all in one Rust crate
   `use_camera_wb` (or `user_mul`), `use_camera_matrix=1`, `output_color=1`
   (sRGB primaries + gamma), `output_bps=16`, `no_auto_bright=1`, `half_size`
   (interactive only; exports pass `full_size`), `user_qual=3`.
+- **Only the export bakes WB into libraw — the previews never do.** `run_export_job`
+  (`src/app.rs`) passes `user_mul = export_wb_mul(cam_mul, adjustments)` with
+  `use_camera_wb=0` and neutralizes `wb_offset`/`hue` for the render; thumbnails
+  and previews pass `user_mul: None` and decode with the camera WB. A defect in
+  `export_wb_mul` (`src/image/srgb.rs`) is therefore invisible in the grid and
+  the editor and shows up **only** in the file that reaches Telegram.
+  It must never return 0 for a channel: libraw leaves `cam_mul[3]` at 0 on a
+  three-colour sensor (the Canon PowerShot DNGs in `./samples/`), and passing
+  that through zeroes half the greens, which the camera matrix then drags R and
+  B down with — a black export with `auto_ev` pinned at +6.00. A missing channel
+  falls back to the green reference. `app::tests::raw_export_with_edits_is_not_black`
+  covers the whole path on a real DNG (skipped when no sample is present).
 - **Capture metadata (EXIF) for the editor's Image section** comes from two
   readers with one shared type (`PhotoMeta`, `src/image/types.rs`): RAW through
   LibRaw (`Raw::meta()`, `src/image/rawffi.rs`) and JPEG/PNG through
