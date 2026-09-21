@@ -973,7 +973,7 @@ pub struct EditorScreen {
     meta_lines: Vec<Label>,
     auto_exposure_btn: Button,
     burn_exposure_btn: Button,
-    rest_exposure_btn: Button,
+    reset_exposure_btn: Button,
     wb_auto_button: Button,
     wb_auto2_button: Button,
     reset_wb_btn: Button,
@@ -1119,8 +1119,8 @@ impl EditorScreen {
         let ev_row = GBox::new(Orientation::Horizontal, 6);
         let auto_exposure_btn = Button::with_label("Auto");
         let burn_exposure_btn = Button::with_label("Burn");
-        let rest_exposure_btn = Button::with_label("Rest");
-        for b in [&auto_exposure_btn, &burn_exposure_btn, &rest_exposure_btn] {
+        let reset_exposure_btn = Button::with_label("Reset");
+        for b in [&auto_exposure_btn, &burn_exposure_btn, &reset_exposure_btn] {
             b.set_hexpand(true);
             ev_row.append(b);
         }
@@ -1301,7 +1301,7 @@ impl EditorScreen {
             meta_lines,
             auto_exposure_btn,
             burn_exposure_btn,
-            rest_exposure_btn,
+            reset_exposure_btn,
             wb_auto_button,
             wb_auto2_button,
             reset_wb_btn,
@@ -1987,8 +1987,9 @@ impl EditorScreen {
             });
         });
 
-        // Rest: the whole tone section back to neutral — manual EV = 0 AND the
-        // black point to 0 (both live in "Exposure · Black point").
+        // Reset: the whole tone section back to neutral — manual EV = 0 AND the
+        // black point to 0 (both live in "Exposure · Black point"). The WB
+        // section has its own Reset; each clears its own section.
         let (a, o, st, s, ev, bp, ev_lab, bp_lab) = (
             Rc::clone(&active_id),
             Arc::clone(&on_event),
@@ -1999,7 +2000,7 @@ impl EditorScreen {
             ev_lab.clone(),
             self.black_point_value.clone(),
         );
-        self.rest_exposure_btn.connect_clicked(move |_| {
+        self.reset_exposure_btn.connect_clicked(move |_| {
             let Some(id) = a.get() else { return };
             let mut adj = current_adjustments(&st.read().unwrap(), id);
             adj.exposure_mode = ExposureMode::Manual;
