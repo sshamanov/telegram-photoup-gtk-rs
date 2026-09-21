@@ -98,7 +98,7 @@ In short: Login (phone/code/2FA) → Main screen (header with group selector +
 indicator; a square-thumbnail grid with checkbox top-left, EV badge top-right,
 filename + RAW/JPG badge) → Editor (preview with crop overlay + right panel:
 RGB histogram, **Exposure · Black point** [EV slider + black-point slider, each
-with its value at the end of its track, then Auto/Burn/Rest], **White balance ·
+with its value at the end of its track, then Auto/Burn/Reset], **White balance ·
 Tint · Saturation** [temp + tint + saturation sliders, then
 Auto/Auto2/Reset/Picker], Crop [1:1/2:3/3:2/Original/Pix], Rotate
 [↺ CCW/↻ CW], Image [camera / lens / shutter · aperture · ISO / date, then

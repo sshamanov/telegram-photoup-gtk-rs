@@ -106,8 +106,10 @@ turns the preview cursor into a **crosshair**.
      can produce. **Manual only**: nothing derives it, and pressing **Auto** /
      **Burn** never moves it.
    - Row (below the two sliders, no values): **Auto** (auto-exposure) | **Burn**
-     (aggressive) | **Rest** (reset **both** the exposure to 0 and the black
-     point to neutral).
+     (aggressive) | **Reset** (reset **both** the exposure to 0 and the black
+     point to neutral). The label is "Reset", not "Rest" — the shortening was
+     only ever needed while the row also carried the EV value, which now sits at
+     the end of the slider's track.
 4. Section "**White balance · Tint · Saturation**" (the colour controls, colour
    next to colour):
    - Temperature (warmth) slider, **−4..+4**, step 0.05, zero-centered (the wider
@@ -212,7 +214,8 @@ These are known gaps, deliberately deferred — do not treat them as bugs:
 - Keep the layout/captions/sections EXACTLY as above; do not rename buttons or
   sections. ("Exposure · Black point"/"White balance · Tint ·
   Saturation"/"Crop"/"Rotate"/"Image";
-  Auto/Burn/Rest; Auto/Auto2/Reset/Picker; 1:1/2:3/3:2/Original/Pix; ↺ CCW/↻ CW;
+  Auto/Burn/Reset; Auto/Auto2/Reset/Picker (both resets are literally
+  "Reset" — one per section); 1:1/2:3/3:2/Original/Pix; ↺ CCW/↻ CW;
   Black point; Saturation;
   ‹ Prev/Next ›; Reject/Close; Reset/Logout; Send {n} selected;
   Preparing/Sending.)
