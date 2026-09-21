@@ -1,6 +1,7 @@
 //! Per-photo editor (photoup `EditorPanel`): preview on the left, a 332px panel
-//! on the right with filename, histogram, Exposure / White balance / Crop / Image
-//! sections, nav (‹ Prev / Next ›) and Reject / Close.
+//! on the right with filename, histogram, "Exposure · Black point" (tone),
+//! "White balance · Tint · Saturation" (colour), Crop / Rotate / Image sections,
+//! nav (‹ Prev / Next ›) and Reject / Close.
 //!
 //! The controls emit `AppEvent::PhotoEdit { id, adjustments }` through the
 //! `on_event` callback; the wiring re-renders the preview and pushes the result
@@ -353,7 +354,8 @@ fn apply_wb(
     suppress: &Rc<Cell<bool>>,
     temp: &FineSlider,
     hue_scale: &FineSlider,
-    wb_lab: &Label,
+    temp_lab: &Label,
+    hue_lab: &Label,
 ) {
     let offset = offset.clamp(-4.0, 4.0); // warmth range is ±4
     let hue = hue.clamp(-1.0, 1.0); // tint range is ±1 (slider is −1..+1)
@@ -361,7 +363,8 @@ fn apply_wb(
     temp.set_value(offset as f64);
     hue_scale.set_value(hue as f64);
     suppress.set(false);
-    wb_lab.set_text(&format!("{:+.2} · {:+.2}", offset, hue));
+    temp_lab.set_text(&format!("{offset:+.2}"));
+    hue_lab.set_text(&format!("{hue:+.2}"));
     let mut adj = current_adjustments(&state.read().unwrap(), id);
     adj.wb_offset = offset;
     adj.hue = hue;
@@ -949,19 +952,20 @@ pub struct EditorScreen {
     file_label: Label,
     histogram_area: DrawingArea,
     exposure_slider: FineSlider,
-    /// Black point (−0.5..+0.5), in the **Exposure** section: it is the one
-    /// thing an exposure gain cannot do — crush the floor to black or lift it
-    /// into a matte, without touching the white end.
+    /// Black point (−0.5..+0.5), in the **Exposure · Black point** section: it is
+    /// the one thing an exposure gain cannot do — crush the floor to black or
+    /// lift it into a matte, without touching the white end. Manual only.
     black_point_slider: FineSlider,
     black_point_value: Label,
     temp_slider: FineSlider,
     hue_slider: FineSlider,
-    /// Saturation (−1..+1), in the **White balance** section (both are colour
-    /// controls; the tone controls stay in Exposure).
+    /// Saturation (−1..+1), in the **White balance · Tint · Saturation** section
+    /// (all three are colour controls; the tone controls stay in Exposure).
     saturation_slider: FineSlider,
     saturation_value: Label,
     ev_value: Label,
-    wb_value: Label,
+    temp_value: Label,
+    hue_value: Label,
     info1: Label,
     info2: Label,
     /// The Image section's four EXIF lines (camera, lens, exposure, date), in
@@ -1093,50 +1097,54 @@ impl EditorScreen {
         });
         panel.append(&histogram_area);
 
-        // ---- Exposure ----
-        panel.append(&section_label("Exposure"));
+        // ---- Exposure · Black point ---- (the two tone controls live together)
+        panel.append(&section_label("Exposure · Black point"));
         // Custom fine slider: drags snap to the 0.05 grid (no GTK Scale
         // precision-mode / 0-stickiness). The zero-correction position is drawn
         // as a subtle tick on the track — a reference, not a snap point.
         let exposure_slider = FineSlider::new(-3.0, 5.0, 0.05);
-        panel.append(&exposure_slider.area());
+        // Each slider carries its own value at the right end of its track; the
+        // section label above names it, so the readout is a bare signed number
+        // (the EV one keeps its unit).
+        let (ev_slider_row, ev_value) = slider_row(&exposure_slider, "+0.00 EV", 6);
+        panel.append(&ev_slider_row);
+
+        // Black point (0.01 grid): 0 = unchanged, positive crushes the floor to
+        // black, negative lifts it into a matte. Manual only — exposure Auto/Burn
+        // never touch it (they set the EV and nothing else).
+        let black_point_slider = FineSlider::new(-0.5, 0.5, 0.01);
+        let (bp_row, black_point_value) = slider_row(&black_point_slider, "+0.00", 6);
+        panel.append(&bp_row);
 
         let ev_row = GBox::new(Orientation::Horizontal, 6);
         let auto_exposure_btn = Button::with_label("Auto");
         let burn_exposure_btn = Button::with_label("Burn");
         let rest_exposure_btn = Button::with_label("Rest");
-        let ev_value = Label::new(Some("+0.00 EV"));
-        ev_value.add_css_class("editor-value");
-        ev_value.set_hexpand(true);
-        ev_value.set_halign(gtk4::Align::End);
-        // Fixed character width so the label never jitters as the value changes
-        // ("+0.00 EV" ↔ "+?.?? EV" ↔ "-1.25 EV" are all 5 chars + unit).
-        ev_value.set_width_chars(6);
-        ev_row.append(&auto_exposure_btn);
-        ev_row.append(&burn_exposure_btn);
-        ev_row.append(&rest_exposure_btn);
-        ev_row.append(&ev_value);
+        for b in [&auto_exposure_btn, &burn_exposure_btn, &rest_exposure_btn] {
+            b.set_hexpand(true);
+            ev_row.append(b);
+        }
         panel.append(&ev_row);
 
-        // Black point (0.01 grid): 0 = unchanged, positive crushes the floor to
-        // black, negative lifts it into a matte. Exposure Auto/Burn derive it
-        // from the crop's tone-mapped histogram (never below 0 — auto only
-        // stretches); dragging this slider takes ownership of the value.
-        let black_point_slider = FineSlider::new(-0.5, 0.5, 0.01);
-        let (bp_row, black_point_value) = slider_row("Black point", &black_point_slider);
-        panel.append(&bp_row);
-
-        // ---- White balance ----
-        panel.append(&section_label("White balance"));
+        // ---- White balance · Tint · Saturation ---- (the colour controls together)
+        panel.append(&section_label("White balance · Tint · Saturation"));
         // Warmth range −4..+4: some images need a stronger cool shift than ±2
         // (−2 was still reddish). At −4 red is quartered / blue quadrupled.
         let temp_slider = FineSlider::new(-4.0, 4.0, 0.05);
-        panel.append(&temp_slider.area());
+        let (temp_row, temp_value) = slider_row(&temp_slider, "+0.00", 6);
+        panel.append(&temp_row);
 
         // Tint (hue) is fine-grained: −1..+1 at 0.01 steps (the old −2..+2 was too
         // wide — tinting is a subtle correction).
         let hue_slider = FineSlider::new(-1.0, 1.0, 0.01);
-        panel.append(&hue_slider.area());
+        let (hue_row, hue_value) = slider_row(&hue_slider, "+0.00", 6);
+        panel.append(&hue_row);
+
+        // Saturation (0.01 grid): 0 = unchanged, −1 = fully gray, +1 = doubled.
+        // Luma-preserving, applied after the tone curve.
+        let saturation_slider = FineSlider::new(-1.0, 1.0, 0.01);
+        let (sat_row, saturation_value) = slider_row(&saturation_slider, "+0.00", 6);
+        panel.append(&sat_row);
 
         let wb_row = GBox::new(Orientation::Horizontal, 6);
         // Auto = clinical neutralization of the frame's neutral reference; Auto2 =
@@ -1149,25 +1157,13 @@ impl EditorScreen {
         let reset_wb_btn = Button::with_label("Reset");
         let picker_wb_btn = Button::with_label("Picker");
         picker_wb_btn.set_tooltip_text(Some("Toggle neutral picker (samples a 7×7–31×31 area)"));
-        let wb_value = Label::new(Some("+0.00 · +0.00"));
-        wb_value.add_css_class("editor-value");
-        wb_value.set_hexpand(true);
-        wb_value.set_halign(gtk4::Align::End);
-        wb_value.set_width_chars(13);
-        wb_row.append(&wb_auto_button);
-        wb_row.append(&wb_auto2_button);
-        wb_row.append(&reset_wb_btn);
-        wb_row.append(&picker_wb_btn);
-        wb_row.append(&wb_value);
+        for b in [&wb_auto_button, &wb_auto2_button, &reset_wb_btn, &picker_wb_btn] {
+            b.set_hexpand(true);
+            wb_row.append(b);
+        }
         // Auto-WB + neutral-pick now have the preview pixels + camera matrix
         // wired (see wire_buttons) — enabled.
         panel.append(&wb_row);
-
-        // Saturation (0.01 grid): 0 = unchanged, −1 = fully gray, +1 = doubled.
-        // Luma-preserving, applied after the tone curve.
-        let saturation_slider = FineSlider::new(-1.0, 1.0, 0.01);
-        let (sat_row, saturation_value) = slider_row("Saturation", &saturation_slider);
-        panel.append(&sat_row);
 
         // ---- Crop ----
         panel.append(&section_label("Crop"));
@@ -1298,7 +1294,8 @@ impl EditorScreen {
             saturation_slider,
             saturation_value,
             ev_value,
-            wb_value,
+            temp_value,
+            hue_value,
             info1,
             info2,
             meta_lines,
@@ -1375,8 +1372,6 @@ impl EditorScreen {
         self.exposure_slider.set_value(shown_ev as f64);
         self.temp_slider.set_value(adjustments.wb_offset as f64);
         self.hue_slider.set_value(adjustments.hue as f64);
-        // An auto black point has no value of its own yet — the render that
-        // lands next (`set_black_point`) positions the slider at the derived one.
         self.black_point_slider
             .set_value(adjustments.black_point as f64);
         self.saturation_slider
@@ -1492,24 +1487,6 @@ impl EditorScreen {
         }
     }
 
-    /// Show the black point the last render actually used. While the exposure
-    /// mode owns it (Auto/Burn derive it per render) the slider follows, exactly
-    /// like the EV slider in `set_ev`; once the user has dragged it (manual) the
-    /// value is theirs and must not be re-programmed mid-drag — `set_value`
-    /// would cancel the live drag via its stale-drag guard.
-    pub fn set_black_point(&self, bp: f32) {
-        let Some(id) = self.active_id.get() else { return };
-        let manual = !current_adjustments(&self.state.read().unwrap(), id).black_point_auto;
-        self.black_point_value
-            .set_text(&format!("Black point {bp:+.2}"));
-        if manual || self.black_point_slider.is_dragging() {
-            return;
-        }
-        self.suppress.set(true);
-        self.black_point_slider.set_value(bp as f64);
-        self.suppress.set(false);
-    }
-
     /// Cache the active photo's LINEAR (0..1) pre-tone RGB sample so WB Auto and
     /// the neutral-picker can measure the true sensor cast.
     pub fn set_wb_sample(&self, rgba: Vec<f32>, w: u32, h: u32) {
@@ -1576,15 +1553,14 @@ impl EditorScreen {
     fn refresh_value_labels(&self) {
         self.ev_value
             .set_text(&format!("{:+.2} EV", self.exposure_slider.value()));
-        self.wb_value.set_text(&format!(
-            "{:+.2} · {:+.2}",
-            self.temp_slider.value(),
-            self.hue_slider.value()
-        ));
+        self.temp_value
+            .set_text(&format!("{:+.2}", self.temp_slider.value()));
+        self.hue_value
+            .set_text(&format!("{:+.2}", self.hue_slider.value()));
         self.black_point_value
-            .set_text(&format!("Black point {:+.2}", self.black_point_slider.value()));
+            .set_text(&format!("{:+.2}", self.black_point_slider.value()));
         self.saturation_value
-            .set_text(&format!("Saturation {:+.2}", self.saturation_slider.value()));
+            .set_text(&format!("{:+.2}", self.saturation_slider.value()));
     }
 
     fn refresh_image_info(&self) {
@@ -1626,7 +1602,6 @@ impl EditorScreen {
         let temp = self.temp_slider.clone();
         let hue = self.hue_slider.clone();
         let ev_lab = self.ev_value.clone();
-        let wb_lab = self.wb_value.clone();
 
         // EV slider: dragging sets Manual exposure with the slider value.
         let (a, o, s, st, lab) = (
@@ -1652,13 +1627,12 @@ impl EditorScreen {
         });
 
         // Temperature slider.
-        let (a, o, s, st, hue2, lab) = (
+        let (a, o, s, st, lab) = (
             Rc::clone(&active_id),
             Arc::clone(&on_event),
             Rc::clone(&suppress),
             Arc::clone(&state),
-            hue.clone(),
-            wb_lab.clone(),
+            self.temp_value.clone(),
         );
         temp.connect_change(move |v| {
             if s.get() {
@@ -1667,7 +1641,7 @@ impl EditorScreen {
             let Some(id) = a.get() else { return };
             let mut adj = current_adjustments(&st.read().unwrap(), id);
             adj.wb_offset = v as f32;
-            lab.set_text(&format!("{:+.2} · {:+.2}", adj.wb_offset, hue2.value()));
+            lab.set_text(&format!("{:+.2}", adj.wb_offset));
             o(AppEvent::PhotoEdit {
                 id,
                 adjustments: adj,
@@ -1675,13 +1649,12 @@ impl EditorScreen {
         });
 
         // Hue slider.
-        let (a, o, s, st, temp2, lab) = (
+        let (a, o, s, st, lab) = (
             Rc::clone(&active_id),
             Arc::clone(&on_event),
             Rc::clone(&suppress),
             Arc::clone(&state),
-            temp.clone(),
-            wb_lab,
+            self.hue_value.clone(),
         );
         hue.connect_change(move |v| {
             if s.get() {
@@ -1690,17 +1663,15 @@ impl EditorScreen {
             let Some(id) = a.get() else { return };
             let mut adj = current_adjustments(&st.read().unwrap(), id);
             adj.hue = v as f32;
-            lab.set_text(&format!("{:+.2} · {:+.2}", temp2.value(), adj.hue));
+            lab.set_text(&format!("{:+.2}", adj.hue));
             o(AppEvent::PhotoEdit {
                 id,
                 adjustments: adj,
             });
         });
 
-        // Black-point slider: a manual value takes the black point away from the
-        // exposure mode's derivation (`black_point_auto = false`) — auto only
-        // ever pulls a lifted floor back to 0, while a manual push is allowed to
-        // crush it further. Pressing Auto/Burn re-arms the derivation.
+        // Black-point slider: manual, like every other value in the panel — 0 is
+        // the identity, positive crushes the floor, negative lifts it into a matte.
         let (a, o, s, st, lab) = (
             Rc::clone(&active_id),
             Arc::clone(&on_event),
@@ -1715,8 +1686,7 @@ impl EditorScreen {
             let Some(id) = a.get() else { return };
             let mut adj = current_adjustments(&st.read().unwrap(), id);
             adj.black_point = v as f32;
-            adj.black_point_auto = false;
-            lab.set_text(&format!("Black point {:+.2}", adj.black_point));
+            lab.set_text(&format!("{:+.2}", adj.black_point));
             o(AppEvent::PhotoEdit {
                 id,
                 adjustments: adj,
@@ -1738,7 +1708,7 @@ impl EditorScreen {
             let Some(id) = a.get() else { return };
             let mut adj = current_adjustments(&st.read().unwrap(), id);
             adj.saturation = v as f32;
-            lab.set_text(&format!("Saturation {:+.2}", adj.saturation));
+            lab.set_text(&format!("{:+.2}", adj.saturation));
             o(AppEvent::PhotoEdit {
                 id,
                 adjustments: adj,
@@ -1901,7 +1871,8 @@ impl EditorScreen {
         let temp_click = self.temp_slider.clone();
         let hue_click = self.hue_slider.clone();
         let suppress_click = Rc::clone(&self.suppress);
-        let wb_lab_click = self.wb_value.clone();
+        let temp_lab_click = self.temp_value.clone();
+        let hue_lab_click = self.hue_value.clone();
         let picker_active_click = Rc::clone(&self.picker_active);
         click.connect_released(move |_g, _n_press, x, y| {
             if !picker_active_click.get() {
@@ -1952,7 +1923,18 @@ impl EditorScreen {
                 "[wb] pick feed r={r:.4} g={g:.4} b={b:.4} → offset={offset:.3} hue={hue:.3} cam={}",
                 if cam.is_some() { "matrix" } else { "grey-world" }
             );
-            apply_wb(id, offset, hue, &state_click, &on_click, &suppress_click, &temp_click, &hue_click, &wb_lab_click);
+            apply_wb(
+                id,
+                offset,
+                hue,
+                &state_click,
+                &on_click,
+                &suppress_click,
+                &temp_click,
+                &hue_click,
+                &temp_lab_click,
+                &hue_lab_click,
+            );
         });
         self.crop_area.add_controller(click);
     }
@@ -1963,11 +1945,8 @@ impl EditorScreen {
         let state = Arc::clone(&self.state);
         let suppress = Rc::clone(&self.suppress);
         let ev = self.exposure_slider.clone();
-        let temp = self.temp_slider.clone();
-        let hue = self.hue_slider.clone();
         let full_size = Rc::clone(&self.full_size);
         let ev_lab = self.ev_value.clone();
-        let wb_lab = self.wb_value.clone();
         let info2 = self.info2.clone();
 
         // Exposure: Auto / Burn. Both switch to an auto mode whose EV is the
@@ -1982,11 +1961,9 @@ impl EditorScreen {
         self.auto_exposure_btn.connect_clicked(move |_| {
             let Some(id) = a.get() else { return };
             let mut adj = current_adjustments(&st.read().unwrap(), id);
+            // Auto/Burn set the exposure mode and nothing else — the black point
+            // is the slider's, so switching modes never moves it.
             adj.exposure_mode = ExposureMode::Auto;
-            // Auto/Burn own the black point again: they derive it from the
-            // crop's tone-mapped histogram, overwriting a manual value the user
-            // dragged.
-            adj.black_point_auto = true;
             lab.set_text("+?.?? EV");
             o(AppEvent::PhotoEdit {
                 id,
@@ -2003,7 +1980,6 @@ impl EditorScreen {
             let Some(id) = a.get() else { return };
             let mut adj = current_adjustments(&st.read().unwrap(), id);
             adj.exposure_mode = ExposureMode::Burn;
-            adj.black_point_auto = true;
             lab.set_text("+?.?? EV");
             o(AppEvent::PhotoEdit {
                 id,
@@ -2011,50 +1987,66 @@ impl EditorScreen {
             });
         });
 
-        // Rest: manual EV = 0, snap the slider.
-        let (a, o, st, s, ev, lab) = (
+        // Rest: the whole tone section back to neutral — manual EV = 0 AND the
+        // black point to 0 (both live in "Exposure · Black point").
+        let (a, o, st, s, ev, bp, ev_lab, bp_lab) = (
             Rc::clone(&active_id),
             Arc::clone(&on_event),
             Arc::clone(&state),
             Rc::clone(&suppress),
             ev.clone(),
+            self.black_point_slider.clone(),
             ev_lab.clone(),
+            self.black_point_value.clone(),
         );
         self.rest_exposure_btn.connect_clicked(move |_| {
             let Some(id) = a.get() else { return };
             let mut adj = current_adjustments(&st.read().unwrap(), id);
             adj.exposure_mode = ExposureMode::Manual;
             adj.exposure_ev = 0.0;
+            adj.black_point = 0.0;
             s.set(true);
             ev.set_value(0.0);
+            bp.set_value(0.0);
             s.set(false);
-            lab.set_text("+0.00 EV");
+            ev_lab.set_text("+0.00 EV");
+            bp_lab.set_text("+0.00");
             o(AppEvent::PhotoEdit {
                 id,
                 adjustments: adj,
             });
         });
 
-        // WB Reset: warmth + hue back to neutral, snap both sliders.
-        let (a, o, st, s, temp, hue, lab) = (
+        // WB Reset: the whole colour section back to neutral — warmth, tint and
+        // saturation to 0, snapping all three sliders.
+        let (a, o, st, s, temp, hue, sat, temp_lab, hue_lab, sat_lab) = (
             Rc::clone(&active_id),
             Arc::clone(&on_event),
             Arc::clone(&state),
             Rc::clone(&suppress),
-            temp.clone(),
-            hue.clone(),
-            wb_lab.clone(),
+            // WB Auto's `let` below reuses `temp`/`hue`, and the labels are
+            // needed there too, so clone fresh from `self`.
+            self.temp_slider.clone(),
+            self.hue_slider.clone(),
+            self.saturation_slider.clone(),
+            self.temp_value.clone(),
+            self.hue_value.clone(),
+            self.saturation_value.clone(),
         );
         self.reset_wb_btn.connect_clicked(move |_| {
             let Some(id) = a.get() else { return };
             let mut adj = current_adjustments(&st.read().unwrap(), id);
             adj.wb_offset = 0.0;
             adj.hue = 0.0;
+            adj.saturation = 0.0;
             s.set(true);
             temp.set_value(0.0);
             hue.set_value(0.0);
+            sat.set_value(0.0);
             s.set(false);
-            lab.set_text("+0.00 · +0.00");
+            temp_lab.set_text("+0.00");
+            hue_lab.set_text("+0.00");
+            sat_lab.set_text("+0.00");
             o(AppEvent::PhotoEdit {
                 id,
                 adjustments: adj,
@@ -2067,7 +2059,7 @@ impl EditorScreen {
         //   Auto  → clinical neutralization (the full `wb_from_pick` fit).
         //   Auto2 → warm: the same reference, but only ~60% corrected + a warm bias,
         //            keeping the ambience (Nikon AUTO2 "keep warm lighting colors").
-        let (a, o, st, wbs, cm, s, temp, hue, lab, croprc) = (
+        let (a, o, st, wbs, cm, s, temp, hue, tlab, hlab, croprc) = (
             Rc::clone(&active_id),
             Arc::clone(&on_event),
             Arc::clone(&state),
@@ -2077,10 +2069,11 @@ impl EditorScreen {
             // WB Reset's `let` shadowed + moved `temp`/`hue`, so clone fresh here.
             self.temp_slider.clone(),
             self.hue_slider.clone(),
-            wb_lab.clone(),
+            self.temp_value.clone(),
+            self.hue_value.clone(),
             Rc::clone(&self.crop),
         );
-        let (a2, o2, st2, wbs2, cm2, s2, temp2, hue2, lab2, croprc2) = (
+        let (a2, o2, st2, wbs2, cm2, s2, temp2, hue2, tlab2, hlab2, croprc2) = (
             Rc::clone(&active_id),
             Arc::clone(&on_event),
             Arc::clone(&state),
@@ -2089,7 +2082,8 @@ impl EditorScreen {
             Rc::clone(&suppress),
             self.temp_slider.clone(),
             self.hue_slider.clone(),
-            wb_lab.clone(),
+            self.temp_value.clone(),
+            self.hue_value.clone(),
             Rc::clone(&self.crop),
         );
         self.wb_auto_button.connect_clicked(move |_| {
@@ -2103,7 +2097,7 @@ impl EditorScreen {
                 "[wb] auto (clinical) feed r={r:.4} g={g:.4} b={b:.4} → offset={wb_offset:.3} hue={wb_hue:.3} cam={}",
                 if cam.is_some() { "matrix" } else { "grey-world" }
             );
-            apply_wb(id, wb_offset, wb_hue, &st, &o, &s, &temp, &hue, &lab);
+            apply_wb(id, wb_offset, wb_hue, &st, &o, &s, &temp, &hue, &tlab, &hlab);
         });
         self.wb_auto2_button.connect_clicked(move |_| {
             let Some(id) = a2.get() else { return };
@@ -2116,7 +2110,7 @@ impl EditorScreen {
                 "[wb] auto2 (warm) feed r={r:.4} g={g:.4} b={b:.4} → offset={wb_offset:.3} hue={wb_hue:.3} cam={}",
                 if cam.is_some() { "matrix" } else { "grey-world" }
             );
-            apply_wb(id, wb_offset, wb_hue, &st2, &o2, &s2, &temp2, &hue2, &lab2);
+            apply_wb(id, wb_offset, wb_hue, &st2, &o2, &s2, &temp2, &hue2, &tlab2, &hlab2);
         });
 
         // Picker is deliberately a persistent switch, not a one-shot click: the
@@ -2262,19 +2256,20 @@ impl EditorScreen {
     }
 }
 
-/// A captioned slider row: the label doubles as the value readout ("Black point
-/// +0.12"), because the 332px panel has no room for a caption line above the
-/// track. Returns the row and the label, so the wiring can update the text.
-fn slider_row(caption: &str, slider: &FineSlider) -> (GBox, Label) {
+/// A slider row with its value at the right end of the track. The section label
+/// above the row names the control (the panel is one control per line, so the
+/// readout itself is just the number); a fixed character width keeps the track
+/// from shifting as the text changes ("+0.00" ↔ "−0.25"). Returns the row and
+/// the label, so the wiring can update the text.
+fn slider_row(slider: &FineSlider, initial: &str, width_chars: i32) -> (GBox, Label) {
     let row = GBox::new(Orientation::Horizontal, 6);
-    let label = Label::new(Some(&format!("{caption} 0.00")));
-    label.add_css_class("editor-value");
-    label.set_halign(gtk4::Align::Start);
-    label.set_valign(gtk4::Align::Center);
-    // Widest text ("Black point −0.50") so the track never shifts between values.
-    label.set_width_chars(17);
-    row.append(&label);
     row.append(&slider.area());
+    let label = Label::new(Some(initial));
+    label.add_css_class("editor-value");
+    label.set_halign(gtk4::Align::End);
+    label.set_valign(gtk4::Align::Center);
+    label.set_width_chars(width_chars);
+    row.append(&label);
     (row, label)
 }
 

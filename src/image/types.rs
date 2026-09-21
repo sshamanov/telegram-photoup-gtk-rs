@@ -49,15 +49,13 @@ pub struct Adjustments {
     pub saturation: f32,
     /// Black point, -0.5..+0.5, applied LAST in display space as
     /// `x' = (x - b) / (1 - b)`: positive crushes the floor to black (more
-    /// contrast), negative lifts it (faded/matte). `black_point_auto` photos
-    /// only ever derive this from ≥ 0 — see the field below.
+    /// contrast), negative lifts it (faded/matte). **Manual only** — the
+    /// exposure Auto/Burn modes do not touch it, and nothing derives it. A
+    /// stretch that keeps white at white necessarily darkens what lies between,
+    /// so a derived value would quietly undo the auto exposure's median-on-128
+    /// promise; leaving it to the slider keeps that promise intact until the
+    /// user asks for the crush.
     pub black_point: f32,
-    /// True while exposure Auto/Burn own the black point: they derive it on
-    /// every render from the crop's tone-mapped histogram, clamped to ≥ 0 so
-    /// auto only ever pulls a lifted floor to 0 (stretches) and never fades.
-    /// Dragging the black-point slider clears it (the manual value is used from
-    /// then on); pressing Auto/Burn again re-arms it.
-    pub black_point_auto: bool,
     pub crop: Option<NormalizedCrop>,
     /// User rotation in clockwise quarter-turns (0..3). 0 = none, 1 = 90° CW,
     /// 2 = 180°, 3 = 270° CW (90° CCW). Applied on top of any EXIF orientation.
@@ -73,7 +71,6 @@ impl Default for Adjustments {
             hue: 0.0,
             saturation: 0.0,
             black_point: 0.0,
-            black_point_auto: true,
             crop: None,
             rotation: 0,
         }

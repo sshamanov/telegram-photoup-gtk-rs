@@ -565,14 +565,14 @@ mod tests {
     }
 
     /// Debug renderer for the black point + saturation controls: for every
-    /// sample it prints the tone-mapped luminance percentiles the auto black
-    /// point derives from and writes one PNG per variant to `out/levels/` —
-    /// `-auto` (exposure Auto + the derived black point), `-bp0` (black point
-    /// off), `-bp20` / `-bpm20` (manual crush / lift), `-sat-1` / `-sat+1`.
+    /// sample it prints the rendered luminance percentiles (p0.1 / p1 / p50 /
+    /// p99 — where the frame's floor and bulk actually sit) and writes one PNG
+    /// per variant to `out/levels/`: `-bp0` (the control at its neutral 0),
+    /// `-bp20` / `-bpm20` (crush / matte lift), `-sat-1` / `-sat+1`.
     /// Opt-in: `PHOTOUP2_DEBUG_LEVELS=1 cargo test --lib levels_debug_render -- --nocapture`.
     #[test]
     fn levels_debug_render() {
-        use crate::image::math::{auto_black_point, fit_within, histogram_percentile};
+        use crate::image::math::{fit_within, histogram_percentile};
         use crate::image::process::{compute_histogram, Base, JpegBase, RawBase};
         use crate::image::types::{Adjustments, ExposureMode};
 
@@ -611,20 +611,17 @@ mod tests {
                 width: rw,
                 height: rh,
             };
-            // Each variant isolates one control: the black point ones keep the
-            // default Auto exposure, the saturation ones switch the (otherwise
-            // re-derived) black point off so only saturation differs.
+            // Each variant isolates one control, all on the default Auto
+            // exposure (the black point is manual-only, so exposure never moves it).
             let manual = |f: &dyn Fn(&mut Adjustments)| {
                 let mut adj = Adjustments {
                     exposure_mode: ExposureMode::Auto,
-                    black_point_auto: false,
                     ..Default::default()
                 };
                 f(&mut adj);
                 adj
             };
             let variants = [
-                ("auto", Adjustments::default()),
                 ("bp0", manual(&|_| {})),
                 ("bp20", manual(&|a| a.black_point = 0.2)),
                 ("bpm20", manual(&|a| a.black_point = -0.2)),
@@ -638,14 +635,13 @@ mod tests {
                     .expect("256-bin luminance histogram");
                 println!(
                     "{stem} {tag:>6}: ev={:+.2} bp={:+.3} | p0.1={:.3} p1={:.3} p50={:.3} \
-                     p99={:.3} | auto_bp={:.3}",
+                     p99={:.3}",
                     r.auto_ev,
-                    r.black_point,
+                    adj.black_point,
                     histogram_percentile(&hist, 0.001),
                     histogram_percentile(&hist, 0.01),
                     histogram_percentile(&hist, 0.5),
                     histogram_percentile(&hist, 0.99),
-                    auto_black_point(&hist, 0.001),
                 );
                 let fname = outdir.join(format!("{stem}-{tag}.png"));
                 if let Ok(f) = std::fs::File::create(&fname) {

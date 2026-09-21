@@ -199,27 +199,6 @@ pub fn histogram_percentile(hist: &[u32; 256], p: f32) -> f32 {
     1.0
 }
 
-/// The black point exposure Auto/Burn derive, from the tone-mapped luminance
-/// histogram: its `p`-th percentile, i.e. where the frame's floor actually sits.
-///
-/// Two properties keep the derivation safe:
-/// * Never negative — auto only ever pulls a lifted floor down to 0, a stretch;
-///   it never fades the image (that is the manual slider's job).
-/// * Nothing at all for a frame whose floor is NOT in the bottom third of its
-///   range below the midpoint. Such a frame's "floor" is its own subject, not a
-///   pedestal under it — a moth on a wall (floor 0.35, frame 0.36..0.55) or a
-///   solid sky: pulling that floor to black costs 70% of the image's brightness
-///   and buys nothing. A frame that does have a dark end derives ~0 anyway, so
-///   the gate only ever rejects the degenerate case; a genuine pedestal (a DNG
-///   black level, a hazy frame) sits far enough below the median to pass.
-pub fn auto_black_point(hist: &[u32; 256], p: f32) -> f32 {
-    let floor = histogram_percentile(hist, p);
-    if 3.0 * floor > histogram_percentile(hist, 0.5) {
-        return 0.0;
-    }
-    clamp(floor, 0.0, 0.5)
-}
-
 /// Average channel means for a gray-world reference (used by neutral picker).
 pub fn channel_means(rgb: &[u8]) -> (f32, f32, f32) {
     let n = rgb.len() / 3;
@@ -431,42 +410,6 @@ mod tests {
         // Out-of-range input clamps instead of dividing by ≤ 0.
         assert_eq!(black_point_lut(-99.0), black_point_lut(-0.5));
         assert_eq!(black_point_lut(99.0), black_point_lut(0.5));
-    }
-
-    #[test]
-    fn auto_black_point_only_pulls_a_lifted_floor() {
-        // A photo that already reaches black derives nothing: auto never fades
-        // (a negative value would) and never crushes data that is already there.
-        let reaching_black = hist_from(&[0, 1, 2, 40, 128, 200, 255]);
-        assert_eq!(auto_black_point(&reaching_black, 0.001), 0.0);
-
-        // A lifted floor (nothing below 0.1) with a real tonal range above it is
-        // pulled all the way to 0 — the DNG-pedestal case this exists for.
-        let lifted = hist_from(&[
-            26, 26, 26, 40, 70, 90, 110, 130, 150, 170, 190, 210, 230, 250, 255,
-        ]);
-        let bp = auto_black_point(&lifted, 0.001);
-        assert!((bp - 26.0 / 255.0).abs() < 1e-6, "floor should be pulled: {bp}");
-
-        // A flat frame has no floor to pull: its lowest tone IS its median, so
-        // deriving anything would crush the whole picture to black.
-        for v in [0u8, 1, 128, 255] {
-            assert_eq!(auto_black_point(&hist_from(&[v; 16]), 0.001), 0.0, "flat {v}");
-            // Never negative (auto never fades), never above the slider's bound.
-            let bp = auto_black_point(&hist_from(&[v; 16]), 0.001);
-            assert!((0.0..=0.5).contains(&bp), "out of range for {v}: {bp}");
-        }
-        // Degenerate input cannot produce NaN.
-        assert_eq!(auto_black_point(&[0; 256], 0.001), 0.0);
-        // A near-flat frame (a gentle gradient, no dark end) is rejected too:
-        // the gate is a ratio, not an exact tie.
-        let near_flat = hist_from(&[100, 102, 104, 106, 108, 110, 112]);
-        assert_eq!(auto_black_point(&near_flat, 0.001), 0.0);
-        // The moth-on-a-wall case: a frame that spans only 0.36..0.55 has its
-        // floor at 2/3 of its midpoint — pulling that to black would darken the
-        // whole picture to no purpose.
-        let flat_subject = hist_from(&[92, 96, 100, 104, 108, 112, 116, 120, 128, 136]);
-        assert_eq!(auto_black_point(&flat_subject, 0.001), 0.0);
     }
 
     #[test]
