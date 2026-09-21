@@ -2578,6 +2578,63 @@ mod tests {
         assert!(!jpeg.is_empty());
     }
 
+    /// The export bakes the effective WB into libraw's `user_mul`, so a channel
+    /// libraw reports as 0 (a three-colour sensor has no second green) must not
+    /// reach it as a multiplier — that zeroes half the greens and the exported
+    /// frame arrives in Telegram black while the previews look fine. The DNGs in
+    /// `./samples/` are exactly that camera. Skipped when no sample is present.
+    #[test]
+    fn raw_export_with_edits_is_not_black() {
+        let samples: Vec<std::path::PathBuf> = std::fs::read_dir("samples")
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.extension()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|e| e.eq_ignore_ascii_case("dng"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if samples.is_empty() {
+            eprintln!("no ./samples/*.dng — skipping");
+            return;
+        }
+        let mut adj = Adjustments::default();
+        adj.exposure_mode = ExposureMode::Manual;
+        adj.exposure_ev = 0.5;
+        adj.wb_offset = 0.5;
+        adj.hue = -0.3;
+        adj.saturation = 0.19;
+        adj.crop = Some(crate::image::types::NormalizedCrop {
+            x: 0.12,
+            y: 0.20,
+            width: 0.6,
+            height: 0.5,
+        });
+        for rotation in [0, 1] {
+            adj.rotation = rotation;
+            for path in &samples {
+                let data = std::fs::read(path).unwrap();
+                // Exactly what the thumbnail decode hands the export: camera WB.
+                let cam_mul = decode_base(&data, SourceType::Raw, false, None)
+                    .unwrap()
+                    .cam_mul;
+                assert!(cam_mul.is_some(), "{path:?} reported no cam_mul");
+                let (jpeg, w, h) = run_export_job(path, SourceType::Raw, &adj, cam_mul)
+                    .unwrap_or_else(|e| panic!("{path:?} rot{rotation}: {e}"));
+                let img = image::load_from_memory(&jpeg).unwrap().to_luma8();
+                let mean = img.as_raw().iter().map(|p| *p as u64).sum::<u64>() as f64
+                    / img.as_raw().len() as f64;
+                assert!(
+                    mean > 40.0,
+                    "{path:?} rot{rotation} ({w}x{h}) exported at mean luma {mean:.1} — black"
+                );
+            }
+        }
+    }
+
     #[test]
     fn missing_file_surfaces_error() {
         let bogus = std::env::temp_dir()

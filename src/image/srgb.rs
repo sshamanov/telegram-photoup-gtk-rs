@@ -252,11 +252,22 @@ pub fn auto_wb(r: f32, g: f32, b: f32, cam_matrix: Option<[[f32; 3]; 3]>) -> (f3
 
 /// Effective WB multipliers for the final export (baked into libraw `user_mul`).
 /// Port of photoup `exportWbMul`.
+///
+/// A channel libraw reported as 0 means "this camera gave no multiplier for it",
+/// which is NOT "multiply by zero". The case that bites is the **second green**:
+/// a three-colour sensor (the Canon PowerShot DNGs in `./samples/`) has no G2
+/// photosite, so `cam_mul[3]` is 0 — and passing that through zeroes half the
+/// green photosites. libraw's camera matrix then drags red and blue down with
+/// them, and the exported JPEG comes back BLACK while the grid thumbnail and the
+/// editor preview look perfectly fine (they decode with the camera WB, not with
+/// `user_mul`; only the export bakes these multipliers in). Falling back to the
+/// green reference is the no-correction value for a missing channel.
 pub fn export_wb_mul(cam_mul: [f32; 4], adjustments: &Adjustments) -> [f32; 4] {
-    let rc = cam_mul[0].max(1e-6);
-    let gc = cam_mul[1].max(1e-6);
-    let bc = cam_mul[2].max(1e-6);
-    let g2c = cam_mul[3].max(1e-6);
+    let usable = |v: f32| v.is_finite() && v > 1e-6;
+    let gc = if usable(cam_mul[1]) { cam_mul[1] } else { 1.0 };
+    let rc = if usable(cam_mul[0]) { cam_mul[0] } else { gc };
+    let bc = if usable(cam_mul[2]) { cam_mul[2] } else { gc };
+    let g2c = if usable(cam_mul[3]) { cam_mul[3] } else { gc };
     let temp_r = 2.0f32.powf(adjustments.wb_offset * 0.5);
     let temp_b = 2.0f32.powf(-adjustments.wb_offset * 0.5);
     let hue_g = 2.0f32.powf(-adjustments.hue * 0.5);
@@ -310,6 +321,26 @@ mod tests {
     fn wb_gains_neutral() {
         let (r, g, b) = wb_gains(0.0, 0.0);
         assert!((r - 1.0).abs() < 1e-6 && (g - 1.0).abs() < 1e-6 && (b - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn export_wb_mul_never_zeroes_a_channel() {
+        // Canon PowerShot DNGs report cam_mul [r, g, b, 0]: the sensor has one
+        // green, so there is no G2. A 0 passed through as a multiplier zeroes
+        // half the greens and the export comes back black.
+        let out = export_wb_mul([1.49, 0.973, 1.68, 0.0], &Adjustments::default());
+        assert!(
+            out.iter().all(|m| (0.5..4.0).contains(m)),
+            "a channel was zeroed: {out:?}"
+        );
+        assert!((out[3] - 1.0).abs() < 1e-6, "G2 must be neutral: {out:?}");
+        // Same for the other channels, however the camera reports them.
+        for broken in [[0.0, 0.9, 1.5, 0.0], [1.5, 0.0, 1.5, 0.0], [f32::NAN; 4]] {
+            let out = export_wb_mul(broken, &Adjustments::default());
+            assert!(out.iter().all(|m| m.is_finite() && *m > 0.0), "{broken:?} → {out:?}");
+        }
+        // No camera WB at all stays neutral rather than multiplying by ~0.
+        assert_eq!(export_wb_mul([0.0; 4], &Adjustments::default()), [1.0; 4]);
     }
 
     #[test]
