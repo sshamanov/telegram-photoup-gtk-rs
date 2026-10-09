@@ -3,8 +3,6 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    pub api_id: i32,
-    pub api_hash: String,
     pub target_peer_id: Option<i64>,
     pub session_path: PathBuf,
 }
@@ -13,12 +11,19 @@ impl Default for AppConfig {
     fn default() -> Self {
         let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("photoup2");
         Self {
-            api_id: 0,
-            api_hash: String::new(),
             target_peer_id: None,
             session_path: base.join("telegram.session"),
         }
     }
+}
+
+/// Telegram API credentials, baked in at build time by `build.rs` from
+/// `TG_API_ID` / `TG_API_HASH` (environment or the gitignored `.env`).
+/// `None` when the binary was built without them.
+pub fn telegram_credentials() -> Option<(i32, &'static str)> {
+    let api_id = env!("PHOTOUP2_TG_API_ID").parse().ok().filter(|&id| id != 0)?;
+    let api_hash = env!("PHOTOUP2_TG_API_HASH");
+    (!api_hash.is_empty()).then_some((api_id, api_hash))
 }
 
 impl AppConfig {
@@ -73,11 +78,10 @@ mod tests {
         let path = dir.path().join("config.toml");
         let mut cfg = AppConfig::default();
         cfg.session_path = dir.path().join("s");
-        cfg.api_id = 123;
         cfg.target_peer_id = Some(42);
         cfg.save_to(&path).unwrap();
         let loaded = AppConfig::load_from(&path).unwrap();
-        assert_eq!(loaded.api_id, 123);
         assert_eq!(loaded.target_peer_id, Some(42));
     }
+
 }

@@ -278,15 +278,17 @@ pub struct AppController {
 
 impl AppController {
     pub fn new(state: Arc<RwLock<AppState>>, window: adw::ApplicationWindow) -> Self {
-        // Telegram worker: commands out, events back. Credentials and the session
-        // path come from the persisted TOML config.
+        // Telegram worker: commands out, events back. Credentials are baked in at
+        // build time; the session path comes from the persisted TOML config.
         let (events_tx, events_rx) = channel::<TEvent>();
         let config = crate::config::AppConfig::load();
+        let credentials = crate::config::telegram_credentials();
+        let (api_id, api_hash) = credentials.unwrap_or_default();
         let telegram_cmd = crate::telegram::worker::spawn(
             TelegramWorkerConfig {
                 session_path: config.session_path.clone(),
-                api_id: config.api_id,
-                api_hash: config.api_hash.clone(),
+                api_id,
+                api_hash: api_hash.to_string(),
             },
             events_tx,
         );
@@ -300,13 +302,10 @@ impl AppController {
 
         let stack = gtk4::Stack::new();
         let toast = Toast::new();
-        if config.api_id == 0 || config.api_hash.is_empty() {
-            // No credentials configured: the worker will fail to connect. Point the
-            // user at the config file rather than a cryptic connect error.
-            toast.show(&format!(
-                "Set api_id / api_hash in {}",
-                crate::config::AppConfig::path().display()
-            ));
+        if credentials.is_none() {
+            // Built without credentials: the worker will fail to connect. Say why
+            // rather than surfacing a cryptic connect error.
+            toast.show("Built without Telegram API keys — set TG_API_ID / TG_API_HASH in .env and rebuild");
         }
 
         let login_on = {
