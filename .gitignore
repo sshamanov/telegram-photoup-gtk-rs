@@ -3,3 +3,4 @@ error.log
 /samples
 /out
 .env
+/tmp
