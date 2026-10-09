@@ -188,10 +188,9 @@ commit once the visual check below passes.
 
 ## Verification rule
 
-**Claude verifies visually — Claude *is* the VLM.** When a change could visibly
-differ, render it and *look at the image yourself* before calling the change
-done; never assert visual correctness from the code alone. There is no external
-vision service; read the PNG with the `Read` tool.
+**Claude verifies visually.** When a change could visibly differ, render it and
+*look at the image yourself* before calling the change done; never assert visual
+correctness from the code alone. Read the PNG with the `Read` tool.
 
 - **Never screenshot the user's desktop.** This dev instance runs the user's real
   Wayland session (Hyprland), and a full-screen grab exposes their terminal and
