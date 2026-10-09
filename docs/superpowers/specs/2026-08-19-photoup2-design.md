@@ -2,7 +2,7 @@
 
 Date: 2026-08-19
 Status: approved
-Author: discussion between schaman and Claude Code
+Author: discussion between sshamanov and Claude Code
 
 > **Historical note (2026-08-27):** this is the original inception design. The
 > app has since diverged from the "faithful photoup port" premise below — it is
