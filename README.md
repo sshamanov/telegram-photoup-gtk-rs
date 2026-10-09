@@ -72,20 +72,35 @@ Ubuntu 24.04 and Arch.
 
 ## Configuration
 
+### Telegram API keys (build time)
+
+The Telegram `api_id` / `api_hash` are **baked into the binary at build time**
+by `build.rs`. Get them from [my.telegram.org](https://my.telegram.org) → API
+development tools (create an app), then put them in a `.env` next to
+`Cargo.toml` (gitignored, never committed — start from `.env.example`):
+
+```sh
+TG_API_ID=123456
+TG_API_HASH=0123456789abcdef0123456789abcdef
+```
+
+`TG_API_ID` / `TG_API_HASH` set in the build environment win over `.env`. Every
+machine that builds the app needs one or the other; editing `.env` triggers a
+rebuild. A binary built without them still runs (dev mode works) but shows
+"Built without Telegram API keys" and cannot log in.
+
+### Runtime config
+
 The app reads `~/.config/photoup2/config.toml` (auto-created with defaults on
 first run):
 
 ```toml
-api_id = 0            # your app api_id from https://my.telegram.org
-api_hash = ""         # your app api_hash from https://my.telegram.org
 target_peer_id = null # last chosen target group (remembered after first send)
 session_path = "/home/you/.config/photoup2/telegram.session"
 ```
 
-Get `api_id`/`api_hash` from [my.telegram.org](https://my.telegram.org) → API
-development tools (create an app). On first launch, log in with phone number →
-SMS code → 2FA password (if set); the session is persisted to the session file,
-so later launches skip login.
+On first launch, log in with phone number → SMS code → 2FA password (if set);
+the session is persisted to the session file, so later launches skip login.
 
 ## UI flow
 

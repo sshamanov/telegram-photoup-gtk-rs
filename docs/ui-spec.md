@@ -192,8 +192,9 @@ intact until the user asks for the crush.
 
 ## Toasts
 
-Transient messages on the toast overlay wrapping the root stack: "Set api_id /
-api_hash in {config path}" on a launch with no credentials, "Log in to Telegram
+Transient messages on the toast overlay wrapping the root stack: "Built
+without Telegram API keys — set TG_API_ID / TG_API_HASH in .env and rebuild" on
+a launch of a binary built without credentials, "Log in to Telegram
 first", "No ready photos selected", "Pick a target group", "No exportable photos
 selected", "Sent {n} photos", "Send failed: {error}", and "Send failed — {n}
 JPEGs kept in {dir}" when a failed send leaves the exported JPEGs on disk so

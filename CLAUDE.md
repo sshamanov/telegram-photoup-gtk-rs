@@ -45,6 +45,10 @@ Implementation plan: `docs/superpowers/plans/2026-08-19-photoup2.md`
 ## Build / run / test
 
 - `cargo build`, `cargo test`, `cargo run` (debug). Release is `lto = true`.
+- **Telegram `api_id`/`api_hash` are baked in at build time** by `build.rs` from
+  `TG_API_ID` / `TG_API_HASH` (build env, else the gitignored `.env`; template
+  `.env.example`) and read via `config::telegram_credentials()`. They are not in
+  `config.toml`. **Never commit `.env` or any key** — the repo is public.
 - System deps: GTK4 + libadwaita (dev headers) and gcc/clang. Arch:
   `gtk4 libadwaita base-devel`. Ubuntu:
   `libgtk-4-dev libadwaita-1-dev build-essential`. No `libraw-dev`.
